@@ -1,0 +1,12 @@
+[package]
+name = "kapel-cuda-abi"
+description = "The arguments shared by the CUDA kernels and the CUDA backend of Kapel."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

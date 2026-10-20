@@ -16,6 +16,7 @@ kapel-ops = { path = "crates/kapel-ops" }
 kapel-ref = { path = "crates/kapel-ref" }
 kapel-cpu = { path = "crates/kapel-cpu" }
 kapel-cuda = { path = "crates/kapel-cuda" }
+kapel-cuda-abi = { path = "crates/kapel-cuda-abi" }
 kapel-hub = { path = "crates/kapel-hub" }
 kapel-tokenizers = { path = "crates/kapel-tokenizers" }
 kapel-models = { path = "crates/kapel-models" }
@@ -44,3 +45,13 @@ todo = "warn"
 
 [profile.release]
 debug = "line-tables-only"
+
+# cutile-rs compiles tile kernels without optimization when its compiler crate is
+# built with debug information (any level: Cargo only says whether there is
+# some). Kernels are always optimized here; `CUDA_RUST_DEBUG=line` or `full`
+# brings device debug information back when needed.
+[profile.release.package.cutile-compiler]
+debug = false
+
+[profile.dev.package.cutile-compiler]
+debug = false

@@ -147,6 +147,13 @@ pub enum Error {
         /// The number of rows that can be indexed.
         size: usize,
     },
+    /// The device or its driver reported an error.
+    Device {
+        /// The operation that failed.
+        op: &'static str,
+        /// The driver's message.
+        message: String,
+    },
     /// A parameter of the operation is invalid; the message says why.
     InvalidArgument {
         /// The operation that failed.
@@ -227,6 +234,7 @@ impl fmt::Display for Error {
                 write!(f, "{op}: index {index} is out of range for {size} rows")
             }
             Self::InvalidArgument { op, message } => write!(f, "{op}: {message}"),
+            Self::Device { op, message } => write!(f, "{op}: device error: {message}"),
         }
     }
 }

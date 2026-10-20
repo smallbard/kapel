@@ -12,5 +12,21 @@ publish.workspace = true
 workspace = true
 
 [features]
-# Runs the tests that need a CUDA device (self-hosted runner only).
-gpu-tests = []
+# The backend itself: needs the CUDA toolkit to build and a device to run. Off by
+# default, so that the workspace builds anywhere.
+cuda = ["dep:cuda-core", "dep:cutile"]
+
+[dependencies]
+kapel-core.workspace = true
+kapel-ops.workspace = true
+kapel-cuda-abi.workspace = true
+cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "a73ec6ef7fe2922c93f5d1e1f2e3de67c891a760", optional = true }
+# Tile kernels, compiled at their first launch by `tileiras` (CUDA 13.2 or later).
+cutile = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "a73ec6ef7fe2922c93f5d1e1f2e3de67c891a760", optional = true }
+
+[dev-dependencies]
+kapel-ref.workspace = true
+
+[[example]]
+name = "gemm"
+required-features = ["cuda"]

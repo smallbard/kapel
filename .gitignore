@@ -7,3 +7,6 @@
 /fuzz/corpus
 /fuzz/artifacts
 /fuzz/coverage
+/kernels/target
+/kernels/*.ll
+/kernels/*.ptx

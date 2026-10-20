@@ -65,4 +65,5 @@ jobs:
     runs-on: [self-hosted, linux, cuda]
     steps:
       - uses: actions/checkout@v4
-      - run: cargo test --workspace --features kapel-cuda/gpu-tests
+      - run: cargo clippy -p kapel-cuda --features cuda --all-targets
+      - run: cargo test -p kapel-cuda --features cuda

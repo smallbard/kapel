@@ -33,6 +33,11 @@ changelog says how.
 - `kapel-models`: Llama, Mistral, Qwen 2 and 3, Gemma 2, Phi and GPT-2 described by
   configuration, with logits matching `transformers`; saving models it reads back.
 - `kapel-core`: decoders of the GGUF Q5 and K formats.
+- `kapel-cuda` (feature `cuda`): the CUDA backend, with kernels written in Rust and
+  compiled to PTX by cuda-oxide; the whole catalogue in `f32`, conforming to the
+  reference and giving the same bits on every run. Attention is naive for now.
+- `kapel-cuda`: matrix products as cutile-rs tile kernels, in `f32`, `bf16` and `f16`
+  with an `f32` accumulator, reading strided and broadcast operands in place.
 
 ### Security
 
