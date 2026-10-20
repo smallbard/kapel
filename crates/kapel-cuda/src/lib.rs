@@ -3,9 +3,10 @@
 //! `Cuda` runs the whole catalogue of `kapel-ops` on an NVIDIA device, written
 //! entirely in Rust with CUDA Rust:
 //!
-//! - matrix products are cutile-rs tile kernels, in `f32`, `bf16` and `f16`
-//!   with an `f32` accumulator, compiled by `tileiras` at their first launch and
-//!   kept in a cache on disk;
+//! - matrix products and attention (in the manner of FlashAttention 2) are
+//!   cutile-rs tile kernels, in `f32`, `bf16` and `f16` with `f32`
+//!   accumulators, compiled by `tileiras` at their first launch and kept in a
+//!   cache on disk;
 //! - the other operations, in `f32`, are cuda-oxide kernels (`kernels/`, built
 //!   by `kernels/build.sh`), whose PTX is embedded in this crate.
 //!
@@ -17,6 +18,8 @@
 //! builds anywhere. Build `cutile-compiler` without debug information (see the
 //! workspace's `Cargo.toml`): with it, tile kernels are compiled unoptimized.
 
+#[cfg(feature = "cuda")]
+mod attention;
 #[cfg(feature = "cuda")]
 mod device;
 #[cfg(feature = "cuda")]
@@ -97,6 +100,79 @@ mod tests {
                 assert!(
                     (e - g).abs() <= tol,
                     "{dtype} element {i}: {g}, expected {e}"
+                );
+            }
+        }
+    }
+
+    /// An attention over several tiles of queries and keys, with grouped
+    /// heads, compared to the reference in both directions, and repeated.
+    #[test]
+    fn attention_over_many_tiles_matches_the_reference() {
+        use kapel_ops::Attention;
+        let cuda = cuda();
+        let (b, hq, hkv, t, d) = (2, 8, 2, 200, 64);
+        let values = |len: usize, seed: usize| -> Vec<f32> {
+            (0..len)
+                .map(|i| ((i * 7919 + seed * 104_729) % 1000) as f32 / 500.0 - 1.0)
+                .collect()
+        };
+        for dtype in [DType::F32, DType::BF16] {
+            let host = |len: usize, seed: usize, shape: &[usize]| {
+                let x = Tensor::from_slice(&values(len, seed), shape).unwrap();
+                Run::<kapel_ops::Cast>::forward(
+                    &kapel_ref::Reference,
+                    &kapel_ops::Cast { dtype },
+                    &[&x],
+                )
+                .unwrap()
+            };
+            let q = host(b * hq * t * d, 1, &[b, hq, t, d]);
+            let k = host(b * hkv * t * d, 2, &[b, hkv, t, d]);
+            let v = host(b * hkv * t * d, 3, &[b, hkv, t, d]);
+            let g = host(b * hq * t * d, 4, &[b, hq, t, d]);
+            let op = Attention::causal();
+            let reference = kapel_ref::Reference;
+            let mut expected = vec![reference.forward(&op, &[&q, &k, &v]).unwrap()];
+            expected.extend(
+                reference
+                    .backward(&op, &[&q, &k, &v], &g)
+                    .unwrap()
+                    .into_iter()
+                    .map(Option::unwrap),
+            );
+            let [dq, dk, dv, dg] = [&q, &k, &v, &g].map(|x| cuda.upload(x).unwrap());
+            let run = || {
+                let mut got = vec![cuda.forward(&op, &[&dq, &dk, &dv]).unwrap()];
+                got.extend(
+                    cuda.backward(&op, &[&dq, &dk, &dv], &dg)
+                        .unwrap()
+                        .into_iter()
+                        .map(Option::unwrap),
+                );
+                got.iter()
+                    .map(|x| cuda.download(x).unwrap().to_f64_vec().unwrap())
+                    .collect::<Vec<_>>()
+            };
+            let got = run();
+            assert_eq!(run(), got, "{dtype}: a second run differs");
+            // Products in 16 bits round the weights and the gradients of the
+            // scores to 16 bits as well.
+            let tolerance = match dtype {
+                DType::F32 => conformity::tolerance(dtype),
+                _ => 4.0 * conformity::tolerance(dtype),
+            };
+            for (n, (e, g)) in expected.iter().zip(&got).enumerate() {
+                let e = e.to_f64_vec().unwrap();
+                let tol = tolerance * e.iter().fold(1.0f64, |m, v| m.max(v.abs()));
+                let worst = e
+                    .iter()
+                    .zip(g)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0, f64::max);
+                assert!(
+                    worst <= tol,
+                    "{dtype} result {n}: error {worst:.2e} above {tol:.2e}"
                 );
             }
         }

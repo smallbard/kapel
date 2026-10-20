@@ -193,6 +193,11 @@ impl Cuda {
         Tensor::from_storage(Arc::new(storage), layout, dtype)
     }
 
+    /// The backend's stream, as the tile runtime sees it.
+    pub(crate) fn tile_stream(&self) -> &Arc<Stream> {
+        &self.tiles().stream
+    }
+
     fn batched_matmul<T: cutile::DType>(
         &self,
         name: &str,
@@ -224,7 +229,7 @@ impl Cuda {
             .generics(generics);
         // SAFETY: as above; the outputs returned are views of borrowed memory,
         // dropped without freeing it.
-        unsafe { launch.async_on(&self.tiles().stream) }
+        unsafe { launch.async_on(self.tile_stream()) }
             .map(drop)
             .map_err(|e| Error::Device {
                 op,

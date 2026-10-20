@@ -35,9 +35,12 @@ changelog says how.
 - `kapel-core`: decoders of the GGUF Q5 and K formats.
 - `kapel-cuda` (feature `cuda`): the CUDA backend, with kernels written in Rust and
   compiled to PTX by cuda-oxide; the whole catalogue in `f32`, conforming to the
-  reference and giving the same bits on every run. Attention is naive for now.
+  reference and giving the same bits on every run.
 - `kapel-cuda`: matrix products as cutile-rs tile kernels, in `f32`, `bf16` and `f16`
   with an `f32` accumulator, reading strided and broadcast operands in place.
+- `kapel-cuda`: attention as cutile-rs tile kernels in the manner of FlashAttention 2,
+  forward and backward, with causal and sliding-window masks, additive masks, capped
+  scores and grouped keys, deterministic.
 
 ### Security
 

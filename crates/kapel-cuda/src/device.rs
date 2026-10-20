@@ -11,7 +11,7 @@ use cuda_core::{
     launch_kernel_on_stream,
 };
 use kapel_core::{DType, Device, Error, HostStorage, Layout, Result, Storage, Tensor};
-use kapel_cuda_abi::{AttentionDims, BLOCK, MAX_RANK, View};
+use kapel_cuda_abi::{BLOCK, MAX_RANK, View};
 use kapel_ops::Transfer;
 
 use crate::tile::Tiles;
@@ -36,12 +36,6 @@ const KERNELS: &[&str] = &[
     "norm_rows",
     "norm_rows_backward",
     "column_sum",
-    "attention_weights",
-    "attention_output",
-    "attention_grad_v",
-    "attention_grad_scores",
-    "attention_grad_q",
-    "attention_grad_k",
     "rope",
     "gather_rows",
     "scatter_rows",
@@ -455,7 +449,6 @@ enum Arg {
     F32(f32),
     U64(u64),
     View(View),
-    Dims(AttentionDims),
 }
 
 impl Args {
@@ -500,11 +493,6 @@ impl Args {
         self
     }
 
-    pub(crate) fn dims(mut self, v: AttentionDims) -> Self {
-        self.values.push(Arg::Dims(v));
-        self
-    }
-
     /// A pointer to each value, as `cuLaunchKernel` wants them. They stay valid
     /// while `self` lives and no value is added.
     fn pointers(&mut self) -> Vec<*mut c_void> {
@@ -515,7 +503,6 @@ impl Args {
                 Arg::F32(v) => std::ptr::from_mut(v).cast::<c_void>(),
                 Arg::U64(v) => std::ptr::from_mut(v).cast::<c_void>(),
                 Arg::View(v) => std::ptr::from_mut(v).cast::<c_void>(),
-                Arg::Dims(v) => std::ptr::from_mut(v).cast::<c_void>(),
             })
             .collect()
     }

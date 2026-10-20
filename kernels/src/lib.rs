@@ -5,9 +5,8 @@
 //! what it needs and writes its own output. No two threads write the same place,
 //! and no sum depends on scheduling: there are no atomics.
 //!
-//! This set aims at correctness. Matrix products are tile kernels written with
-//! cutile-rs, in the backend itself; attention is written naively here, until
-//! a tiled kernel replaces it.
+//! Matrix products and attention are not here: they are tile kernels written
+//! with cutile-rs, in the backend itself.
 //!
 //! The arguments passed by value are defined in `kapel-cuda-abi`. A slice
 //! argument becomes two kernel parameters: its device pointer, then its length.
@@ -16,7 +15,7 @@
 #![allow(clippy::needless_range_loop, clippy::too_many_arguments)]
 
 use cuda_device::{DisjointSlice, kernel, launch_bounds, thread};
-use kapel_cuda_abi::{AttentionDims, View, binary, unary};
+use kapel_cuda_abi::{View, binary, unary};
 
 /// The exact error function, as `kapel_ops::special::erf` computes it: its
 /// Taylor series below 2.5, the continued fraction of `erfc` above.
@@ -495,185 +494,6 @@ pub fn column_sum(x: &[f32], rows: u32, mut out: DisjointSlice<f32>) {
         let mut total = 0.0f32;
         for r in 0..rows as usize {
             total += x[r * width + c];
-        }
-        *y = total;
-    }
-}
-
-/// Whether key `j` is visible from query `i`.
-fn visible(dims: &AttentionDims, i: u32, j: u32) -> bool {
-    let position = dims.tk - dims.tq + i;
-    (dims.causal == 0 || j <= position) && (dims.window == 0 || position < j + dims.window)
-}
-
-/// The attention weights of every query, `p [B, Hq, Tq, Tk]`, one thread per
-/// query; and the slope of the softcap at each score (1 without one).
-#[kernel]
-#[launch_bounds(256)]
-pub fn attention_weights(q: &[f32], k: &[f32], mask: &[f32], dims: AttentionDims, mut p: DisjointSlice<f32>, mut slope: DisjointSlice<f32>) {
-    let idx = thread::index_1d();
-    let row = idx.get() as u32;
-    if row < dims.b * dims.hq * dims.tq {
-        let (b, h, i) = (row / (dims.hq * dims.tq), row / dims.tq % dims.hq, row % dims.tq);
-        let kv = h / (dims.hq / dims.hkv);
-        let qa = (row * dims.d) as usize;
-        let base = (row * dims.tk) as usize;
-        let mut max = f32::NEG_INFINITY;
-        for j in 0..dims.tk {
-            let mut s = f32::NEG_INFINITY;
-            let mut sl = 1.0f32;
-            if visible(&dims, i, j) {
-                let ka = (((b * dims.hkv + kv) * dims.tk + j) * dims.d) as usize;
-                let mut dot = 0.0f32;
-                for c in 0..dims.d as usize {
-                    dot += q[qa + c] * k[ka + c];
-                }
-                s = dims.scale * dot;
-                if dims.softcap > 0.0 {
-                    let t = (s / dims.softcap).tanh();
-                    sl = 1.0 - t * t;
-                    s = dims.softcap * t;
-                }
-                if dims.masked == 1 {
-                    let flat = ((b * dims.hq + h) * dims.tq + i) * dims.tk + j;
-                    s += mask[dims.mask.at(flat) as usize];
-                }
-                if s > max {
-                    max = s;
-                }
-            }
-            // SAFETY: each query writes its own row of `p` and `slope`.
-            unsafe {
-                *p.as_mut_ptr().add(base + j as usize) = s;
-                *slope.as_mut_ptr().add(base + j as usize) = sl;
-            }
-        }
-        // SAFETY: as above.
-        let row_p = unsafe { core::slice::from_raw_parts_mut(p.as_mut_ptr().add(base), dims.tk as usize) };
-        if max == f32::NEG_INFINITY {
-            for v in row_p.iter_mut() {
-                *v = 0.0;
-            }
-        } else {
-            let mut total = 0.0f32;
-            for v in row_p.iter_mut() {
-                *v = (*v - max).exp();
-                total += *v;
-            }
-            for v in row_p.iter_mut() {
-                *v /= total;
-            }
-        }
-    }
-}
-
-/// `y[b, h, i, c] = Σ_j p[b, h, i, j] · v[b, kv(h), j, c]`.
-#[kernel]
-#[launch_bounds(256)]
-pub fn attention_output(p: &[f32], v: &[f32], dims: AttentionDims, mut out: DisjointSlice<f32>) {
-    let idx = thread::index_1d();
-    let flat = idx.get() as u32;
-    if let Some(y) = out.get_mut(idx) {
-        let (row, c) = (flat / dims.dv, flat % dims.dv);
-        let (b, h) = (row / (dims.hq * dims.tq), row / dims.tq % dims.hq);
-        let kv = h / (dims.hq / dims.hkv);
-        let mut total = 0.0f32;
-        for j in 0..dims.tk {
-            let va = ((b * dims.hkv + kv) * dims.tk + j) * dims.dv + c;
-            total += p[(row * dims.tk + j) as usize] * v[va as usize];
-        }
-        *y = total;
-    }
-}
-
-/// `∂v[b, kv, j, c] = Σ_{h of kv} Σ_i p[b, h, i, j] · g[b, h, i, c]`.
-#[kernel]
-#[launch_bounds(256)]
-pub fn attention_grad_v(p: &[f32], g: &[f32], dims: AttentionDims, mut out: DisjointSlice<f32>) {
-    let idx = thread::index_1d();
-    let flat = idx.get() as u32;
-    if let Some(y) = out.get_mut(idx) {
-        let (key, c) = (flat / dims.dv, flat % dims.dv);
-        let (b, kv, j) = (key / (dims.hkv * dims.tk), key / dims.tk % dims.hkv, key % dims.tk);
-        let group = dims.hq / dims.hkv;
-        let mut total = 0.0f32;
-        for h in kv * group..(kv + 1) * group {
-            for i in 0..dims.tq {
-                let row = (b * dims.hq + h) * dims.tq + i;
-                total += p[(row * dims.tk + j) as usize] * g[(row * dims.dv + c) as usize];
-            }
-        }
-        *y = total;
-    }
-}
-
-/// `∂s` of every query, from the weights, the output gradient and the values:
-/// `∂p[j] = g·v[j]`, then `∂s[j] = scale · p[j] · (∂p[j] − Σ p·∂p) · slope[j]`.
-#[kernel]
-#[launch_bounds(256)]
-pub fn attention_grad_scores(p: &[f32], slope: &[f32], g: &[f32], v: &[f32], dims: AttentionDims, mut ds: DisjointSlice<f32>) {
-    let idx = thread::index_1d();
-    let row = idx.get() as u32;
-    if row < dims.b * dims.hq * dims.tq {
-        let (b, h) = (row / (dims.hq * dims.tq), row / dims.tq % dims.hq);
-        let kv = h / (dims.hq / dims.hkv);
-        let base = (row * dims.tk) as usize;
-        let mut mean = 0.0f32;
-        for j in 0..dims.tk {
-            let va = (((b * dims.hkv + kv) * dims.tk + j) * dims.dv) as usize;
-            let mut dp = 0.0f32;
-            for c in 0..dims.dv as usize {
-                dp += g[(row * dims.dv) as usize + c] * v[va + c];
-            }
-            mean += p[base + j as usize] * dp;
-            // SAFETY: each query writes its own row.
-            unsafe { *ds.as_mut_ptr().add(base + j as usize) = dp };
-        }
-        for j in 0..dims.tk as usize {
-            // SAFETY: as above.
-            unsafe {
-                let at = ds.as_mut_ptr().add(base + j);
-                *at = dims.scale * p[base + j] * (*at - mean) * slope[base + j];
-            }
-        }
-    }
-}
-
-/// `∂q[b, h, i, c] = Σ_j ∂s[b, h, i, j] · k[b, kv(h), j, c]`.
-#[kernel]
-#[launch_bounds(256)]
-pub fn attention_grad_q(ds: &[f32], k: &[f32], dims: AttentionDims, mut out: DisjointSlice<f32>) {
-    let idx = thread::index_1d();
-    let flat = idx.get() as u32;
-    if let Some(y) = out.get_mut(idx) {
-        let (row, c) = (flat / dims.d, flat % dims.d);
-        let (b, h) = (row / (dims.hq * dims.tq), row / dims.tq % dims.hq);
-        let kv = h / (dims.hq / dims.hkv);
-        let mut total = 0.0f32;
-        for j in 0..dims.tk {
-            let ka = ((b * dims.hkv + kv) * dims.tk + j) * dims.d + c;
-            total += ds[(row * dims.tk + j) as usize] * k[ka as usize];
-        }
-        *y = total;
-    }
-}
-
-/// `∂k[b, kv, j, c] = Σ_{h of kv} Σ_i ∂s[b, h, i, j] · q[b, h, i, c]`.
-#[kernel]
-#[launch_bounds(256)]
-pub fn attention_grad_k(ds: &[f32], q: &[f32], dims: AttentionDims, mut out: DisjointSlice<f32>) {
-    let idx = thread::index_1d();
-    let flat = idx.get() as u32;
-    if let Some(y) = out.get_mut(idx) {
-        let (key, c) = (flat / dims.d, flat % dims.d);
-        let (b, kv, j) = (key / (dims.hkv * dims.tk), key / dims.tk % dims.hkv, key % dims.tk);
-        let group = dims.hq / dims.hkv;
-        let mut total = 0.0f32;
-        for h in kv * group..(kv + 1) * group {
-            for i in 0..dims.tq {
-                let row = (b * dims.hq + h) * dims.tq + i;
-                total += ds[(row * dims.tk + j) as usize] * q[(row * dims.d + c) as usize];
-            }
         }
         *y = total;
     }

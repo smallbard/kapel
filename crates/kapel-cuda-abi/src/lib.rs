@@ -92,38 +92,6 @@ pub mod binary {
     pub const MIN: u32 = 5;
 }
 
-/// The sizes and switches of an attention, passed by value.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct AttentionDims {
-    /// Batch.
-    pub b: u32,
-    /// Query heads.
-    pub hq: u32,
-    /// Key and value heads.
-    pub hkv: u32,
-    /// Queries.
-    pub tq: u32,
-    /// Keys.
-    pub tk: u32,
-    /// Width of queries and keys.
-    pub d: u32,
-    /// Width of values.
-    pub dv: u32,
-    /// 1 for causal attention.
-    pub causal: u32,
-    /// The window, or 0 for none.
-    pub window: u32,
-    /// 1 if a mask is given.
-    pub masked: u32,
-    /// The factor of the scores.
-    pub scale: f32,
-    /// The softcap, or 0 for none.
-    pub softcap: f32,
-    /// The view of the mask, broadcast to `[B, Hq, Tq, Tk]`.
-    pub mask: View,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

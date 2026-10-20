@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use kapel_core::{DType, Error, HostStorage, Layout, Result, Tensor};
-use kapel_cuda_abi::{AttentionDims, MAX_RANK, View, binary, unary};
+use kapel_cuda_abi::{binary, unary};
 use kapel_ops::{
     Affine, Attention, Binary, BinaryKind, Cast, GatherRows, LayerNorm, LogSoftmax, Matmul, Max,
     Mean, Operation, QuantizedMatmul, RmsNorm, Rope, RopeLayout, Run, ScatterAddRows, Softmax, Sum,
@@ -858,108 +858,12 @@ impl Run<RmsNorm> for Cuda {
     }
 }
 
-/// What every attention kernel reads: `q`, `k`, `v` in row-major order, the
-/// mask (or a placeholder), and the dimensions.
-struct AttentionArgs {
-    q: Flat,
-    k: Flat,
-    v: Flat,
-    mask: (u64, usize),
-    _placeholder: Option<Tensor>,
-    dims: AttentionDims,
-    rows: usize,
-}
-
-impl Cuda {
-    fn attention_args(&self, op: &Attention, inputs: &[&Tensor]) -> Result<AttentionArgs> {
-        let name = Attention::NAME;
-        let (q, k, v) = (inputs[0], inputs[1], inputs[2]);
-        let [b, hq, tq, d] = [q.shape()[0], q.shape()[1], q.shape()[2], q.shape()[3]];
-        let (hkv, tk, dv) = (k.shape()[1], k.shape()[2], v.shape()[3]);
-        let (mask, placeholder, view) = match inputs.get(3) {
-            Some(m) => {
-                let arg = self.arg_as(name, m, &m.layout().broadcast_to(&[b, hq, tq, tk])?)?;
-                ((arg.base, arg.len), None, arg.view)
-            }
-            None => {
-                let zero = self.upload_f32(&[0.0], &[1])?;
-                let arg = self.arg(name, &zero)?;
-                let view = View {
-                    shape: [1; MAX_RANK],
-                    strides: [0; MAX_RANK],
-                    offset: 0,
-                };
-                ((arg.base, arg.len), Some(zero), view)
-            }
-        };
-        let dims = AttentionDims {
-            b: small(name, b)?,
-            hq: small(name, hq)?,
-            hkv: small(name, hkv)?,
-            tq: small(name, tq)?,
-            tk: small(name, tk)?,
-            d: small(name, d)?,
-            dv: small(name, dv)?,
-            causal: u32::from(op.causal),
-            // A window of `tk` or more hides nothing; 0 stands for none.
-            window: small(name, op.window.map_or(0, |w| w.min(tk)))?,
-            masked: u32::from(inputs.len() == 4),
-            scale: op.scale_for(d) as f32,
-            softcap: op.softcap.map_or(0.0, |c| c as f32),
-            mask: view,
-        };
-        Ok(AttentionArgs {
-            q: self.flat(name, q)?,
-            k: self.flat(name, k)?,
-            v: self.flat(name, v)?,
-            mask,
-            _placeholder: placeholder,
-            dims,
-            rows: b * hq * tq,
-        })
-    }
-
-    /// The attention weights `[B, Hq, Tq, Tk]` and the slopes of the softcap.
-    fn attention_weights(&self, a: &AttentionArgs) -> Result<(CudaStorage, CudaStorage)> {
-        let size = a.rows * a.dims.tk as usize;
-        let p = self.alloc(size * 4, false)?;
-        let slope = self.alloc(size * 4, false)?;
-        self.launch(
-            "attention_weights",
-            a.rows,
-            Args::new()
-                .flat(&a.q)
-                .flat(&a.k)
-                .slice(a.mask.0, a.mask.1)
-                .dims(a.dims)
-                .list(&p, size)
-                .list(&slope, size),
-        )?;
-        Ok((p, slope))
-    }
-}
-
 impl Run<Attention> for Cuda {
     fn forward(&self, op: &Attention, inputs: &[&Tensor]) -> Result<Tensor> {
-        let signature = op.infer(inputs)?;
-        let a = self.attention_args(op, inputs)?;
-        let (p, _) = self.attention_weights(&a)?;
-        let size = a.rows * a.dims.tk as usize;
-        self.output(&signature.shape, false, |out, n| {
-            self.launch(
-                "attention_output",
-                n,
-                Args::new()
-                    .list(&p, size)
-                    .flat(&a.v)
-                    .dims(a.dims)
-                    .slice(out, n),
-            )
-        })
+        op.infer(inputs)?;
+        Ok(self.flash_forward(op, inputs)?.0)
     }
 
-    /// `∂v = Pᵀ·g`, `∂s = scale · P ⊙ (g·vᵀ − rowsum) ⊙ slope`, `∂q = ∂s·k`,
-    /// `∂k = ∂sᵀ·q`, each query head adding to its key and value head.
     fn backward(
         &self,
         op: &Attention,
@@ -967,55 +871,7 @@ impl Run<Attention> for Cuda {
         grad: &Tensor,
     ) -> Result<Vec<Option<Tensor>>> {
         op.infer(inputs)?;
-        let a = self.attention_args(op, inputs)?;
-        let g = self.flat(Attention::NAME, grad)?;
-        let (p, slope) = self.attention_weights(&a)?;
-        let size = a.rows * a.dims.tk as usize;
-        let gv = self.output(inputs[2].shape(), false, |out, n| {
-            self.launch(
-                "attention_grad_v",
-                n,
-                Args::new()
-                    .list(&p, size)
-                    .flat(&g)
-                    .dims(a.dims)
-                    .slice(out, n),
-            )
-        })?;
-        let ds = self.alloc(size * 4, false)?;
-        self.launch(
-            "attention_grad_scores",
-            a.rows,
-            Args::new()
-                .list(&p, size)
-                .list(&slope, size)
-                .flat(&g)
-                .flat(&a.v)
-                .dims(a.dims)
-                .list(&ds, size),
-        )?;
-        let gq = self.output(inputs[0].shape(), false, |out, n| {
-            self.launch(
-                "attention_grad_q",
-                n,
-                Args::new()
-                    .list(&ds, size)
-                    .flat(&a.k)
-                    .dims(a.dims)
-                    .slice(out, n),
-            )
-        })?;
-        let gk = self.output(inputs[1].shape(), false, |out, n| {
-            self.launch(
-                "attention_grad_k",
-                n,
-                Args::new()
-                    .list(&ds, size)
-                    .flat(&a.q)
-                    .dims(a.dims)
-                    .slice(out, n),
-            )
-        })?;
+        let [gq, gk, gv] = self.flash_backward(op, inputs, grad)?;
         let mut grads = vec![Some(gq), Some(gk), Some(gv)];
         if inputs.len() == 4 {
             grads.push(None);
