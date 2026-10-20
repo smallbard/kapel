@@ -1,0 +1,9 @@
+/target
+/data
+*.safetensors
+*.gguf
+/PLAN*.md
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+/fuzz/coverage

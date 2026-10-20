@@ -1,0 +1,46 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+authors = ["Olivier Le Guyader"]
+publish = false
+
+[workspace.dependencies]
+kapel-core = { path = "crates/kapel-core" }
+kapel-ops = { path = "crates/kapel-ops" }
+kapel-ref = { path = "crates/kapel-ref" }
+kapel-cpu = { path = "crates/kapel-cpu" }
+kapel-cuda = { path = "crates/kapel-cuda" }
+kapel-hub = { path = "crates/kapel-hub" }
+kapel-tokenizers = { path = "crates/kapel-tokenizers" }
+kapel-models = { path = "crates/kapel-models" }
+kapel-infer = { path = "crates/kapel-infer" }
+kapel-train = { path = "crates/kapel-train" }
+kapel-serve = { path = "crates/kapel-serve" }
+fancy-regex = "0.16"
+memmap2 = "0.9"
+minijinja = { version = "2", features = ["loop_controls", "json", "fuel"] }
+minijinja-contrib = { version = "2", features = ["pycompat"] }
+serde_json = "1"
+sha2 = "0.10"
+ureq = "2"
+unicode-normalization = "0.1"
+
+[workspace.lints.rust]
+missing_docs = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "warn"
+dbg_macro = "warn"
+todo = "warn"
+
+[profile.release]
+debug = "line-tables-only"

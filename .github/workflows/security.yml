@@ -1,0 +1,36 @@
+name: Security
+
+on:
+  schedule:
+    - cron: "0 3 * * 1"   # every Monday at 03:00 UTC
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [safetensors, gguf, tokenizer_json, tokenizer_encode, chat_template, model_config]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo install cargo-fuzz --locked
+      - run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=3600 -timeout=10 -rss_limit_mb=2048
+        working-directory: fuzz
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: crash-${{ matrix.target }}
+          path: fuzz/artifacts
+
+  miri:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - run: cargo miri test -p kapel-core
+      - run: cargo miri test -p kapel-cpu pool::
+      - run: cargo miri test -p kapel-cpu tests::the_backend_conforms_in_f32_and_bf16

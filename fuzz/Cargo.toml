@@ -1,0 +1,62 @@
+[package]
+name = "kapel-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "MIT"
+
+[package.metadata]
+cargo-fuzz = true
+
+# The fuzz targets need nightly and libFuzzer: they stay out of the workspace.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+kapel-core = { path = "../crates/kapel-core" }
+kapel-hub = { path = "../crates/kapel-hub", default-features = false }
+kapel-tokenizers = { path = "../crates/kapel-tokenizers" }
+kapel-models = { path = "../crates/kapel-models" }
+serde_json = "1"
+
+[[bin]]
+name = "safetensors"
+path = "fuzz_targets/safetensors.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "gguf"
+path = "fuzz_targets/gguf.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tokenizer_json"
+path = "fuzz_targets/tokenizer_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tokenizer_encode"
+path = "fuzz_targets/tokenizer_encode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "chat_template"
+path = "fuzz_targets/chat_template.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "model_config"
+path = "fuzz_targets/model_config.rs"
+test = false
+doc = false
+bench = false

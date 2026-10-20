@@ -1,0 +1,16 @@
+[package]
+name = "kapel-cuda"
+description = "The CUDA backend, built on CUDA Rust (cutile-rs and cuda-oxide)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# Runs the tests that need a CUDA device (self-hosted runner only).
+gpu-tests = []

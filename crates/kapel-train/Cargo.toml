@@ -1,0 +1,12 @@
+[package]
+name = "kapel-train"
+description = "The training engine: autodiff, optimizers, data, distributed training."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

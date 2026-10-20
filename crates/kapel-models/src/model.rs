@@ -1,0 +1,381 @@
+//! The forward pass of a decoder, on any backend.
+
+use std::collections::BTreeMap;
+
+use kapel_core::Tensor;
+use kapel_hub::Checkpoint;
+use kapel_ops::{
+    Affine, Attention, Backend, Binary, BinaryKind, GatherRows, LayerNorm, Matmul, RmsNorm, Rope,
+    Transfer, Unary, UnaryKind,
+};
+
+use crate::ModelError;
+use crate::config::{Block, Config, Norm};
+
+/// A model: its configuration and its weights, by their names in the checkpoint.
+pub struct Model {
+    config: Config,
+    /// `config.json` as read, written back unchanged by [`Model::save`].
+    raw_config: serde_json::Value,
+    weights: BTreeMap<String, Tensor>,
+}
+
+type Result<T> = std::result::Result<T, ModelError>;
+
+/// The operations of the forward pass, on one backend.
+struct Ops<'a, B>(&'a B);
+
+impl<B: Backend> Ops<'_, B> {
+    fn linear(&self, x: &Tensor, w: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
+        // `transformers` stores `[out, in]`: `y = x · wᵀ`, a view.
+        let y = self.0.forward(&Matmul, &[x, &w.transpose(0, 1)?])?;
+        self.bias(y, bias)
+    }
+
+    fn bias(&self, y: Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
+        Ok(match bias {
+            Some(b) => self.0.forward(
+                &Binary {
+                    kind: BinaryKind::Add,
+                },
+                &[&y, b],
+            )?,
+            None => y,
+        })
+    }
+
+    fn binary(&self, kind: BinaryKind, a: &Tensor, b: &Tensor) -> Result<Tensor> {
+        Ok(self.0.forward(&Binary { kind }, &[a, b])?)
+    }
+
+    fn unary(&self, kind: UnaryKind, x: &Tensor) -> Result<Tensor> {
+        Ok(self.0.forward(&Unary { kind }, &[x])?)
+    }
+
+    fn affine(&self, x: &Tensor, scale: f64) -> Result<Tensor> {
+        Ok(self.0.forward(&Affine { scale, bias: 0.0 }, &[x])?)
+    }
+
+    /// `cap · tanh(x / cap)`.
+    fn softcap(&self, x: &Tensor, cap: f64) -> Result<Tensor> {
+        let t = self.unary(UnaryKind::Tanh, &self.affine(x, 1.0 / cap)?)?;
+        self.affine(&t, cap)
+    }
+}
+
+impl Model {
+    /// Reads the configuration and maps the weights of a model directory.
+    ///
+    /// # Errors
+    ///
+    /// For an unsupported architecture, or missing or unreadable weights.
+    pub fn load(checkpoint: &Checkpoint) -> Result<Self> {
+        let raw_config = checkpoint.config()?;
+        let config = Config::from_json(&raw_config)?;
+        let weights = checkpoint
+            .names()
+            .map(|name| Ok((name.to_string(), checkpoint.tensor(name)?)))
+            .collect::<std::result::Result<_, kapel_hub::HubError>>()?;
+        Ok(Self {
+            config,
+            raw_config,
+            weights,
+        })
+    }
+
+    /// The configuration.
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
+    /// Writes the model to `dir` in the layout of the Hub: `config.json` and
+    /// `model.safetensors`, which `transformers` loads back.
+    ///
+    /// # Errors
+    ///
+    /// If the directory or the files cannot be written.
+    pub fn save(&self, dir: impl AsRef<std::path::Path>) -> Result<()> {
+        let dir = dir.as_ref();
+        let io = |e: std::io::Error| {
+            ModelError::Hub(kapel_hub::HubError::Io {
+                path: dir.to_path_buf(),
+                source: e,
+            })
+        };
+        std::fs::create_dir_all(dir).map_err(io)?;
+        let json = serde_json::to_string_pretty(&self.raw_config).expect("a JSON value serializes");
+        std::fs::write(dir.join("config.json"), json).map_err(io)?;
+        let tensors: Vec<(&str, &Tensor)> =
+            self.weights.iter().map(|(n, t)| (n.as_str(), t)).collect();
+        let metadata = BTreeMap::from([("format".to_string(), "pt".to_string())]);
+        kapel_hub::safetensors::save(dir.join("model.safetensors"), &tensors, &metadata)?;
+        Ok(())
+    }
+
+    fn weight(&self, name: &str) -> Result<&Tensor> {
+        self.weights
+            .get(name)
+            .ok_or_else(|| ModelError::MissingWeight(name.to_string()))
+    }
+
+    fn optional(&self, name: &str) -> Option<&Tensor> {
+        self.weights.get(name)
+    }
+
+    fn norm<B: Backend>(&self, ops: &Ops<'_, B>, x: &Tensor, prefix: &str) -> Result<Tensor> {
+        let w = self.weight(&format!("{prefix}.weight"))?;
+        Ok(match self.config.norm {
+            Norm::Rms { offset } => ops.0.forward(
+                &RmsNorm {
+                    eps: self.config.eps,
+                    weight_offset: offset,
+                },
+                &[x, w],
+            )?,
+            Norm::Layer => {
+                let b = self.weight(&format!("{prefix}.bias"))?;
+                ops.0.forward(
+                    &LayerNorm {
+                        eps: self.config.eps,
+                    },
+                    &[x, w, b],
+                )?
+            }
+        })
+    }
+
+    /// The logits `[T, vocab]` of the token ids `ids`, one sequence, without a
+    /// cache: every position sees the ones before it.
+    ///
+    /// # Errors
+    ///
+    /// If a weight is missing, or an operation fails on the backend.
+    pub fn forward<B: Backend + Transfer>(&self, backend: &B, ids: &[u32]) -> Result<Tensor> {
+        let c = &self.config;
+        let ops = Ops(backend);
+        let t = ids.len();
+        let ids_tensor = backend.upload(&Tensor::from_slice(ids, &[t])?)?;
+        let positions = backend.upload(&Tensor::from_slice(
+            &(0..t as u32).collect::<Vec<_>>(),
+            &[t],
+        )?)?;
+
+        let (embed_name, prefix) = match c.block {
+            Block::Gpt2 => ("transformer.wte.weight", "transformer.h"),
+            _ => ("model.embed_tokens.weight", "model.layers"),
+        };
+        let embed = self.weight(embed_name)?;
+        let mut x = backend.forward(&GatherRows, &[embed, &ids_tensor])?;
+        if let Some(scale) = c.embed_scale {
+            // Gemma rounds the factor to the type of the hidden states.
+            x = ops.affine(&x, f64::from(scale as f32))?;
+        }
+        if c.block == Block::Gpt2 {
+            let wpe = backend.forward(
+                &GatherRows,
+                &[self.weight("transformer.wpe.weight")?, &positions],
+            )?;
+            x = ops.binary(BinaryKind::Add, &x, &wpe)?;
+        }
+
+        for layer in 0..c.layers {
+            let p = format!("{prefix}.{layer}");
+            x = match c.block {
+                Block::Sequential | Block::Sandwich => {
+                    let h = self.norm(&ops, &x, &format!("{p}.input_layernorm"))?;
+                    let mut a = self.attention(&ops, &h, &positions, layer, &p)?;
+                    if c.block == Block::Sandwich {
+                        a = self.norm(&ops, &a, &format!("{p}.post_attention_layernorm"))?;
+                    }
+                    let x = ops.binary(BinaryKind::Add, &x, &a)?;
+                    let before = if c.block == Block::Sandwich {
+                        "pre_feedforward_layernorm"
+                    } else {
+                        "post_attention_layernorm"
+                    };
+                    let h = self.norm(&ops, &x, &format!("{p}.{before}"))?;
+                    let gate =
+                        ops.linear(&h, self.weight(&format!("{p}.mlp.gate_proj.weight"))?, None)?;
+                    let up =
+                        ops.linear(&h, self.weight(&format!("{p}.mlp.up_proj.weight"))?, None)?;
+                    let inner =
+                        ops.binary(BinaryKind::Mul, &ops.unary(c.activation, &gate)?, &up)?;
+                    let mut m = ops.linear(
+                        &inner,
+                        self.weight(&format!("{p}.mlp.down_proj.weight"))?,
+                        None,
+                    )?;
+                    if c.block == Block::Sandwich {
+                        m = self.norm(&ops, &m, &format!("{p}.post_feedforward_layernorm"))?;
+                    }
+                    ops.binary(BinaryKind::Add, &x, &m)?
+                }
+                Block::Parallel => {
+                    let h = self.norm(&ops, &x, &format!("{p}.input_layernorm"))?;
+                    let a = self.attention(&ops, &h, &positions, layer, &p)?;
+                    let fc1 = ops.linear(
+                        &h,
+                        self.weight(&format!("{p}.mlp.fc1.weight"))?,
+                        self.optional(&format!("{p}.mlp.fc1.bias")),
+                    )?;
+                    let fc2 = ops.linear(
+                        &ops.unary(c.activation, &fc1)?,
+                        self.weight(&format!("{p}.mlp.fc2.weight"))?,
+                        self.optional(&format!("{p}.mlp.fc2.bias")),
+                    )?;
+                    ops.binary(BinaryKind::Add, &ops.binary(BinaryKind::Add, &x, &a)?, &fc2)?
+                }
+                Block::Gpt2 => {
+                    let h = self.norm(&ops, &x, &format!("{p}.ln_1"))?;
+                    let a = self.attention(&ops, &h, &positions, layer, &p)?;
+                    let x = ops.binary(BinaryKind::Add, &x, &a)?;
+                    let h = self.norm(&ops, &x, &format!("{p}.ln_2"))?;
+                    // GPT-2's `Conv1D` stores `[in, out]`: `y = x · w`.
+                    let fc = ops.bias(
+                        backend.forward(
+                            &Matmul,
+                            &[&h, self.weight(&format!("{p}.mlp.c_fc.weight"))?],
+                        )?,
+                        self.optional(&format!("{p}.mlp.c_fc.bias")),
+                    )?;
+                    let out = ops.bias(
+                        backend.forward(
+                            &Matmul,
+                            &[
+                                &ops.unary(c.activation, &fc)?,
+                                self.weight(&format!("{p}.mlp.c_proj.weight"))?,
+                            ],
+                        )?,
+                        self.optional(&format!("{p}.mlp.c_proj.bias")),
+                    )?;
+                    ops.binary(BinaryKind::Add, &x, &out)?
+                }
+            };
+        }
+
+        let final_norm = match c.block {
+            Block::Gpt2 => "transformer.ln_f",
+            Block::Parallel => "model.final_layernorm",
+            _ => "model.norm",
+        };
+        let h = self.norm(&ops, &x, final_norm)?;
+        let head = match self.optional("lm_head.weight") {
+            Some(w) if !c.tie_embeddings => w,
+            _ => embed,
+        };
+        let mut logits = ops.linear(
+            &h,
+            head,
+            self.optional("lm_head.bias").filter(|_| c.lm_head_bias),
+        )?;
+        if let Some(cap) = c.final_softcap {
+            logits = ops.softcap(&logits, cap)?;
+        }
+        Ok(logits)
+    }
+
+    /// The attention of one block: `[T, hidden]` to `[T, hidden]`.
+    fn attention<B: Backend>(
+        &self,
+        ops: &Ops<'_, B>,
+        h: &Tensor,
+        positions: &Tensor,
+        layer: usize,
+        p: &str,
+    ) -> Result<Tensor> {
+        let c = &self.config;
+        let t = h.shape()[0];
+        let (hq, hkv, d) = (c.heads, c.kv_heads, c.head_dim);
+        let bias = |name: &str| {
+            if c.qkv_bias {
+                self.optional(name)
+            } else {
+                None
+            }
+        };
+        let (q, k, v) = if c.block == Block::Gpt2 {
+            let w = self.weight(&format!("{p}.attn.c_attn.weight"))?;
+            let qkv = ops.bias(
+                ops.0.forward(&Matmul, &[h, w])?,
+                self.optional(&format!("{p}.attn.c_attn.bias")),
+            )?;
+            let width = hq * d;
+            (
+                qkv.narrow(1, 0, width)?,
+                qkv.narrow(1, width, width)?,
+                qkv.narrow(1, 2 * width, width)?,
+            )
+        } else {
+            let proj = |name: &str| {
+                ops.linear(
+                    h,
+                    self.weight(&format!("{p}.self_attn.{name}.weight"))?,
+                    bias(&format!("{p}.self_attn.{name}.bias")),
+                )
+            };
+            (proj("q_proj")?, proj("k_proj")?, proj("v_proj")?)
+        };
+        // [T, H·D] → [T, H, D] → [1, H, T, D], as views.
+        let heads = |x: Tensor, n: usize, norm: Option<&str>| -> Result<Tensor> {
+            let mut x = x.contiguous()?.reshape(&[t, n, d])?;
+            if let Some(name) = norm {
+                let w = self.weight(&format!("{p}.self_attn.{name}.weight"))?;
+                x = ops.0.forward(
+                    &RmsNorm {
+                        eps: c.eps,
+                        weight_offset: 0.0,
+                    },
+                    &[&x, w],
+                )?;
+            }
+            Ok(x.reshape(&[1, t, n, d])?.transpose(1, 2)?)
+        };
+        let mut q = heads(q, hq, c.qk_norm.then_some("q_norm"))?;
+        let mut k = heads(k, hkv, c.qk_norm.then_some("k_norm"))?;
+        let v = heads(v, hkv, None)?;
+        if let Some((theta, scaling, rotary_dim)) = c.rope {
+            let rope = Rope {
+                theta,
+                layout: c.rope_layout,
+                rotary_dim: Some(rotary_dim),
+                scaling,
+            };
+            q = ops.0.forward(&rope, &[&q, positions])?;
+            k = ops.0.forward(&rope, &[&k, positions])?;
+        }
+        let attention = Attention {
+            causal: true,
+            window: c.windows[layer],
+            scale: c.query_scale,
+            softcap: c.attn_softcap,
+        };
+        let y = ops.0.forward(&attention, &[&q, &k, &v])?;
+        // [1, H, T, D] → [T, H·D].
+        let y = y.transpose(1, 2)?.contiguous()?.reshape(&[t, hq * d])?;
+        Ok(if c.block == Block::Gpt2 {
+            ops.bias(
+                ops.0.forward(
+                    &Matmul,
+                    &[&y, self.weight(&format!("{p}.attn.c_proj.weight"))?],
+                )?,
+                self.optional(&format!("{p}.attn.c_proj.bias")),
+            )?
+        } else {
+            let out = if c.block == Block::Parallel {
+                "dense"
+            } else {
+                "o_proj"
+            };
+            let bias = if c.out_bias {
+                self.optional(&format!("{p}.self_attn.{out}.bias"))
+            } else {
+                None
+            };
+            ops.linear(
+                &y,
+                self.weight(&format!("{p}.self_attn.{out}.weight"))?,
+                bias,
+            )?
+        })
+    }
+}

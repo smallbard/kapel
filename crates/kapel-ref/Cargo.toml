@@ -1,0 +1,16 @@
+[package]
+name = "kapel-ref"
+description = "The reference backend: every operation in plain f64, written to be read."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+kapel-core.workspace = true
+kapel-ops.workspace = true
