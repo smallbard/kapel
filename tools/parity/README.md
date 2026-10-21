@@ -13,8 +13,10 @@ KAPEL_REQUIRE_PARITY=1 cargo test --release --workspace
 
 The parity tests are `gguf::tests::every_format_dequantizes_as_llama_cpp_does`
 (kapel-hub), `tests::encodings_match_the_tokenizers_library` and
-`chat::tests::renderings_match_transformers` (kapel-tokenizers), and
-`logits_match_transformers_and_survive_a_save` (kapel-models).
+`chat::tests::renderings_match_transformers` (kapel-tokenizers),
+`logits_match_transformers_and_survive_a_save` (kapel-models), and, on an NVIDIA card,
+`models_on_the_card_match_transformers` (kapel-cuda, feature `cuda`: `f32` against
+`transformers`, `bf16` against the processor's `bf16`).
 
 Chat templates that write today's date (`strftime_now`, as Llama 3's does) are
 rendered at a fixed time on both sides: `FIXED_NOW` in `chat_reference.py` and

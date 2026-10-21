@@ -3,8 +3,19 @@
 //!
 //! A [`Model`] reads `config.json` into a [`Config`] and maps the weights of a
 //! model directory; [`Model::forward`] computes logits on any backend of the
-//! catalogue. The parity tool (`tools/parity`) checks them against
-//! `transformers`.
+//! catalogue. The weights stay in host memory: for a backend with its own
+//! device, [`Model::upload`] copies them there, and [`Model::cast`] converts
+//! them, to compute in `bf16` for instance:
+//!
+//! ```ignore
+//! let cuda = kapel_cuda::Cuda::new(0)?;
+//! let model = Model::load(&Checkpoint::open(dir)?)?
+//!     .upload(&cuda)?
+//!     .cast(&cuda, DType::BF16)?;
+//! let logits = cuda.download(&model.forward(&cuda, &ids)?)?;
+//! ```
+//!
+//! The parity tool (`tools/parity`) checks the logits against `transformers`.
 
 mod config;
 mod model;
