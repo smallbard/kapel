@@ -19,7 +19,7 @@ use std::sync::Arc;
 use cutile::cuda_async::device_operation::DeviceOp;
 use cutile::half::{bf16, f16};
 use cutile::tensor::{IntoPartition, Tensor as TileTensor};
-use cutile::tile_kernel::TileKernel;
+use cutile::tile_kernel::{CompileOptions, TileKernel};
 use kapel_core::{DType, Error, Layout, Result, Tensor};
 use kapel_ops::{Attention, Operation, Transfer};
 
@@ -35,8 +35,10 @@ mod kernels {
     ///
     /// Key `j` is seen by query `i` if both exist, `j ≤ p(i) + ahead` (`ahead`
     /// is 0 for causal attention, `tk` otherwise) and `p(i) − j < window` (more
-    /// than `tk` without a window), with `p(i) = tk − tq + i`; and if its score
-    /// is not −∞ (from the mask).
+    /// than `tk` without a window), with `p(i) = tk − tq + i`. Only the tiles
+    /// on an edge of the visible region compute it: their hidden scores become
+    /// `HIDDEN`, below the running maximum's start, so their weights vanish.
+    /// Scores of −∞ (from the mask) vanish by themselves.
     #[cutile::entry()]
     fn attention_forward<
         E: ElementType,
@@ -67,9 +69,6 @@ mod kernels {
         let h: i32 = pid.0 % heads;
         let qi: i32 = pid.1;
         let kv: i32 = h / group;
-        let transpose: Array<{ [1, 0] }> = Array::<{ [1, 0] }> {
-            dims: &[1i32, 0i32],
-        };
         let tile_q: Tile<E, { [BM, D] }> = q
             .partition(shape![1, 1, BM, D])
             .load([b, h, qi, 0i32])
@@ -77,34 +76,28 @@ mod kernels {
         let k_part = k.partition(shape![1, 1, BN, D]);
         let v_part = v.partition(shape![1, 1, BN, DV]);
         let mask_part = mask.partition(shape![1, 1, BM, BN]);
-        let rows: Tile<i32, { [BM] }> = iota(shape![BM]);
-        let i: Tile<i32, { [BM, BN] }> = rows.reshape(shape![BM, 1]).broadcast(shape![BM, BN])
-            + broadcast_scalar(qi * BM, shape![BM, BN]);
-        let cols: Tile<i32, { [BN] }> = iota(shape![BN]);
-        let cols: Tile<i32, { [BM, BN] }> = cols.reshape(shape![1, BN]).broadcast(shape![BM, BN]);
-        let p: Tile<i32, { [BM, BN] }> = i + broadcast_scalar(tk - tq, shape![BM, BN]);
-        let query_exists: Tile<bool, { [BM, BN] }> =
-            lt_tile(i, broadcast_scalar(tq, shape![BM, BN]));
-        let key_end: Tile<i32, { [BM, BN] }> = broadcast_scalar(tk, shape![BM, BN]);
-        let ahead_tile: Tile<i32, { [BM, BN] }> = broadcast_scalar(ahead, shape![BM, BN]);
-        let window_tile: Tile<i32, { [BM, BN] }> = broadcast_scalar(window, shape![BM, BN]);
-        let hidden: Tile<f32, { [BM, BN] }> = constant(-1.0e30f32, shape![BM, BN]);
         let zeros: Tile<f32, { [BM, BN] }> = constant(0.0f32, shape![BM, BN]);
         let scale_tile: Tile<f32, { [BM, BN] }> = broadcast_scalar(scale, shape![BM, BN]);
+        let log2e: f32 = 1.442_695_f32;
+        let log2e_tile: Tile<f32, { [BM, BN] }> = broadcast_scalar(log2e, shape![BM, BN]);
+        let log2e_col: Tile<f32, { [BM, 1] }> = broadcast_scalar(log2e, shape![BM, 1]);
         let mut m_i: Tile<f32, { [BM, 1] }> = constant(-1.0e30f32, shape![BM, 1]);
         let mut l_i: Tile<f32, { [BM, 1] }> = constant(0.0f32, shape![BM, 1]);
         let mut acc: Tile<f32, { [BM, DV] }> = constant(0.0f32, shape![BM, DV]);
-        // Only the key tiles that some query of this tile may see.
+        // The key tiles that some query of this tile may see, and among them
+        // those that every query sees.
         let first: i32 = tk - tq + qi * BM;
         let last: i32 = min(tk, first + BM + ahead);
         let end: i32 = ceil_div(last, BN);
         let lowest: i32 = first - window + 1i32;
         let start: i32 = max(0i32, lowest) / BN;
+        let full_lo: i32 = ceil_div(max(0i32, first + BM - window), BN);
+        let full_hi: i32 = min(first + ahead + 1i32, tk) / BN;
+        let queries_end: i32 = (qi + 1i32) * BM;
         for jt in start..end {
             let tile_k: Tile<E, { [BN, D] }> =
                 k_part.load([b, kv, jt, 0i32]).reshape(shape![BN, D]);
-            let tile_kt: Tile<E, { [D, BN] }> = permute(tile_k, transpose);
-            let raw: Tile<f32, { [BM, BN] }> = mma(tile_q, tile_kt, zeros);
+            let raw: Tile<f32, { [BM, BN] }> = mma(tile_q, tile_k.transpose(), zeros);
             let mut s: Tile<f32, { [BM, BN] }> = raw * scale_tile;
             if CAPPED == 1i32 {
                 let cap: Tile<f32, { [BM, BN] }> = broadcast_scalar(softcap, shape![BM, BN]);
@@ -115,18 +108,30 @@ mod kernels {
                     mask_part.load([b, h, qi, jt]).reshape(shape![BM, BN]);
                 s = s + m;
             }
-            let j: Tile<i32, { [BM, BN] }> = cols + broadcast_scalar(jt * BN, shape![BM, BN]);
-            let seen: Tile<bool, { [BM, BN] }> = lt_tile(j, key_end)
-                & query_exists
-                & le_tile(j, p + ahead_tile)
-                & lt_tile(p - j, window_tile)
-                & gt_tile(s, hidden);
-            let s: Tile<f32, { [BM, BN] }> = select(seen, s, hidden);
+            if jt < full_lo || jt >= full_hi || queries_end > tq {
+                let rows: Tile<i32, { [BM] }> = iota(shape![BM]);
+                let p: Tile<i32, { [BM, 1] }> =
+                    rows.reshape(shape![BM, 1]) + broadcast_scalar(first, shape![BM, 1]);
+                let p: Tile<i32, { [BM, BN] }> = p.broadcast(shape![BM, BN]);
+                let cols: Tile<i32, { [BN] }> = iota(shape![BN]);
+                let j: Tile<i32, { [1, BN] }> =
+                    cols.reshape(shape![1, BN]) + broadcast_scalar(jt * BN, shape![1, BN]);
+                let j: Tile<i32, { [BM, BN] }> = j.broadcast(shape![BM, BN]);
+                let end_tile: Tile<i32, { [BM, BN] }> = broadcast_scalar(tk, shape![BM, BN]);
+                let ahead_tile: Tile<i32, { [BM, BN] }> = broadcast_scalar(ahead, shape![BM, BN]);
+                let window_tile: Tile<i32, { [BM, BN] }> = broadcast_scalar(window, shape![BM, BN]);
+                let seen: Tile<bool, { [BM, BN] }> = lt_tile(j, end_tile)
+                    & lt_tile(p, end_tile)
+                    & le_tile(j, p + ahead_tile)
+                    & lt_tile(p - j, window_tile);
+                let hidden: Tile<f32, { [BM, BN] }> = constant(-2.0e30f32, shape![BM, BN]);
+                s = select(seen, s, hidden);
+            }
             let row_max: Tile<f32, { [BM] }> = reduce_max(s, 1i32);
             let m_new: Tile<f32, { [BM, 1] }> = max_tile(m_i, row_max.reshape(shape![BM, 1]));
-            let w: Tile<f32, { [BM, BN] }> = exp(s - m_new.broadcast(shape![BM, BN]));
-            let w: Tile<f32, { [BM, BN] }> = select(seen, w, zeros);
-            let alpha: Tile<f32, { [BM, 1] }> = exp(m_i - m_new);
+            let shift: Tile<f32, { [BM, BN] }> = (m_new * log2e_col).broadcast(shape![BM, BN]);
+            let w: Tile<f32, { [BM, BN] }> = exp2(s * log2e_tile - shift, ftz::Enabled);
+            let alpha: Tile<f32, { [BM, 1] }> = exp2((m_i - m_new) * log2e_col, ftz::Enabled);
             let row_sum: Tile<f32, { [BM] }> = reduce_sum(w, 1i32);
             l_i = l_i * alpha + row_sum.reshape(shape![BM, 1]);
             let tile_v: Tile<E, { [BN, DV] }> =
@@ -174,7 +179,7 @@ mod kernels {
     /// The gradient of the queries of tile `pid.1` of head `pid.0`: with the
     /// weights `P` recomputed from `lse`, `∂P = g · vᵀ`,
     /// `∂s = scale · P ⊙ (∂P − δ) ⊙ slope`, the slope being that of the softcap
-    /// (1 without one), and `∂q = ∂s · k`.
+    /// (1 without one), and `∂q = ∂s · k`. Visibility as in the forward pass.
     #[cutile::entry()]
     fn attention_grad_q<
         E: ElementType,
@@ -215,74 +220,75 @@ mod kernels {
             .partition(shape![1, 1, BM, DV])
             .load([b, h, qi, 0i32])
             .reshape(shape![BM, DV]);
+        let log2e: f32 = 1.442_695_f32;
         let tile_lse: Tile<f32, { [BM, 1] }> = lse
             .partition(shape![1, 1, BM])
             .load([pid.0, 0i32, qi])
             .reshape(shape![BM, 1]);
-        let tile_lse: Tile<f32, { [BM, BN] }> = tile_lse.broadcast(shape![BM, BN]);
+        let lse2: Tile<f32, { [BM, BN] }> =
+            (tile_lse * broadcast_scalar(log2e, shape![BM, 1])).broadcast(shape![BM, BN]);
         let tile_delta: Tile<f32, { [BM, 1] }> = delta
             .partition(shape![1, 1, BM])
             .load([pid.0, 0i32, qi])
             .reshape(shape![BM, 1]);
         let tile_delta: Tile<f32, { [BM, BN] }> = tile_delta.broadcast(shape![BM, BN]);
-        let transpose: Array<{ [1, 0] }> = Array::<{ [1, 0] }> {
-            dims: &[1i32, 0i32],
-        };
         let k_part = k.partition(shape![1, 1, BN, D]);
         let v_part = v.partition(shape![1, 1, BN, DV]);
         let mask_part = mask.partition(shape![1, 1, BM, BN]);
-        let rows: Tile<i32, { [BM] }> = iota(shape![BM]);
-        let i: Tile<i32, { [BM, BN] }> = rows.reshape(shape![BM, 1]).broadcast(shape![BM, BN])
-            + broadcast_scalar(qi * BM, shape![BM, BN]);
-        let cols: Tile<i32, { [BN] }> = iota(shape![BN]);
-        let cols: Tile<i32, { [BM, BN] }> = cols.reshape(shape![1, BN]).broadcast(shape![BM, BN]);
-        let p: Tile<i32, { [BM, BN] }> = i + broadcast_scalar(tk - tq, shape![BM, BN]);
-        let query_exists: Tile<bool, { [BM, BN] }> =
-            lt_tile(i, broadcast_scalar(tq, shape![BM, BN]));
-        let key_end: Tile<i32, { [BM, BN] }> = broadcast_scalar(tk, shape![BM, BN]);
-        let ahead_tile: Tile<i32, { [BM, BN] }> = broadcast_scalar(ahead, shape![BM, BN]);
-        let window_tile: Tile<i32, { [BM, BN] }> = broadcast_scalar(window, shape![BM, BN]);
-        let hidden: Tile<f32, { [BM, BN] }> = constant(-1.0e30f32, shape![BM, BN]);
         let zeros: Tile<f32, { [BM, BN] }> = constant(0.0f32, shape![BM, BN]);
-        let ones: Tile<f32, { [BM, BN] }> = constant(1.0f32, shape![BM, BN]);
         let scale_tile: Tile<f32, { [BM, BN] }> = broadcast_scalar(scale, shape![BM, BN]);
+        let log2e_tile: Tile<f32, { [BM, BN] }> = broadcast_scalar(log2e, shape![BM, BN]);
         let mut acc: Tile<f32, { [BM, D] }> = constant(0.0f32, shape![BM, D]);
         let first: i32 = tk - tq + qi * BM;
         let last: i32 = min(tk, first + BM + ahead);
         let end: i32 = ceil_div(last, BN);
         let lowest: i32 = first - window + 1i32;
         let start: i32 = max(0i32, lowest) / BN;
+        let full_lo: i32 = ceil_div(max(0i32, first + BM - window), BN);
+        let full_hi: i32 = min(first + ahead + 1i32, tk) / BN;
+        let queries_end: i32 = (qi + 1i32) * BM;
         for jt in start..end {
             let tile_k: Tile<E, { [BN, D] }> =
                 k_part.load([b, kv, jt, 0i32]).reshape(shape![BN, D]);
-            let tile_kt: Tile<E, { [D, BN] }> = permute(tile_k, transpose);
-            let raw: Tile<f32, { [BM, BN] }> = mma(tile_q, tile_kt, zeros);
+            let raw: Tile<f32, { [BM, BN] }> = mma(tile_q, tile_k.transpose(), zeros);
             let mut s: Tile<f32, { [BM, BN] }> = raw * scale_tile;
-            let mut slope: Tile<f32, { [BM, BN] }> = ones;
+            let mut ds_scale: Tile<f32, { [BM, BN] }> = scale_tile;
             if CAPPED == 1i32 {
                 let cap: Tile<f32, { [BM, BN] }> = broadcast_scalar(softcap, shape![BM, BN]);
                 let t: Tile<f32, { [BM, BN] }> = tanh(true_div(s, cap));
                 s = cap * t;
-                slope = ones - t * t;
+                let ones: Tile<f32, { [BM, BN] }> = constant(1.0f32, shape![BM, BN]);
+                ds_scale = scale_tile * (ones - t * t);
             }
             if MASKED == 1i32 {
                 let m: Tile<f32, { [BM, BN] }> =
                     mask_part.load([b, h, qi, jt]).reshape(shape![BM, BN]);
                 s = s + m;
             }
-            let j: Tile<i32, { [BM, BN] }> = cols + broadcast_scalar(jt * BN, shape![BM, BN]);
-            let seen: Tile<bool, { [BM, BN] }> = lt_tile(j, key_end)
-                & query_exists
-                & le_tile(j, p + ahead_tile)
-                & lt_tile(p - j, window_tile)
-                & gt_tile(s, hidden);
-            let w: Tile<f32, { [BM, BN] }> = exp(s - tile_lse);
-            let w: Tile<f32, { [BM, BN] }> = select(seen, w, zeros);
+            if jt < full_lo || jt >= full_hi || queries_end > tq {
+                let rows: Tile<i32, { [BM] }> = iota(shape![BM]);
+                let p: Tile<i32, { [BM, 1] }> =
+                    rows.reshape(shape![BM, 1]) + broadcast_scalar(first, shape![BM, 1]);
+                let p: Tile<i32, { [BM, BN] }> = p.broadcast(shape![BM, BN]);
+                let cols: Tile<i32, { [BN] }> = iota(shape![BN]);
+                let j: Tile<i32, { [1, BN] }> =
+                    cols.reshape(shape![1, BN]) + broadcast_scalar(jt * BN, shape![1, BN]);
+                let j: Tile<i32, { [BM, BN] }> = j.broadcast(shape![BM, BN]);
+                let end_tile: Tile<i32, { [BM, BN] }> = broadcast_scalar(tk, shape![BM, BN]);
+                let ahead_tile: Tile<i32, { [BM, BN] }> = broadcast_scalar(ahead, shape![BM, BN]);
+                let window_tile: Tile<i32, { [BM, BN] }> = broadcast_scalar(window, shape![BM, BN]);
+                let seen: Tile<bool, { [BM, BN] }> = lt_tile(j, end_tile)
+                    & lt_tile(p, end_tile)
+                    & le_tile(j, p + ahead_tile)
+                    & lt_tile(p - j, window_tile);
+                let hidden: Tile<f32, { [BM, BN] }> = constant(-2.0e30f32, shape![BM, BN]);
+                s = select(seen, s, hidden);
+            }
+            let w: Tile<f32, { [BM, BN] }> = exp2(s * log2e_tile - lse2, ftz::Enabled);
             let tile_v: Tile<E, { [BN, DV] }> =
                 v_part.load([b, kv, jt, 0i32]).reshape(shape![BN, DV]);
-            let tile_vt: Tile<E, { [DV, BN] }> = permute(tile_v, transpose);
-            let dw: Tile<f32, { [BM, BN] }> = mma(tile_g, tile_vt, zeros);
-            let ds: Tile<f32, { [BM, BN] }> = w * (dw - tile_delta) * slope * scale_tile;
+            let dw: Tile<f32, { [BM, BN] }> = mma(tile_g, tile_v.transpose(), zeros);
+            let ds: Tile<f32, { [BM, BN] }> = w * (dw - tile_delta) * ds_scale;
             let ds: Tile<E, { [BM, BN] }> = convert_tile(ds);
             acc = mma(ds, tile_k, acc);
         }
@@ -335,81 +341,88 @@ mod kernels {
             .partition(shape![1, 1, BN, DV])
             .load([b, kv, kj, 0i32])
             .reshape(shape![BN, DV]);
-        let transpose: Array<{ [1, 0] }> = Array::<{ [1, 0] }> {
-            dims: &[1i32, 0i32],
-        };
         let q_part = q.partition(shape![1, 1, BM, D]);
         let g_part = g.partition(shape![1, 1, BM, DV]);
         let lse_part = lse.partition(shape![1, 1, BM]);
         let delta_part = delta.partition(shape![1, 1, BM]);
         let mask_part = mask.partition(shape![1, 1, BM, BN]);
-        // Rows are keys, columns queries.
-        let rows: Tile<i32, { [BN] }> = iota(shape![BN]);
-        let j: Tile<i32, { [BN, BM] }> = rows.reshape(shape![BN, 1]).broadcast(shape![BN, BM])
-            + broadcast_scalar(kj * BN, shape![BN, BM]);
-        let cols: Tile<i32, { [BM] }> = iota(shape![BM]);
-        let cols: Tile<i32, { [BN, BM] }> = cols.reshape(shape![1, BM]).broadcast(shape![BN, BM]);
-        let key_exists: Tile<bool, { [BN, BM] }> = lt_tile(j, broadcast_scalar(tk, shape![BN, BM]));
-        let query_end: Tile<i32, { [BN, BM] }> = broadcast_scalar(tq, shape![BN, BM]);
-        let ahead_tile: Tile<i32, { [BN, BM] }> = broadcast_scalar(ahead, shape![BN, BM]);
-        let window_tile: Tile<i32, { [BN, BM] }> = broadcast_scalar(window, shape![BN, BM]);
-        let hidden: Tile<f32, { [BN, BM] }> = constant(-1.0e30f32, shape![BN, BM]);
         let zeros: Tile<f32, { [BN, BM] }> = constant(0.0f32, shape![BN, BM]);
-        let ones: Tile<f32, { [BN, BM] }> = constant(1.0f32, shape![BN, BM]);
         let scale_tile: Tile<f32, { [BN, BM] }> = broadcast_scalar(scale, shape![BN, BM]);
+        let log2e: f32 = 1.442_695_f32;
+        let log2e_tile: Tile<f32, { [BN, BM] }> = broadcast_scalar(log2e, shape![BN, BM]);
+        let log2e_row: Tile<f32, { [1, BM] }> = broadcast_scalar(log2e, shape![1, BM]);
         let mut acc_k: Tile<f32, { [BN, D] }> = constant(0.0f32, shape![BN, D]);
         let mut acc_v: Tile<f32, { [BN, DV] }> = constant(0.0f32, shape![BN, DV]);
-        // Only the query tiles that may see some key of this tile: query `i`
-        // sees key `j` only if `j − ahead ≤ p(i)` and `p(i) < j + window`.
+        // The query tiles that may see some key of this tile: query `i` sees
+        // key `j` only if `j − ahead ≤ p(i)` and `p(i) < j + window`; and
+        // among them those whose queries all see all its keys.
         let shift: i32 = tk - tq;
         let lowest: i32 = kj * BN - ahead - shift;
         let start: i32 = max(0i32, lowest) / BM;
         let highest: i32 = kj * BN + BN - 1i32 + window - shift;
         let last: i32 = min(tq, highest);
         let end: i32 = ceil_div(max(0i32, last), BM);
+        let full_lo: i32 = ceil_div(max(0i32, lowest + BN - 1i32), BM);
+        let widest: i32 = max(-1i32, window - shift - BM + kj * BN);
+        let full_hi: i32 = min((widest + BM) / BM, tq / BM);
+        let keys_end: i32 = (kj + 1i32) * BN;
         for gh in 0i32..group {
             let h: i32 = kv * group + gh;
             let bh: i32 = b * heads + h;
             for qi in start..end {
                 let tile_q: Tile<E, { [BM, D] }> =
                     q_part.load([b, h, qi, 0i32]).reshape(shape![BM, D]);
-                let tile_qt: Tile<E, { [D, BM] }> = permute(tile_q, transpose);
-                let raw: Tile<f32, { [BN, BM] }> = mma(tile_k, tile_qt, zeros);
+                // Rows are keys, columns queries.
+                let raw: Tile<f32, { [BN, BM] }> = mma(tile_k, tile_q.transpose(), zeros);
                 let mut s: Tile<f32, { [BN, BM] }> = raw * scale_tile;
-                let mut slope: Tile<f32, { [BN, BM] }> = ones;
+                let mut ds_scale: Tile<f32, { [BN, BM] }> = scale_tile;
                 if CAPPED == 1i32 {
                     let cap: Tile<f32, { [BN, BM] }> = broadcast_scalar(softcap, shape![BN, BM]);
                     let t: Tile<f32, { [BN, BM] }> = tanh(true_div(s, cap));
                     s = cap * t;
-                    slope = ones - t * t;
+                    let ones: Tile<f32, { [BN, BM] }> = constant(1.0f32, shape![BN, BM]);
+                    ds_scale = scale_tile * (ones - t * t);
                 }
                 if MASKED == 1i32 {
                     let m: Tile<f32, { [BM, BN] }> =
                         mask_part.load([b, h, qi, kj]).reshape(shape![BM, BN]);
-                    let m: Tile<f32, { [BN, BM] }> = permute(m, transpose);
-                    s = s + m;
+                    s = s + m.transpose();
                 }
-                let i: Tile<i32, { [BN, BM] }> = cols + broadcast_scalar(qi * BM, shape![BN, BM]);
-                let p: Tile<i32, { [BN, BM] }> = i + broadcast_scalar(shift, shape![BN, BM]);
-                let seen: Tile<bool, { [BN, BM] }> = key_exists
-                    & lt_tile(i, query_end)
-                    & le_tile(j, p + ahead_tile)
-                    & lt_tile(p - j, window_tile)
-                    & gt_tile(s, hidden);
+                if qi < full_lo || qi >= full_hi || keys_end > tk {
+                    let rows: Tile<i32, { [BN] }> = iota(shape![BN]);
+                    let j: Tile<i32, { [BN, 1] }> =
+                        rows.reshape(shape![BN, 1]) + broadcast_scalar(kj * BN, shape![BN, 1]);
+                    let j: Tile<i32, { [BN, BM] }> = j.broadcast(shape![BN, BM]);
+                    let cols: Tile<i32, { [BM] }> = iota(shape![BM]);
+                    let p: Tile<i32, { [1, BM] }> = cols.reshape(shape![1, BM])
+                        + broadcast_scalar(shift + qi * BM, shape![1, BM]);
+                    let p: Tile<i32, { [BN, BM] }> = p.broadcast(shape![BN, BM]);
+                    let end_tile: Tile<i32, { [BN, BM] }> = broadcast_scalar(tk, shape![BN, BM]);
+                    let ahead_tile: Tile<i32, { [BN, BM] }> =
+                        broadcast_scalar(ahead, shape![BN, BM]);
+                    let window_tile: Tile<i32, { [BN, BM] }> =
+                        broadcast_scalar(window, shape![BN, BM]);
+                    let seen: Tile<bool, { [BN, BM] }> = lt_tile(j, end_tile)
+                        & lt_tile(p, end_tile)
+                        & le_tile(j, p + ahead_tile)
+                        & lt_tile(p - j, window_tile);
+                    let hidden: Tile<f32, { [BN, BM] }> = constant(-2.0e30f32, shape![BN, BM]);
+                    s = select(seen, s, hidden);
+                }
                 let tile_lse: Tile<f32, { [1, BM] }> =
                     lse_part.load([bh, 0i32, qi]).reshape(shape![1, BM]);
-                let w: Tile<f32, { [BN, BM] }> = exp(s - tile_lse.broadcast(shape![BN, BM]));
-                let w: Tile<f32, { [BN, BM] }> = select(seen, w, zeros);
+                let lse2: Tile<f32, { [BN, BM] }> =
+                    (tile_lse * log2e_row).broadcast(shape![BN, BM]);
+                let w: Tile<f32, { [BN, BM] }> = exp2(s * log2e_tile - lse2, ftz::Enabled);
                 let tile_g: Tile<E, { [BM, DV] }> =
                     g_part.load([b, h, qi, 0i32]).reshape(shape![BM, DV]);
                 let we: Tile<E, { [BN, BM] }> = convert_tile(w);
                 acc_v = mma(we, tile_g, acc_v);
-                let tile_gt: Tile<E, { [DV, BM] }> = permute(tile_g, transpose);
-                let dw: Tile<f32, { [BN, BM] }> = mma(tile_v, tile_gt, zeros);
+                let dw: Tile<f32, { [BN, BM] }> = mma(tile_v, tile_g.transpose(), zeros);
                 let tile_delta: Tile<f32, { [1, BM] }> =
                     delta_part.load([bh, 0i32, qi]).reshape(shape![1, BM]);
                 let ds: Tile<f32, { [BN, BM] }> =
-                    w * (dw - tile_delta.broadcast(shape![BN, BM])) * slope * scale_tile;
+                    w * (dw - tile_delta.broadcast(shape![BN, BM])) * ds_scale;
                 let ds: Tile<E, { [BN, BM] }> = convert_tile(ds);
                 acc_k = mma(ds, tile_q, acc_k);
             }
@@ -430,36 +443,91 @@ struct Heads {
     strides: Vec<i32>,
 }
 
-/// The tile sizes: queries and keys per tile, and the head widths padded to a
-/// power of two (the loads read zeros past the true width). The kernel of the
-/// gradients of keys and values keeps two accumulators of `keys × width`: it
-/// takes fewer keys per tile, `kv_bn`.
+/// How one kernel runs: queries and keys per tile, and the compiler's hints.
+#[derive(Clone, Copy)]
+struct Launch {
+    tiles: [usize; 2],
+    occupancy: Option<i32>,
+    warps: Option<i32>,
+}
+
+impl Launch {
+    const fn new(queries: usize, keys: usize) -> Self {
+        Self {
+            tiles: [queries, keys],
+            occupancy: None,
+            warps: None,
+        }
+    }
+
+    /// Asks for `blocks` tile blocks per multiprocessor.
+    const fn occupancy(mut self, blocks: i32) -> Self {
+        self.occupancy = Some(blocks);
+        self
+    }
+
+    /// Asks for `warps` warps per tile block.
+    const fn warps(mut self, warps: i32) -> Self {
+        self.warps = Some(warps);
+        self
+    }
+
+    fn options(&self) -> CompileOptions {
+        let mut options = CompileOptions::new();
+        if let Some(blocks) = self.occupancy {
+            options = options.occupancy(blocks);
+        }
+        if let Some(warps) = self.warps {
+            options = options.num_worker_warps_per_cta(warps);
+        }
+        options
+    }
+}
+
+/// How each kernel runs, and the head widths padded to a power of two (the
+/// loads read zeros past the true width).
 struct Tiles {
-    bm: usize,
-    bn: usize,
-    kv_bn: usize,
+    forward: Launch,
+    grad_q: Launch,
+    grad_kv: Launch,
     d: usize,
     dv: usize,
 }
 
 impl Tiles {
+    /// The best of a sweep on an RTX 3090, causal, over 1 to 4 thousand
+    /// positions. Neighbouring choices can be up to 6 times slower: the
+    /// compiler's results do not follow a rule.
     fn for_(dtype: DType, d: usize, dv: usize) -> Self {
         let pad = |n: usize| n.next_power_of_two().max(16);
         let (d, dv) = (pad(d), pad(dv));
-        let (bm, bn) = match dtype {
-            DType::F32 => (32, 32),
-            _ if d.max(dv) > 128 => (64, 32),
-            _ => (64, 64),
+        let l = Launch::new;
+        let (forward, grad_q, grad_kv) = match (dtype, d.max(dv)) {
+            (DType::F32, _) => (l(32, 32), l(32, 32), l(32, 32)),
+            (_, ..=64) => (l(128, 64), l(64, 32), l(64, 32)),
+            (_, ..=128) => (
+                l(128, 32).occupancy(2),
+                l(64, 32).warps(8),
+                l(32, 32).warps(8),
+            ),
+            _ => (
+                l(64, 32).warps(8),
+                l(32, 32).occupancy(2),
+                l(64, 64).warps(8),
+            ),
         };
         Self {
-            bm,
-            bn,
-            kv_bn: bn.min(32),
+            forward,
+            grad_q,
+            grad_kv,
             d,
             dv,
         }
     }
 }
+
+/// The queries per tile of the kernel of `δ`.
+const DELTA_ROWS: usize = 64;
 
 fn int(value: usize) -> Result<i32> {
     i32::try_from(value).map_err(|_| Error::Overflow {
@@ -499,11 +567,11 @@ struct Prepared {
 }
 
 impl Prepared {
-    fn generics(&self) -> Vec<String> {
+    fn generics(&self, [bm, bn]: [usize; 2]) -> Vec<String> {
         let t = &self.tiles;
         [
-            t.bm,
-            t.bn,
+            bm,
+            bn,
             t.d,
             t.dv,
             usize::from(self.masked),
@@ -656,8 +724,8 @@ impl Cuda {
         // keep alive; `y` and `lse` are fresh outputs.
         let launch = unsafe {
             kernels::attention_forward(
-                borrow::<T>(o, &y).partition([1, t.bm, t.dv]),
-                borrow::<f32>(o, &lse).partition([1, t.bm, 1]),
+                borrow::<T>(o, &y).partition([1, t.forward.tiles[0], t.dv]),
+                borrow::<f32>(o, &lse).partition([1, t.forward.tiles[0], 1]),
                 Arc::new(borrow::<T>(o, &a.q)),
                 Arc::new(borrow::<T>(o, &a.k)),
                 Arc::new(borrow::<T>(o, &a.v)),
@@ -672,7 +740,8 @@ impl Cuda {
                 a.window,
             )
         }
-        .generics(a.generics());
+        .generics(a.generics(t.forward.tiles))
+        .compile_options(t.forward.options());
         // SAFETY: as above; the views returned are dropped without freeing.
         unsafe { launch.async_on(self.tile_stream()) }
             .map(drop)
@@ -746,13 +815,17 @@ impl Cuda {
         // kernels that read `delta` are queued after the one that writes it.
         let deltas = unsafe {
             kernels::attention_delta(
-                borrow::<f32>(o, &column(delta)).partition([1, t.bm, 1]),
+                borrow::<f32>(o, &column(delta)).partition([1, DELTA_ROWS, 1]),
                 Arc::new(borrow::<T>(o, y)),
                 Arc::new(borrow::<T>(o, g)),
                 int(hq)?,
             )
         }
-        .generics(vec![a.name.to_string(), t.bm.to_string(), t.dv.to_string()]);
+        .generics(vec![
+            a.name.to_string(),
+            DELTA_ROWS.to_string(),
+            t.dv.to_string(),
+        ]);
         // SAFETY: as above; the views returned are dropped without freeing.
         unsafe { deltas.async_on(stream) }
             .map(drop)
@@ -760,7 +833,7 @@ impl Cuda {
         // SAFETY: (`borrow`) as above.
         let grad_q = unsafe {
             kernels::attention_grad_q(
-                borrow::<T>(o, gq).partition([1, t.bm, t.d]),
+                borrow::<T>(o, gq).partition([1, t.grad_q.tiles[0], t.d]),
                 Arc::new(borrow::<T>(o, &a.q)),
                 Arc::new(borrow::<T>(o, &a.k)),
                 Arc::new(borrow::<T>(o, &a.v)),
@@ -778,7 +851,8 @@ impl Cuda {
                 a.window,
             )
         }
-        .generics(a.generics());
+        .generics(a.generics(t.grad_q.tiles))
+        .compile_options(t.grad_q.options());
         // SAFETY: as above.
         unsafe { grad_q.async_on(stream) }
             .map(drop)
@@ -786,8 +860,8 @@ impl Cuda {
         // SAFETY: (`borrow`) as above.
         let grad_kv = unsafe {
             kernels::attention_grad_kv(
-                borrow::<T>(o, gk).partition([1, t.kv_bn, t.d]),
-                borrow::<T>(o, gv).partition([1, t.kv_bn, t.dv]),
+                borrow::<T>(o, gk).partition([1, t.grad_kv.tiles[1], t.d]),
+                borrow::<T>(o, gv).partition([1, t.grad_kv.tiles[1], t.dv]),
                 Arc::new(borrow::<T>(o, &a.q)),
                 Arc::new(borrow::<T>(o, &a.k)),
                 Arc::new(borrow::<T>(o, &a.v)),
@@ -806,11 +880,8 @@ impl Cuda {
                 a.window,
             )
         }
-        .generics({
-            let mut generics = a.generics();
-            generics[2] = t.kv_bn.to_string();
-            generics
-        });
+        .generics(a.generics(t.grad_kv.tiles))
+        .compile_options(t.grad_kv.options());
         // SAFETY: as above.
         unsafe { grad_kv.async_on(stream) }
             .map(drop)

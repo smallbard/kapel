@@ -13,7 +13,12 @@ use kapel_ops::{Attention, Run, Transfer};
 fn main() -> Result<(), kapel_core::Error> {
     let cuda = Cuda::new(0)?;
     let op = Attention::causal();
-    for (b, h, t, d) in [(4, 16, 1024, 64), (4, 16, 2048, 128), (1, 32, 4096, 128)] {
+    for (b, h, t, d) in [
+        (4, 16, 1024, 64),
+        (4, 16, 2048, 128),
+        (1, 32, 4096, 128),
+        (2, 8, 2048, 256),
+    ] {
         let tensor = |seed: usize| -> Result<Tensor, kapel_core::Error> {
             let values: Vec<BF16> = (0..b * h * t * d)
                 .map(|i| BF16::from_f64(((i * 7919 + seed) % 1000) as f64 / 500.0 - 1.0))

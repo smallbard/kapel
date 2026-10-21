@@ -41,6 +41,9 @@ changelog says how.
 - `kapel-cuda`: attention as cutile-rs tile kernels in the manner of FlashAttention 2,
   forward and backward, with causal and sliding-window masks, additive masks, capped
   scores and grouped keys, deterministic.
+- `kapel-cuda`: tile sizes and compiler hints tuned per kernel and head width on an
+  RTX 3090: bf16 products reach 69 Top/s at `4096³`, attention 44 to 51 Top/s forward
+  and 37 to 41 backward.
 
 ### Security
 

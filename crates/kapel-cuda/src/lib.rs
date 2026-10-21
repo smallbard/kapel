@@ -105,75 +105,111 @@ mod tests {
         }
     }
 
-    /// An attention over several tiles of queries and keys, with grouped
-    /// heads, compared to the reference in both directions, and repeated.
+    /// Attentions over several tiles of queries and keys, with grouped heads,
+    /// compared to the reference in both directions, and repeated: causal;
+    /// with a window and queries after a cache; with a mask holding −∞ and a
+    /// softcap, not causal; for each width of tiles. Tiles inside the visible region and on its edges
+    /// take different paths.
     #[test]
     fn attention_over_many_tiles_matches_the_reference() {
         use kapel_ops::Attention;
         let cuda = cuda();
-        let (b, hq, hkv, t, d) = (2, 8, 2, 200, 64);
+        let (b, hq, hkv) = (2, 8, 2);
         let values = |len: usize, seed: usize| -> Vec<f32> {
             (0..len)
                 .map(|i| ((i * 7919 + seed * 104_729) % 1000) as f32 / 500.0 - 1.0)
                 .collect()
         };
-        for dtype in [DType::F32, DType::BF16] {
-            let host = |len: usize, seed: usize, shape: &[usize]| {
-                let x = Tensor::from_slice(&values(len, seed), shape).unwrap();
-                Run::<kapel_ops::Cast>::forward(
-                    &kapel_ref::Reference,
-                    &kapel_ops::Cast { dtype },
-                    &[&x],
-                )
-                .unwrap()
-            };
-            let q = host(b * hq * t * d, 1, &[b, hq, t, d]);
-            let k = host(b * hkv * t * d, 2, &[b, hkv, t, d]);
-            let v = host(b * hkv * t * d, 3, &[b, hkv, t, d]);
-            let g = host(b * hq * t * d, 4, &[b, hq, t, d]);
-            let op = Attention::causal();
-            let reference = kapel_ref::Reference;
-            let mut expected = vec![reference.forward(&op, &[&q, &k, &v]).unwrap()];
-            expected.extend(
-                reference
-                    .backward(&op, &[&q, &k, &v], &g)
+        let windowed = Attention {
+            window: Some(70),
+            ..Attention::causal()
+        };
+        let capped = Attention {
+            causal: false,
+            softcap: Some(2.0),
+            ..Attention::causal()
+        };
+        for (op, tq, tk, d, masked) in [
+            (Attention::causal(), 200, 200, 64, false),
+            (windowed, 136, 200, 64, false),
+            (capped, 200, 200, 64, true),
+            (Attention::causal(), 200, 200, 128, false),
+            (windowed, 136, 200, 256, false),
+        ] {
+            for dtype in [DType::F32, DType::BF16] {
+                let host = |len: usize, seed: usize, shape: &[usize]| {
+                    let x = Tensor::from_slice(&values(len, seed), shape).unwrap();
+                    Run::<kapel_ops::Cast>::forward(
+                        &kapel_ref::Reference,
+                        &kapel_ops::Cast { dtype },
+                        &[&x],
+                    )
                     .unwrap()
-                    .into_iter()
-                    .map(Option::unwrap),
-            );
-            let [dq, dk, dv, dg] = [&q, &k, &v, &g].map(|x| cuda.upload(x).unwrap());
-            let run = || {
-                let mut got = vec![cuda.forward(&op, &[&dq, &dk, &dv]).unwrap()];
-                got.extend(
-                    cuda.backward(&op, &[&dq, &dk, &dv], &dg)
+                };
+                let mut inputs = vec![
+                    host(b * hq * tq * d, 1, &[b, hq, tq, d]),
+                    host(b * hkv * tk * d, 2, &[b, hkv, tk, d]),
+                    host(b * hkv * tk * d, 3, &[b, hkv, tk, d]),
+                ];
+                if masked {
+                    let mask: Vec<f32> = (0..tq * tk)
+                        .map(|n| match n % 7 {
+                            0 => f32::NEG_INFINITY,
+                            r => r as f32 / 7.0 - 0.5,
+                        })
+                        .collect();
+                    inputs.push(Tensor::from_slice(&mask, &[1, 1, tq, tk]).unwrap());
+                }
+                let g = host(b * hq * tq * d, 4, &[b, hq, tq, d]);
+                let reference = kapel_ref::Reference;
+                let refs: Vec<&Tensor> = inputs.iter().collect();
+                let mut expected = vec![reference.forward(&op, &refs).unwrap()];
+                expected.extend(
+                    reference
+                        .backward(&op, &refs, &g)
                         .unwrap()
                         .into_iter()
+                        .take(3)
                         .map(Option::unwrap),
                 );
-                got.iter()
-                    .map(|x| cuda.download(x).unwrap().to_f64_vec().unwrap())
-                    .collect::<Vec<_>>()
-            };
-            let got = run();
-            assert_eq!(run(), got, "{dtype}: a second run differs");
-            // Products in 16 bits round the weights and the gradients of the
-            // scores to 16 bits as well.
-            let tolerance = match dtype {
-                DType::F32 => conformity::tolerance(dtype),
-                _ => 4.0 * conformity::tolerance(dtype),
-            };
-            for (n, (e, g)) in expected.iter().zip(&got).enumerate() {
-                let e = e.to_f64_vec().unwrap();
-                let tol = tolerance * e.iter().fold(1.0f64, |m, v| m.max(v.abs()));
-                let worst = e
-                    .iter()
-                    .zip(g)
-                    .map(|(a, b)| (a - b).abs())
-                    .fold(0.0, f64::max);
-                assert!(
-                    worst <= tol,
-                    "{dtype} result {n}: error {worst:.2e} above {tol:.2e}"
-                );
+                let on_device: Vec<Tensor> =
+                    inputs.iter().map(|x| cuda.upload(x).unwrap()).collect();
+                let on_device: Vec<&Tensor> = on_device.iter().collect();
+                let dg = cuda.upload(&g).unwrap();
+                let run = || {
+                    let mut got = vec![cuda.forward(&op, &on_device).unwrap()];
+                    got.extend(
+                        cuda.backward(&op, &on_device, &dg)
+                            .unwrap()
+                            .into_iter()
+                            .take(3)
+                            .map(Option::unwrap),
+                    );
+                    got.iter()
+                        .map(|x| cuda.download(x).unwrap().to_f64_vec().unwrap())
+                        .collect::<Vec<_>>()
+                };
+                let got = run();
+                assert_eq!(run(), got, "{op:?} {dtype}: a second run differs");
+                // Products in 16 bits round the weights and the gradients of
+                // the scores to 16 bits as well.
+                let tolerance = match dtype {
+                    DType::F32 => conformity::tolerance(dtype),
+                    _ => 4.0 * conformity::tolerance(dtype),
+                };
+                for (n, (e, g)) in expected.iter().zip(&got).enumerate() {
+                    let e = e.to_f64_vec().unwrap();
+                    let tol = tolerance * e.iter().fold(1.0f64, |m, v| m.max(v.abs()));
+                    let worst = e
+                        .iter()
+                        .zip(g)
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0.0, f64::max);
+                    assert!(
+                        worst <= tol,
+                        "{op:?} {dtype} result {n}: error {worst:.2e} above {tol:.2e}"
+                    );
+                }
             }
         }
     }

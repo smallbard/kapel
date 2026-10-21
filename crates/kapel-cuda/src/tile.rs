@@ -11,7 +11,7 @@ use cutile::cuda_async::device_operation::DeviceOp;
 use cutile::cuda_core::{Device as Gpu, Stream};
 use cutile::half::{bf16, f16};
 use cutile::tensor::{IntoPartition, Tensor as TileTensor};
-use cutile::tile_kernel::TileKernel;
+use cutile::tile_kernel::{CompileOptions, TileKernel};
 use kapel_core::{DType, Error, Layout, Result, Tensor};
 use kapel_ops::{Matmul, Operation};
 
@@ -103,13 +103,17 @@ fn batch_stride(shape: &[usize], strides: &[usize]) -> Option<usize> {
     Some(dims.last().map_or(0, |&(_, s)| s))
 }
 
-/// The tile sizes for an `m × n` output of `dtype`. Larger tiles reuse more of
-/// what they load, but leave blocks idle on small outputs.
-fn tiles_for(dtype: DType, m: usize) -> [usize; 3] {
+/// The tile sizes for an `m × n` output of `dtype`, and the tile blocks asked
+/// for per multiprocessor. Larger tiles reuse more of what they load, but leave
+/// blocks idle on small outputs. In 16 bits, two blocks of `128 × 64 × 32`
+/// reach 70 Top/s on an RTX 3090 at `4096³`, against 53 for one of
+/// `128 × 64 × 64`: the best of a sweep, whose neighbours can be 3 times
+/// slower.
+fn tiles_for(dtype: DType, m: usize) -> ([usize; 3], Option<i32>) {
     match dtype {
-        DType::F32 => [64, 64, 32],
-        _ if m >= 128 => [128, 64, 64],
-        _ => [64, 64, 64],
+        DType::F32 => ([64, 64, 32], None),
+        _ if m >= 128 => ([128, 64, 32], Some(2)),
+        _ => ([64, 64, 64], None),
     }
 }
 
@@ -183,11 +187,11 @@ impl Cuda {
                 shape: [numel / (m * n), m, n],
                 strides: [m * n, n, 1],
             };
-            let tiles = tiles_for(dtype, m);
+            let launch = tiles_for(dtype, m);
             match dtype {
-                DType::F32 => self.batched_matmul::<f32>("f32", &z, &x, &y, tiles)?,
-                DType::BF16 => self.batched_matmul::<bf16>("bf16", &z, &x, &y, tiles)?,
-                _ => self.batched_matmul::<f16>("f16", &z, &x, &y, tiles)?,
+                DType::F32 => self.batched_matmul::<f32>("f32", &z, &x, &y, launch)?,
+                DType::BF16 => self.batched_matmul::<bf16>("bf16", &z, &x, &y, launch)?,
+                _ => self.batched_matmul::<f16>("f16", &z, &x, &y, launch)?,
             }
         }
         Tensor::from_storage(Arc::new(storage), layout, dtype)
@@ -204,7 +208,7 @@ impl Cuda {
         z: &Matrices,
         x: &Matrices,
         y: &Matrices,
-        tiles: [usize; 3],
+        (tiles, occupancy): ([usize; 3], Option<i32>),
     ) -> Result<()> {
         let op = Matmul::NAME;
         let ordinal = self.ordinal() as usize;
@@ -226,7 +230,11 @@ impl Cuda {
             bk.to_string(),
         ];
         let launch = kernels::batched_matmul(out, Arc::new(tensor(x)?), Arc::new(tensor(y)?))
-            .generics(generics);
+            .generics(generics)
+            .compile_options(match occupancy {
+                Some(blocks) => CompileOptions::new().occupancy(blocks),
+                None => CompileOptions::new(),
+            });
         // SAFETY: as above; the outputs returned are views of borrowed memory,
         // dropped without freeing it.
         unsafe { launch.async_on(self.tile_stream()) }
