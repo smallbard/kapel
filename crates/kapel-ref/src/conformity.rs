@@ -32,9 +32,9 @@ use std::panic::{self, AssertUnwindSafe};
 
 use kapel_core::{DType, Result, Tensor};
 use kapel_ops::{
-    Affine, Attention, Backend, Binary, BinaryKind, Cast, GatherRows, LayerNorm, LogSoftmax,
-    Matmul, Max, Mean, Operation, QuantizedMatmul, RmsNorm, Rope, RopeLayout, RopeScaling, Run,
-    ScatterAddRows, Softmax, Sum, Transfer, Unary, UnaryKind,
+    Affine, Attention, Backend, Binary, BinaryKind, Cast, Contiguous, GatherRows, LayerNorm,
+    LogSoftmax, Matmul, Max, Mean, Operation, QuantizedMatmul, RmsNorm, Rope, RopeLayout,
+    RopeScaling, Run, ScatterAddRows, Softmax, Sum, Transfer, Unary, UnaryKind,
 };
 
 use crate::Reference;
@@ -295,6 +295,29 @@ fn cases<V: Visitor>(v: &mut V, dtype: DType) {
             vec![x(rng, &[3, 4])],
         );
     }
+    let mut r = |shape: &[usize]| random(rng, shape, dtype, -1.0, 1.0);
+    for (case, arg) in [
+        ("[3, 4]", plain(r(&[3, 4]))),
+        ("[2, 3, 4], last two swapped", transposed(r(&[2, 3, 4]))),
+        (
+            "[5, 4], rows 1 to 3",
+            viewed(
+                r(&[5, 4]),
+                View::Narrow {
+                    dim: 0,
+                    start: 1,
+                    len: 3,
+                },
+            ),
+        ),
+        (
+            "[3] broadcast to [2, 3]",
+            viewed(r(&[3]), View::Broadcast(vec![2, 3])),
+        ),
+        ("[0, 4]", plain(r(&[0, 4]))),
+    ] {
+        v.visit(&Contiguous, case.into(), vec![arg]);
+    }
     let wide = plain(random(rng, &[3, 4], dtype, -150.0, 150.0));
     v.visit(
         &Cast { dtype: DType::I8 },
@@ -433,6 +456,21 @@ fn cases<V: Visitor>(v: &mut V, dtype: DType) {
         vec![x(rng, &[3, 6])],
     );
 
+    // Rows wider than a warp of 32, and not a multiple of it.
+    v.visit(
+        &LayerNorm { eps: 1e-5 },
+        "[3, 100], weight and bias".into(),
+        vec![x(rng, &[3, 100]), x(rng, &[100]), x(rng, &[100])],
+    );
+    v.visit(
+        &RmsNorm {
+            eps: 1e-6,
+            weight_offset: 0.0,
+        },
+        "[3, 100], weight".into(),
+        vec![x(rng, &[3, 100]), x(rng, &[100])],
+    );
+
     let attention = |rng: &mut Rng, hq: usize, hkv: usize, tq: usize, tk: usize| {
         vec![
             plain(random(rng, &[2, hq, tq, 8], dtype, -1.0, 1.0)),
@@ -522,6 +560,13 @@ fn cases<V: Visitor>(v: &mut V, dtype: DType) {
         &rope(RopeLayout::Interleaved, None, RopeScaling::None),
         "interleaved, positions per token".into(),
         args,
+    );
+    // Signed positions, negative and far: their phase needs `f64` angles.
+    let far = Tensor::from_slice(&[-3i32, 0, 70_001, 300_007], &[4]).expect("sizes agree");
+    v.visit(
+        &rope(RopeLayout::Half, None, RopeScaling::None),
+        "i32 positions, negative and far".into(),
+        vec![x(rng, &[1, 2, 4, 16]), plain(far)],
     );
     let args = vec![x(rng, &[3, 2, 10]), plain(indices(rng, &[3, 1], 100))];
     v.visit(

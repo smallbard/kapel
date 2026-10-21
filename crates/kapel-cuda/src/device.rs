@@ -11,7 +11,7 @@ use cuda_core::{
     launch_kernel_on_stream,
 };
 use kapel_core::{DType, Device, Error, HostStorage, Layout, Result, Storage, Tensor};
-use kapel_cuda_abi::{BLOCK, MAX_RANK, View};
+use kapel_cuda_abi::{BLOCK, MAX_RANK, View, half};
 use kapel_ops::Transfer;
 
 use crate::signatures::{self, Param};
@@ -384,14 +384,23 @@ impl Cuda {
         zeroed: bool,
         fill: impl FnOnce(u64, usize) -> Result<()>,
     ) -> Result<Tensor> {
+        self.output_as(shape, DType::F32, zeroed, fill)
+    }
+
+    /// A tensor of `shape` and `dtype` (with elements of their own), as
+    /// [`Cuda::output`].
+    pub(crate) fn output_as(
+        &self,
+        shape: &[usize],
+        dtype: DType,
+        zeroed: bool,
+        fill: impl FnOnce(u64, usize) -> Result<()>,
+    ) -> Result<Tensor> {
         let layout = Layout::contiguous(shape)?;
-        let bytes = layout
-            .numel()
-            .checked_mul(4)
-            .ok_or(Error::Overflow { op: "output" })?;
+        let bytes = dtype.storage_bytes(layout.numel())?;
         let storage = self.alloc(bytes, zeroed)?;
         fill(storage.pointer(), layout.numel())?;
-        Tensor::from_storage(Arc::new(storage), layout, DType::F32)
+        Tensor::from_storage(Arc::new(storage), layout, dtype)
     }
 
     /// Launches kernel `name` with one thread per item of `items`.
@@ -496,10 +505,21 @@ impl Cuda {
                 dtype: tensor.dtype(),
             });
         }
+        self.any_arg(op, tensor, layout)
+    }
+
+    /// A tensor of this backend, of any type with elements of their own (not
+    /// quantized blocks), as a kernel argument read through `layout`. The
+    /// storage's length counts its elements.
+    fn any_arg(&self, op: &'static str, tensor: &Tensor, layout: &Layout) -> Result<DeviceTensor> {
+        let dtype = tensor.dtype();
+        let size = dtype
+            .element_size()
+            .ok_or(Error::UnsupportedDType { op, dtype })?;
         let storage = self.storage(op, tensor)?;
         Ok(DeviceTensor {
             base: storage.pointer(),
-            len: storage.len() / 4,
+            len: storage.len() / size,
             view: view_of(op, layout)?,
         })
     }
@@ -519,17 +539,70 @@ impl Cuda {
         self.materialize(op, tensor, tensor.layout())
     }
 
-    /// A row-major copy of an `f32` tensor of this backend read through
-    /// `layout` (its own, or a broadcast of it).
+    /// A row-major copy of a tensor of this backend read through `layout` (its
+    /// own, or a broadcast of it), bit for bit, in its own type.
     pub(crate) fn materialize(
         &self,
         op: &'static str,
         tensor: &Tensor,
         layout: &Layout,
     ) -> Result<Tensor> {
-        let x = self.arg_as(op, tensor, layout)?;
-        self.output(layout.shape(), false, |out, n| {
-            self.launch("copy_view", n, Args::new().strided(&x).slice(out, n))
+        let dtype = tensor.dtype();
+        let x = self.any_arg(op, tensor, layout)?;
+        let kernel = match dtype.element_size() {
+            Some(1) => "copy_view_8",
+            Some(2) => "copy_view_16",
+            Some(4) => "copy_view_32",
+            _ => "copy_view_64",
+        };
+        self.output_as(layout.shape(), dtype, false, |out, n| {
+            self.launch(kernel, n, Args::new().strided(&x).slice(out, n))
+        })
+    }
+
+    /// A float tensor of this backend in `f32`, read through its layout: an
+    /// `f32` tensor as it is, a `bf16` or `f16` one widened (exactly) into a
+    /// row-major copy.
+    pub(crate) fn widened(&self, op: &'static str, tensor: &Tensor) -> Result<Tensor> {
+        let kind = match tensor.dtype() {
+            DType::BF16 => half::BF16,
+            DType::F16 => half::F16,
+            _ => {
+                self.storage(op, tensor)?;
+                return Ok(tensor.clone());
+            }
+        };
+        let x = self.any_arg(op, tensor, tensor.layout())?;
+        self.output(tensor.shape(), false, |out, n| {
+            self.launch(
+                "widen_16",
+                n,
+                Args::new().u32(kind).strided(&x).slice(out, n),
+            )
+        })
+    }
+
+    /// An `f32` tensor of this backend rounded to `dtype` (ties to even, as
+    /// [`DType::encode`] does): itself for `f32`, a row-major copy for `bf16`
+    /// and `f16`.
+    pub(crate) fn narrowed(
+        &self,
+        op: &'static str,
+        tensor: &Tensor,
+        dtype: DType,
+    ) -> Result<Tensor> {
+        let kind = match dtype {
+            DType::F32 => {
+                self.storage(op, tensor)?;
+                return Ok(tensor.clone());
+            }
+            DType::BF16 => half::BF16,
+            DType::F16 => half::F16,
+            dtype => return Err(Error::UnsupportedDType { op, dtype }),
+        };
+        let x = self.flat(op, tensor)?;
+        self.output_as(tensor.shape(), dtype, false, |out, n| {
+            self.launch("narrow_16", n, Args::new().u32(kind).flat(&x).slice(out, n))
         })
     }
 
@@ -739,11 +812,11 @@ impl Args {
     }
 }
 
-/// An `f32` tensor of this backend, read through a view.
+/// A tensor of this backend, read through a view.
 pub(crate) struct DeviceTensor {
     /// The device address of the storage's first element.
     pub(crate) base: u64,
-    /// The number of `f32` elements of the storage.
+    /// The number of elements of the storage.
     pub(crate) len: usize,
     /// How the tensor reads its storage.
     pub(crate) view: View,

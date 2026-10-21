@@ -4,7 +4,7 @@ use std::f32::consts::PI;
 use std::sync::Arc;
 
 use kapel_core::{Error, HostStorage, Layout, Result, Tensor};
-use kapel_ops::{Affine, Binary, BinaryKind, Cast, Operation, Run, Unary, UnaryKind};
+use kapel_ops::{Affine, Binary, BinaryKind, Cast, Contiguous, Operation, Run, Unary, UnaryKind};
 
 use crate::backend::{CHUNK, Cpu};
 use crate::io::{self, broadcast_offsets};
@@ -340,6 +340,36 @@ impl Run<Cast> for Cpu {
         }
         let g = io::contiguous(Cast::NAME, grad)?;
         io::supported(Cast::NAME, dtype)?;
+        Ok(vec![Some(io::write(
+            &self.buffers,
+            &g,
+            inputs[0].shape(),
+            dtype,
+        )?)])
+    }
+}
+
+impl Run<Contiguous> for Cpu {
+    fn forward(&self, op: &Contiguous, inputs: &[&Tensor]) -> Result<Tensor> {
+        op.infer(inputs)?;
+        inputs[0].contiguous()
+    }
+
+    fn backward(
+        &self,
+        op: &Contiguous,
+        inputs: &[&Tensor],
+        grad: &Tensor,
+    ) -> Result<Vec<Option<Tensor>>> {
+        op.infer_backward(inputs, grad)?;
+        // The gradient passes through, in the input's type; an integer input
+        // receives none.
+        let dtype = inputs[0].dtype();
+        if !dtype.is_float() {
+            return Ok(vec![None]);
+        }
+        let g = io::contiguous(Contiguous::NAME, grad)?;
+        io::supported(Contiguous::NAME, dtype)?;
         Ok(vec![Some(io::write(
             &self.buffers,
             &g,

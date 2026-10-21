@@ -44,6 +44,14 @@ changelog says how.
 - `kapel-cuda`: tile sizes and compiler hints tuned per kernel and head width on an
   RTX 3090: bf16 products reach 69 Top/s at `4096³`, attention 44 to 51 Top/s forward
   and 37 to 41 backward.
+- `kapel-ops`: `Contiguous`, a bit-exact row-major copy of a strided view, in any
+  non-quantized type; the attention of `kapel-models` uses it, and runs on any backend.
+- `kapel-cuda`: the whole catalogue in `bf16` and `f16`, and conversions between `f32`,
+  `bf16` and `f16` on the device, rounding exactly as the host does.
+- `kapel-models`: `Model::upload` and `Model::cast`, to run a model on a backend's
+  device and in a given type; the small parity models run on the card.
+- `kapel-cuda`: rotary angles computed on the device in `f64`, and normalizations with
+  one warp per row: no copy back to the host per layer.
 
 ### Changed
 
@@ -73,6 +81,8 @@ changelog says how.
 
 ### Fixed
 
+- `kapel-cpu`: rotary embeddings accept negative `i32` positions, as the contract and
+  the reference do.
 - Empty dimensions no longer panic in the reference products.
 - `kapel-cuda`: `Max` backward could write outside its buffer; kernels writing
   through raw pointers check their bounds; positions beyond 32 bits are refused.

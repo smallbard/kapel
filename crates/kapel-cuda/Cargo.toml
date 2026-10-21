@@ -26,6 +26,13 @@ cutile = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "a73ec6ef7fe2
 
 [dev-dependencies]
 kapel-ref.workspace = true
+kapel-cpu.workspace = true
+kapel-hub.workspace = true
+kapel-models.workspace = true
+
+[[test]]
+name = "parity"
+required-features = ["cuda"]
 
 [[example]]
 name = "gemm"
@@ -37,4 +44,8 @@ required-features = ["cuda"]
 
 [[example]]
 name = "reductions"
+required-features = ["cuda"]
+
+[[example]]
+name = "prefill"
 required-features = ["cuda"]

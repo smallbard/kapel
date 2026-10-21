@@ -7,8 +7,13 @@
 //!   cutile-rs tile kernels, in `f32`, `bf16` and `f16` with `f32`
 //!   accumulators, compiled by `tileiras` at their first launch and kept in a
 //!   cache on disk;
-//! - the other operations, in `f32`, are cuda-oxide kernels (`kernels/`, built
-//!   by `kernels/build.sh`), whose PTX is embedded in this crate.
+//! - the other operations are cuda-oxide kernels (`kernels/`, built by
+//!   `kernels/build.sh`), whose PTX is embedded in this crate. They compute in
+//!   `f32`: inputs in `bf16` or `f16` are widened on the device, and results
+//!   rounded back, ties to even, as the host rounds them.
+//!
+//! The whole catalogue conforms in `f32`, `bf16` and `f16`, and the models of
+//! `kapel-models` run on the card (`tests/parity.rs`, `examples/prefill.rs`).
 //!
 //! Each kernel gives the same bits on every run: one thread, or one tile block,
 //! computes each output, adding its terms in a fixed order, without atomics.
@@ -46,6 +51,123 @@ mod tests {
     #[test]
     fn the_backend_conforms_in_f32() {
         conformity::assert_conforms(&cuda(), DType::F32);
+    }
+
+    #[test]
+    fn the_backend_conforms_in_16_bits() {
+        let cuda = cuda();
+        conformity::assert_conforms(&cuda, DType::BF16);
+        conformity::assert_conforms(&cuda, DType::F16);
+    }
+
+    /// Every `bf16` and `f16` value widened to `f32`, and a spread of `f32`
+    /// bit patterns (every exponent, ties, subnormals, the edges of overflow,
+    /// infinities and NaNs) rounded to both: the device's bits must be the
+    /// host's.
+    #[test]
+    fn conversions_round_as_the_host_does() {
+        use kapel_ops::Cast;
+        let cuda = cuda();
+        let cast = |x: &Tensor, dtype: DType| {
+            let y = cuda
+                .forward(&Cast { dtype }, &[&cuda.upload(x).unwrap()])
+                .unwrap();
+            cuda.download(&y).unwrap()
+        };
+        let bits: Vec<u16> = (0..=u16::MAX).collect();
+        for dtype in [DType::BF16, DType::F16] {
+            let bytes: Vec<u8> = bits.iter().flat_map(|b| b.to_le_bytes()).collect();
+            let x = Tensor::from_bytes(dtype, &[bits.len()], &bytes).unwrap();
+            let want =
+                Run::<Cast>::forward(&kapel_ref::Reference, &Cast { dtype: DType::F32 }, &[&x])
+                    .unwrap()
+                    .to_vec::<f32>()
+                    .unwrap();
+            let got = cast(&x, DType::F32).to_vec::<f32>().unwrap();
+            for (i, (w, g)) in want.iter().zip(&got).enumerate() {
+                assert!(
+                    w.to_bits() == g.to_bits() || (w.is_nan() && g.is_nan()),
+                    "{dtype} {i:#06x}: {g} on the device, {w} on the host"
+                );
+            }
+        }
+        let mut patterns: Vec<u32> = Vec::new();
+        for exponent in 0..256u32 {
+            for low in [
+                0u32, 1, 0x0fff, 0x1000, 0x1001, 0x7fff, 0x8000, 0x8001, 0xffff,
+            ] {
+                for high in [0u32, 0x1fff, 0x2000, 0x55, 0x7f_0000, 0x7f_ffff & !0xffff] {
+                    let mantissa = (high | low) & 0x7f_ffff;
+                    for sign in [0, 1u32 << 31] {
+                        patterns.push(sign | exponent << 23 | mantissa);
+                    }
+                }
+            }
+        }
+        // Around the largest finite f16 and its rounding midpoint, 65520.
+        patterns.extend((0x477f_e000..0x4780_1000).step_by(0x100));
+        let values: Vec<f32> = patterns.iter().map(|&b| f32::from_bits(b)).collect();
+        let x = Tensor::from_slice(&values, &[values.len()]).unwrap();
+        for dtype in [DType::BF16, DType::F16] {
+            let want = Run::<Cast>::forward(&kapel_ref::Reference, &Cast { dtype }, &[&x]).unwrap();
+            let got = cast(&x, dtype);
+            let (want, got) = (
+                want.storage().host_bytes().unwrap(),
+                got.storage().host_bytes().unwrap(),
+            );
+            for (i, (w, g)) in want.chunks(2).zip(got.chunks(2)).enumerate() {
+                assert_eq!(
+                    w, g,
+                    "{dtype} of {:#010x}: {g:02x?} on the device, {w:02x?} on the host",
+                    patterns[i]
+                );
+            }
+        }
+    }
+
+    /// Copies of strided views, bit for bit, in every element size.
+    #[test]
+    fn strided_views_are_copied_in_any_type() {
+        use kapel_ops::Contiguous;
+        let cuda = cuda();
+        let check = |x: Tensor| {
+            let on_device = cuda.upload(&x).unwrap();
+            let view = on_device.transpose(0, 1).unwrap().narrow(0, 1, 2).unwrap();
+            let got = cuda
+                .download(&cuda.forward(&Contiguous, &[&view]).unwrap())
+                .unwrap();
+            let want = x
+                .transpose(0, 1)
+                .unwrap()
+                .narrow(0, 1, 2)
+                .unwrap()
+                .contiguous()
+                .unwrap();
+            assert!(got.is_contiguous());
+            assert_eq!(got.dtype(), x.dtype());
+            assert_eq!(
+                got.storage().host_bytes(),
+                want.storage().host_bytes(),
+                "{}",
+                x.dtype()
+            );
+        };
+        let values: Vec<f64> = (0..12).map(|i| f64::from(i) * 1.25 - 3.0).collect();
+        for dtype in [
+            DType::F64,
+            DType::F32,
+            DType::BF16,
+            DType::F16,
+            DType::U8,
+            DType::I32,
+        ] {
+            let size = dtype.block_bytes();
+            let mut bytes = vec![0; values.len() * size];
+            for (v, out) in values.iter().zip(bytes.chunks_exact_mut(size)) {
+                dtype.encode(v.abs().round(), out).unwrap();
+            }
+            check(Tensor::from_bytes(dtype, &[3, 4], &bytes).unwrap());
+        }
     }
 
     #[test]

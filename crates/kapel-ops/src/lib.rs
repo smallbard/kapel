@@ -13,6 +13,7 @@
 //! conformity suite checks any backend against it.
 
 mod attention;
+mod copy;
 mod elementwise;
 mod index;
 mod matmul;
@@ -25,6 +26,7 @@ pub mod special;
 use std::fmt;
 
 pub use attention::Attention;
+pub use copy::Contiguous;
 pub use elementwise::{Affine, Binary, BinaryKind, Cast, Unary, UnaryKind};
 pub use index::{GatherRows, ScatterAddRows};
 use kapel_core::{DType, Error, Result, Tensor};
@@ -146,6 +148,7 @@ pub trait Backend:
     + Run<Binary>
     + Run<Affine>
     + Run<Cast>
+    + Run<Contiguous>
     + Run<Matmul>
     + Run<QuantizedMatmul>
     + Run<Sum>
@@ -167,6 +170,7 @@ impl<B> Backend for B where
         + Run<Binary>
         + Run<Affine>
         + Run<Cast>
+        + Run<Contiguous>
         + Run<Matmul>
         + Run<QuantizedMatmul>
         + Run<Sum>

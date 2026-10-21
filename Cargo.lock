@@ -748,7 +748,10 @@ dependencies = [
  "cuda-core",
  "cutile",
  "kapel-core",
+ "kapel-cpu",
  "kapel-cuda-abi",
+ "kapel-hub",
+ "kapel-models",
  "kapel-ops",
  "kapel-ref",
 ]

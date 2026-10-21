@@ -24,12 +24,13 @@ fn rotate(
     let r = op.rotated(d);
     let frequencies = op.frequencies(r);
     let factor = op.attention_factor();
-    let entries = io::indices(Rope::NAME, positions, usize::MAX)?;
+    // Signed positions keep their sign: the contract asks for integers.
+    let entries = positions.to_f64_vec()?;
     let table: Vec<(f32, f32)> = entries
         .iter()
         .flat_map(|&p| {
             frequencies.iter().map(move |&w| {
-                let (sin, cos) = (direction * p as f64 * w).sin_cos();
+                let (sin, cos) = (direction * p * w).sin_cos();
                 ((factor * sin) as f32, (factor * cos) as f32)
             })
         })

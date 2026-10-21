@@ -1,9 +1,10 @@
 //! Kapel's CUDA kernels.
 //!
 //! Each kernel follows the simplest scheme that gives the same bits on every
-//! run: one thread per output element (or per line, row, query), which reads
-//! what it needs and writes its own output. No two threads write the same place,
-//! and no sum depends on scheduling: there are no atomics.
+//! run: one thread per output element (or per line), which reads what it needs
+//! and writes its own output; normalizations take one warp per row, whose lanes
+//! add their partial sums by a fixed butterfly. No two threads write the same
+//! place, and no sum depends on scheduling: there are no atomics.
 //!
 //! Matrix products and attention are not here: they are tile kernels written
 //! with cutile-rs, in the backend itself.
@@ -21,8 +22,8 @@
 // Kernels index explicitly: the indexing is the memory access each thread makes.
 #![allow(clippy::needless_range_loop, clippy::too_many_arguments)]
 
-use cuda_device::{DisjointSlice, kernel, launch_bounds, thread};
-use kapel_cuda_abi::{View, binary, unary};
+use cuda_device::{DisjointSlice, kernel, launch_bounds, thread, warp};
+use kapel_cuda_abi::{View, binary, half, unary};
 
 /// The exact error function, as `kapel_ops::special::erf` computes it: its
 /// Taylor series below 2.5, the continued fraction of `erfc` above.
@@ -182,14 +183,138 @@ fn binary_value(op: u32, a: f32, b: f32) -> (f32, f32, f32) {
     }
 }
 
-/// `out[i] = x[view.at(i)]`: a strided view made contiguous.
+/// `out[i] = x[view.at(i)]`: a strided view made contiguous, for elements of
+/// 1, 2, 4 and 8 bytes, copied bit for bit.
 #[kernel]
 #[launch_bounds(256)]
-pub fn copy_view(x: &[f32], view: View, mut out: DisjointSlice<f32>) {
+pub fn copy_view_8(x: &[u8], view: View, mut out: DisjointSlice<u8>) {
     let idx = thread::index_1d();
     let i = idx.get();
     if let Some(y) = out.get_mut(idx) {
         *y = x[view.at(i as u32) as usize];
+    }
+}
+
+/// See `copy_view_8`.
+#[kernel]
+#[launch_bounds(256)]
+pub fn copy_view_16(x: &[u16], view: View, mut out: DisjointSlice<u16>) {
+    let idx = thread::index_1d();
+    let i = idx.get();
+    if let Some(y) = out.get_mut(idx) {
+        *y = x[view.at(i as u32) as usize];
+    }
+}
+
+/// See `copy_view_8`.
+#[kernel]
+#[launch_bounds(256)]
+pub fn copy_view_32(x: &[u32], view: View, mut out: DisjointSlice<u32>) {
+    let idx = thread::index_1d();
+    let i = idx.get();
+    if let Some(y) = out.get_mut(idx) {
+        *y = x[view.at(i as u32) as usize];
+    }
+}
+
+/// See `copy_view_8`.
+#[kernel]
+#[launch_bounds(256)]
+pub fn copy_view_64(x: &[u64], view: View, mut out: DisjointSlice<u64>) {
+    let idx = thread::index_1d();
+    let i = idx.get();
+    if let Some(y) = out.get_mut(idx) {
+        *y = x[view.at(i as u32) as usize];
+    }
+}
+
+/// The value of 16-bit float `bits`: `bf16` (`kind` = `half::BF16`) is the top
+/// half of an `f32`; `f16` (`half::F16`) widens exactly, subnormals included.
+fn widen(kind: u32, bits: u16) -> f32 {
+    let bits = bits as u32;
+    if kind == half::BF16 {
+        return f32::from_bits(bits << 16);
+    }
+    let sign = (bits & 0x8000) << 16;
+    let exponent = (bits >> 10) & 0x1f;
+    let mantissa = bits & 0x3ff;
+    let magnitude = if exponent == 0x1f {
+        // Infinities, and NaNs with their payload.
+        0x7f80_0000 | (mantissa << 13)
+    } else if exponent != 0 {
+        ((exponent + 112) << 23) | (mantissa << 13)
+    } else if mantissa == 0 {
+        0
+    } else {
+        // A subnormal: `mantissa · 2⁻²⁴`, exact in `f32`.
+        let value = mantissa as f32 * (1.0 / 16_777_216.0);
+        value.to_bits()
+    };
+    f32::from_bits(sign | magnitude)
+}
+
+/// The 16-bit float nearest to `x`, ties to even, as the host's conversion
+/// gives it: overflow to infinity, every NaN to the positive quiet NaN.
+fn narrow(kind: u32, x: f32) -> u16 {
+    let bits = x.to_bits();
+    let sign = (bits >> 16) & 0x8000;
+    let a = bits & 0x7fff_ffff;
+    if a > 0x7f80_0000 {
+        return if kind == half::BF16 { 0x7fc0 } else { 0x7e00 };
+    }
+    if kind == half::BF16 {
+        if a == 0x7f80_0000 {
+            return (sign | 0x7f80) as u16;
+        }
+        // Adding half a unit, less one unless the kept part is odd, rounds to
+        // nearest even; a carry into the exponent is the right result, up to
+        // infinity.
+        let rounded = a + 0x7fff + ((a >> 16) & 1);
+        return (sign | (rounded >> 16)) as u16;
+    }
+    // `f16`. From 65520 on (`2¹⁶ − 2⁴`, the midpoint above the largest
+    // finite value, which rounds to even, up), infinity.
+    if a >= 0x477f_f000 {
+        return (sign | 0x7c00) as u16;
+    }
+    let exponent = (a >> 23) as i32 - 127;
+    if exponent < -14 {
+        // Subnormal (or zero): in units of `2⁻²⁴`, rounded by the hardware's
+        // own ties-to-even, exactly: `|x| · 2²⁴` is exact, and below 2¹⁰.
+        let units = f32::from_bits(a) * 16_777_216.0;
+        let r = round_ties_even(units);
+        return (sign | r as u32) as u16;
+    }
+    let shifted = a - ((127 - 15) << 23);
+    let rounded = shifted + 0xfff + ((shifted >> 13) & 1);
+    (sign | (rounded >> 13)) as u16
+}
+
+/// `x` rounded to the nearest integer, ties to even, for `0 ≤ x < 2²³`.
+fn round_ties_even(x: f32) -> f32 {
+    // Adding 2²³ leaves no fractional bits; the addition rounds to even.
+    (x + 8_388_608.0) - 8_388_608.0
+}
+
+/// `out[i] = x[view.at(i)]` widened to `f32` from a 16-bit float `kind`.
+#[kernel]
+#[launch_bounds(256)]
+pub fn widen_16(kind: u32, x: &[u16], view: View, mut out: DisjointSlice<f32>) {
+    let idx = thread::index_1d();
+    let i = idx.get();
+    if let Some(y) = out.get_mut(idx) {
+        *y = widen(kind, x[view.at(i as u32) as usize]);
+    }
+}
+
+/// `out[i] = x[i]` rounded to a 16-bit float `kind`.
+#[kernel]
+#[launch_bounds(256)]
+pub fn narrow_16(kind: u32, x: &[f32], mut out: DisjointSlice<u16>) {
+    let idx = thread::index_1d();
+    let i = idx.get();
+    if let Some(y) = out.get_mut(idx) {
+        *y = narrow(kind, x[i]);
     }
 }
 
@@ -420,41 +545,59 @@ pub fn softmax_lines_backward(
     }
 }
 
+/// The sum of `v` over the 32 lanes of the warp, the same bits on every lane:
+/// a butterfly whose every step adds two lanes' values, in either order.
+fn warp_sum(v: f32) -> f32 {
+    warp::reduce_sum_f32(v)
+}
+
 /// LayerNorm (`rms` = 0) or RMSNorm (`rms` = 1) of every row of `width`:
-/// `y = x̂ · (offset + w) + b`, one thread per row.
+/// `y = x̂ · (offset + w) + b`, one warp per row. Lane `l` reads and writes
+/// columns `l, l + 32, …`; the sums over the row add each lane's partial sum,
+/// then the lanes by `warp_sum`.
 #[kernel]
 #[launch_bounds(256)]
 pub fn norm_rows(rms: u32, x: &[f32], w: &[f32], b: &[f32], offset: f32, eps: f32, width: u32, mut out: DisjointSlice<f32>) {
     let idx = thread::index_1d();
-    let row = idx.get();
+    let row = idx.get() / 32;
+    let lane = idx.get() % 32;
     let width = width as usize;
     let start = row * width;
+    // The same for every lane of the warp: whole warps go on or stop.
     if width > 0 && start + width <= x.len() && start + width <= out.len() {
+        let n = width as f32;
         let mut mean = 0.0f32;
         if rms == 0 {
-            for c in 0..width {
-                mean += x[start + c];
+            let mut part = 0.0f32;
+            let mut c = lane;
+            while c < width {
+                part += x[start + c];
+                c += 32;
             }
-            mean /= width as f32;
+            mean = warp_sum(part) / n;
         }
-        let mut squares = 0.0f32;
-        for c in 0..width {
+        let mut part = 0.0f32;
+        let mut c = lane;
+        while c < width {
             let v = x[start + c] - mean;
-            squares += v * v;
+            part += v * v;
+            c += 32;
         }
-        let inv = 1.0 / (squares / width as f32 + eps).sqrt();
-        for c in 0..width {
+        let inv = 1.0 / (warp_sum(part) / n + eps).sqrt();
+        let mut c = lane;
+        while c < width {
             let hat = (x[start + c] - mean) * inv;
             // SAFETY: `start + c < start + width ≤ out.len()` (checked
-            // above), and row `row` is written by this thread alone.
+            // above); row `row` belongs to this warp, column `c` to this lane.
             unsafe { *out.as_mut_ptr().add(start + c) = hat * (offset + w[c]) + b[c] };
+            c += 32;
         }
     }
 }
 
-/// The backward pass of `norm_rows`: the gradient of `x`, and for every row its
-/// contributions `g·x̂` and `g` to the gradients of the weight and the bias,
-/// summed over rows afterwards by `column_sum`.
+/// The backward pass of `norm_rows`, one warp per row as it: the gradient of
+/// `x`, and for every row its contributions `g·x̂` and `g` to the gradients of
+/// the weight and the bias, summed over rows afterwards by `column_sum`.
 #[kernel]
 #[launch_bounds(256)]
 pub fn norm_rows_backward(
@@ -470,7 +613,8 @@ pub fn norm_rows_backward(
     mut gb_rows: DisjointSlice<f32>,
 ) {
     let idx = thread::index_1d();
-    let row = idx.get();
+    let row = idx.get() / 32;
+    let lane = idx.get() % 32;
     let width = width as usize;
     let start = row * width;
     let end = start + width;
@@ -478,39 +622,48 @@ pub fn norm_rows_backward(
         let n = width as f32;
         let mut mean = 0.0f32;
         if rms == 0 {
-            for c in 0..width {
-                mean += x[start + c];
+            let mut part = 0.0f32;
+            let mut c = lane;
+            while c < width {
+                part += x[start + c];
+                c += 32;
             }
-            mean /= n;
+            mean = warp_sum(part) / n;
         }
-        let mut squares = 0.0f32;
-        for c in 0..width {
+        let mut part = 0.0f32;
+        let mut c = lane;
+        while c < width {
             let v = x[start + c] - mean;
-            squares += v * v;
+            part += v * v;
+            c += 32;
         }
-        let inv = 1.0 / (squares / n + eps).sqrt();
-        let (mut mean_gh, mut mean_ghh) = (0.0f32, 0.0f32);
-        for c in 0..width {
+        let inv = 1.0 / (warp_sum(part) / n + eps).sqrt();
+        let (mut part_gh, mut part_ghh) = (0.0f32, 0.0f32);
+        let mut c = lane;
+        while c < width {
             let hat = (x[start + c] - mean) * inv;
             let gh = g[start + c] * (offset + w[c]);
-            mean_gh += gh;
-            mean_ghh += gh * hat;
+            part_gh += gh;
+            part_ghh += gh * hat;
+            c += 32;
         }
-        mean_gh /= n;
-        mean_ghh /= n;
+        let mut mean_gh = warp_sum(part_gh) / n;
+        let mean_ghh = warp_sum(part_ghh) / n;
         if rms == 1 {
             mean_gh = 0.0;
         }
-        for c in 0..width {
+        let mut c = lane;
+        while c < width {
             let hat = (x[start + c] - mean) * inv;
             let gh = g[start + c] * (offset + w[c]);
             // SAFETY: `start + c < end`, within the three outputs (checked
-            // above), and row `row` is written by this thread alone.
+            // above); row `row` belongs to this warp, column `c` to this lane.
             unsafe {
                 *gx.as_mut_ptr().add(start + c) = inv * (gh - mean_gh - hat * mean_ghh);
                 *gw_rows.as_mut_ptr().add(start + c) = g[start + c] * hat;
                 *gb_rows.as_mut_ptr().add(start + c) = g[start + c];
             }
+            c += 32;
         }
     }
 }
@@ -528,6 +681,31 @@ pub fn column_sum(x: &[f32], rows: u32, mut out: DisjointSlice<f32>) {
             total += x[r * width + c];
         }
         *y = total;
+    }
+}
+
+/// The angles of rotary embeddings, in `f64`: for position entry `e` and
+/// frequency `j`, `out[2(e·half + j)..][..2] = (s·cos θ, s·sin θ)`, with
+/// `θ = direction · p[e] · ω[j]`. `constants` holds the bits of `s`, then of
+/// each `ω`. Positions are `u32`, or `i32` when `signed` is 1.
+#[kernel]
+#[launch_bounds(256)]
+pub fn rope_table(positions: &[u32], signed: u32, constants: &[u64], direction: f32, mut out: DisjointSlice<f32>) {
+    let idx = thread::index_1d();
+    let t = idx.get();
+    let half = constants.len() - 1;
+    if half > 0 && t < positions.len() * half && 2 * t + 1 < out.len() {
+        let (e, j) = (t / half, t % half);
+        let p = if signed == 1 { positions[e] as i32 as f64 } else { positions[e] as f64 };
+        let factor = f64::from_bits(constants[0]);
+        let angle = direction as f64 * p * f64::from_bits(constants[1 + j]);
+        let (sin, cos) = (angle.sin(), angle.cos());
+        // SAFETY: `2t + 1 < out.len()` (checked above), and slots `2t`,
+        // `2t + 1` belong to thread `t` alone.
+        unsafe {
+            *out.as_mut_ptr().add(2 * t) = (factor * cos) as f32;
+            *out.as_mut_ptr().add(2 * t + 1) = (factor * sin) as f32;
+        }
     }
 }
 
@@ -566,6 +744,18 @@ pub fn rope(x: &[f32], table: &[f32], entry: &[u32], d: u32, r: u32, half_pairs:
 #[kernel]
 #[launch_bounds(256)]
 pub fn gather_rows(src: &[f32], rows: &[u32], width: u32, mut out: DisjointSlice<f32>) {
+    let idx = thread::index_1d();
+    let flat = idx.get();
+    if let Some(y) = out.get_mut(idx) {
+        let width = width as usize;
+        *y = src[rows[flat / width] as usize * width + flat % width];
+    }
+}
+
+/// `gather_rows` for 16-bit elements, copied bit for bit.
+#[kernel]
+#[launch_bounds(256)]
+pub fn gather_rows_16(src: &[u16], rows: &[u32], width: u32, mut out: DisjointSlice<u16>) {
     let idx = thread::index_1d();
     let flat = idx.get();
     if let Some(y) = out.get_mut(idx) {

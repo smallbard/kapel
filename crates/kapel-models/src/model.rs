@@ -2,11 +2,11 @@
 
 use std::collections::BTreeMap;
 
-use kapel_core::Tensor;
+use kapel_core::{DType, Tensor};
 use kapel_hub::Checkpoint;
 use kapel_ops::{
-    Affine, Attention, Backend, Binary, BinaryKind, GatherRows, LayerNorm, Matmul, RmsNorm, Rope,
-    Transfer, Unary, UnaryKind,
+    Affine, Attention, Backend, Binary, BinaryKind, Cast, Contiguous, GatherRows, LayerNorm,
+    Matmul, RmsNorm, Rope, Transfer, Unary, UnaryKind,
 };
 
 use crate::ModelError;
@@ -56,6 +56,11 @@ impl<B: Backend> Ops<'_, B> {
         Ok(self.0.forward(&Affine { scale, bias: 0.0 }, &[x])?)
     }
 
+    /// `x` with its elements in row-major order, on the backend.
+    fn contiguous(&self, x: &Tensor) -> Result<Tensor> {
+        Ok(self.0.forward(&Contiguous, &[x])?)
+    }
+
     /// `cap · tanh(x / cap)`.
     fn softcap(&self, x: &Tensor, cap: f64) -> Result<Tensor> {
         let t = self.unary(UnaryKind::Tanh, &self.affine(x, 1.0 / cap)?)?;
@@ -88,8 +93,49 @@ impl Model {
         &self.config
     }
 
+    /// The model with its weights on `backend`'s device, ready for
+    /// [`Model::forward`] on it.
+    ///
+    /// # Errors
+    ///
+    /// If a weight cannot be copied to the device.
+    pub fn upload<B: Transfer>(&self, backend: &B) -> Result<Self> {
+        self.map(|w| Ok(backend.upload(w)?))
+    }
+
+    /// The model with its float weights converted to `dtype` on `backend`, to
+    /// compute in that type (`bf16` on a card, for instance). Quantized and
+    /// integer weights are kept.
+    ///
+    /// # Errors
+    ///
+    /// If the backend cannot convert a weight.
+    pub fn cast<B: Backend>(&self, backend: &B, dtype: DType) -> Result<Self> {
+        self.map(|w| {
+            Ok(if w.dtype().is_float() && w.dtype() != dtype {
+                backend.forward(&Cast { dtype }, &[w])?
+            } else {
+                w.clone()
+            })
+        })
+    }
+
+    /// The model with `f` applied to each weight.
+    fn map(&self, f: impl Fn(&Tensor) -> Result<Tensor>) -> Result<Self> {
+        Ok(Self {
+            config: self.config.clone(),
+            raw_config: self.raw_config.clone(),
+            weights: self
+                .weights
+                .iter()
+                .map(|(name, w)| Ok((name.clone(), f(w)?)))
+                .collect::<Result<_>>()?,
+        })
+    }
+
     /// Writes the model to `dir` in the layout of the Hub: `config.json` and
-    /// `model.safetensors`, which `transformers` loads back.
+    /// `model.safetensors`, which `transformers` loads back. The weights must
+    /// be in host memory: a model as loaded, not [uploaded](Model::upload).
     ///
     /// `dir` may be the directory the model was loaded from: each file is
     /// written under a temporary name and renamed into place
@@ -176,7 +222,7 @@ impl Model {
         let mut x = backend.forward(&GatherRows, &[embed, &ids_tensor])?;
         if let Some(scale) = c.embed_scale {
             // Gemma rounds the factor to the type of the hidden states.
-            x = ops.affine(&x, f64::from(scale as f32))?;
+            x = ops.affine(&x, rounded(x.dtype(), scale)?)?;
         }
         if c.block == Block::Gpt2 {
             let wpe = backend.forward(
@@ -325,7 +371,7 @@ impl Model {
         };
         // [T, H·D] → [T, H, D] → [1, H, T, D], as views.
         let heads = |x: Tensor, n: usize, norm: Option<&str>| -> Result<Tensor> {
-            let mut x = x.contiguous()?.reshape(&[t, n, d])?;
+            let mut x = ops.contiguous(&x)?.reshape(&[t, n, d])?;
             if let Some(name) = norm {
                 let w = self.weight(&format!("{p}.self_attn.{name}.weight"))?;
                 x = ops.0.forward(
@@ -359,7 +405,7 @@ impl Model {
         };
         let y = ops.0.forward(&attention, &[&q, &k, &v])?;
         // [1, H, T, D] → [T, H·D].
-        let y = y.transpose(1, 2)?.contiguous()?.reshape(&[t, hq * d])?;
+        let y = ops.contiguous(&y.transpose(1, 2)?)?.reshape(&[t, hq * d])?;
         Ok(if c.block == Block::Gpt2 {
             ops.bias(
                 ops.0.forward(
@@ -386,6 +432,13 @@ impl Model {
             )?
         })
     }
+}
+
+/// `value` rounded to `dtype`, as a float of that type holds it.
+fn rounded(dtype: DType, value: f64) -> Result<f64> {
+    let mut bytes = vec![0; dtype.block_bytes()];
+    dtype.encode(value, &mut bytes)?;
+    Ok(dtype.decode(&bytes)?)
 }
 
 #[cfg(test)]

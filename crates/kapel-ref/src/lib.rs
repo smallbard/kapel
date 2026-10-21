@@ -2,10 +2,11 @@
 //! written to be read.
 //!
 //! [`Reference`] reads its inputs at their exact value, whatever their type,
-//! computes in `f64`, and returns `f64` tensors (except [`kapel_ops::Cast`],
-//! which returns its target type). It is slow on purpose: each operation is the
-//! direct transcription of its definition in `kapel-ops`, so that it can be
-//! checked by eye.
+//! computes in `f64`, and returns `f64` tensors, except two operations that
+//! keep a type: [`kapel_ops::Cast`] returns its target type, and
+//! [`kapel_ops::Contiguous`] its input's. It is slow on purpose: each
+//! operation is the direct transcription of its definition in `kapel-ops`, so
+//! that it can be checked by eye.
 //!
 //! Every other backend is checked against it with the [`conformity`] suite, and
 //! its own gradients against finite differences.
@@ -153,6 +154,7 @@ mod tests {
         kapel_ops::Binary,
         kapel_ops::Affine,
         kapel_ops::Cast,
+        kapel_ops::Contiguous,
         kapel_ops::Matmul,
         kapel_ops::QuantizedMatmul,
         kapel_ops::Sum,

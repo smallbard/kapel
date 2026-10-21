@@ -28,7 +28,12 @@ use Param::{F32, Slice, U32, View};
 
 /// Every kernel of `kernels.ptx`, with its arguments in order.
 pub(crate) const KERNELS: &[(&str, &[Param])] = &[
-    ("copy_view", &[Slice, View, Slice]),
+    ("copy_view_8", &[Slice, View, Slice]),
+    ("copy_view_16", &[Slice, View, Slice]),
+    ("copy_view_32", &[Slice, View, Slice]),
+    ("copy_view_64", &[Slice, View, Slice]),
+    ("widen_16", &[U32, Slice, View, Slice]),
+    ("narrow_16", &[U32, Slice, Slice]),
     ("unary_forward", &[U32, Slice, Slice]),
     ("unary_backward", &[U32, Slice, Slice, Slice]),
     ("affine", &[F32, F32, Slice, Slice]),
@@ -55,8 +60,10 @@ pub(crate) const KERNELS: &[(&str, &[Param])] = &[
         &[U32, Slice, Slice, Slice, F32, F32, U32, Slice, Slice, Slice],
     ),
     ("column_sum", &[Slice, U32, Slice]),
+    ("rope_table", &[Slice, U32, Slice, F32, Slice]),
     ("rope", &[Slice, Slice, Slice, U32, U32, U32, Slice]),
     ("gather_rows", &[Slice, Slice, U32, Slice]),
+    ("gather_rows_16", &[Slice, Slice, U32, Slice]),
     ("scatter_rows", &[Slice, Slice, Slice, U32, Slice]),
 ];
 

@@ -96,6 +96,14 @@ pub mod binary {
     pub const MIN: u32 = 5;
 }
 
+/// Codes of the 16-bit float formats of the conversion kernels.
+pub mod half {
+    /// bfloat16.
+    pub const BF16: u32 = 0;
+    /// IEEE 754 binary16.
+    pub const F16: u32 = 1;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

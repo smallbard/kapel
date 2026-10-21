@@ -4,7 +4,7 @@ use std::f64::consts::PI;
 use std::sync::Arc;
 
 use kapel_core::{Error, HostStorage, Layout, Result, Tensor};
-use kapel_ops::{Affine, Binary, BinaryKind, Cast, Operation, Run, Unary, UnaryKind};
+use kapel_ops::{Affine, Binary, BinaryKind, Cast, Contiguous, Operation, Run, Unary, UnaryKind};
 
 use crate::Reference;
 use crate::array::{Array, broadcast_map, sum_to};
@@ -236,6 +236,27 @@ impl Run<Cast> for Reference {
         // Between float types the gradient passes through; an integer input or
         // output receives none.
         if !op.differentiable(0) || !inputs[0].dtype().is_float() {
+            return Ok(vec![None]);
+        }
+        Ok(vec![Some(Array::of(grad)?.tensor()?)])
+    }
+}
+
+impl Run<Contiguous> for Reference {
+    /// The copy keeps the input's type, bit for bit, like a cast to its own type.
+    fn forward(&self, op: &Contiguous, inputs: &[&Tensor]) -> Result<Tensor> {
+        op.infer(inputs)?;
+        inputs[0].contiguous()
+    }
+
+    fn backward(
+        &self,
+        op: &Contiguous,
+        inputs: &[&Tensor],
+        grad: &Tensor,
+    ) -> Result<Vec<Option<Tensor>>> {
+        op.infer_backward(inputs, grad)?;
+        if !inputs[0].dtype().is_float() {
             return Ok(vec![None]);
         }
         Ok(vec![Some(Array::of(grad)?.tensor()?)])

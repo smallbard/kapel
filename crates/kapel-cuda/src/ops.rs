@@ -1,18 +1,24 @@
-//! The catalogue of operations on the device, in `f32`.
+//! The catalogue of operations on the device.
+//!
+//! Products and attention compute in their inputs' type (see `tile.rs` and
+//! `attention.rs`). The other operations compute in `f32`: inputs in `bf16`
+//! or `f16` are widened to `f32` on the device, and results rounded back to
+//! their type ([`InF32`]). Copies and row gathers move the bits of any type.
 //!
 //! The host prepares what depends only on shapes (the offsets of reductions,
 //! the lines of a softmax, the rows of a scatter, the angles of rotary
-//! embeddings) and the kernels do the arithmetic. Conversions and quantized
-//! weights go through the host for now.
+//! embeddings) and the kernels do the arithmetic. Quantized weights, and
+//! conversions to or from types other than `f32`, `bf16` and `f16`, go
+//! through the host for now.
 
 use std::sync::Arc;
 
 use kapel_core::{DType, Error, HostStorage, Layout, Result, Tensor};
 use kapel_cuda_abi::{binary, unary};
 use kapel_ops::{
-    Affine, Attention, Binary, BinaryKind, Cast, GatherRows, LayerNorm, LogSoftmax, Matmul, Max,
-    Mean, Operation, QuantizedMatmul, RmsNorm, Rope, RopeLayout, Run, ScatterAddRows, Softmax, Sum,
-    Transfer, Unary, UnaryKind,
+    Affine, Attention, Binary, BinaryKind, Cast, Contiguous, GatherRows, LayerNorm, LogSoftmax,
+    Matmul, Max, Mean, Operation, QuantizedMatmul, RmsNorm, Rope, RopeLayout, Run, ScatterAddRows,
+    Softmax, Sum, Transfer, Unary, UnaryKind,
 };
 
 use crate::device::{Args, Cuda, CudaStorage, Flat, Table, small, smalls};
@@ -299,8 +305,80 @@ impl Cuda {
     }
 }
 
-impl Run<Unary> for Cuda {
-    fn forward(&self, op: &Unary, inputs: &[&Tensor]) -> Result<Tensor> {
+/// An operation computed in `f32`, for inputs in `f32`; [`Run`] widens the
+/// others first.
+trait InF32<O> {
+    fn forward_f32(&self, op: &O, inputs: &[&Tensor]) -> Result<Tensor>;
+
+    fn backward_f32(
+        &self,
+        op: &O,
+        inputs: &[&Tensor],
+        grad: &Tensor,
+    ) -> Result<Vec<Option<Tensor>>>;
+}
+
+impl Cuda {
+    /// Each input in `f32` if it is in `bf16` or `f16`; the others as they are.
+    fn widened_all(&self, op: &'static str, inputs: &[&Tensor]) -> Result<Vec<Tensor>> {
+        inputs.iter().map(|x| self.widened(op, x)).collect()
+    }
+}
+
+/// [`Run`] for operations computed in `f32`: inputs widened, the output
+/// rounded to the type of its signature, and each gradient to its input's.
+macro_rules! in_f32 {
+    ($($op:ty),* $(,)?) => {$(
+        impl Run<$op> for Cuda {
+            fn forward(&self, op: &$op, inputs: &[&Tensor]) -> Result<Tensor> {
+                let name = <$op>::NAME;
+                let dtype = op.infer(inputs)?.dtype;
+                let wide = self.widened_all(name, inputs)?;
+                let wide: Vec<&Tensor> = wide.iter().collect();
+                let y = InF32::<$op>::forward_f32(self, op, &wide)?;
+                self.narrowed(name, &y, dtype)
+            }
+
+            fn backward(
+                &self,
+                op: &$op,
+                inputs: &[&Tensor],
+                grad: &Tensor,
+            ) -> Result<Vec<Option<Tensor>>> {
+                let name = <$op>::NAME;
+                op.infer_backward(inputs, grad)?;
+                let wide = self.widened_all(name, inputs)?;
+                let wide: Vec<&Tensor> = wide.iter().collect();
+                let g = self.widened(name, grad)?;
+                let grads = InF32::<$op>::backward_f32(self, op, &wide, &g)?;
+                grads
+                    .into_iter()
+                    .zip(inputs)
+                    .map(|(g, x)| g.map(|g| self.narrowed(name, &g, x.dtype())).transpose())
+                    .collect()
+            }
+        }
+    )*};
+}
+
+in_f32!(
+    Unary,
+    Affine,
+    Binary,
+    QuantizedMatmul,
+    Sum,
+    Mean,
+    Max,
+    Softmax,
+    LogSoftmax,
+    LayerNorm,
+    RmsNorm,
+    Rope,
+    ScatterAddRows,
+);
+
+impl InF32<Unary> for Cuda {
+    fn forward_f32(&self, op: &Unary, inputs: &[&Tensor]) -> Result<Tensor> {
         let signature = op.infer(inputs)?;
         let code = unary_code(Unary::NAME, op.kind)?;
         let x = self.flat(Unary::NAME, inputs[0])?;
@@ -313,7 +391,7 @@ impl Run<Unary> for Cuda {
         })
     }
 
-    fn backward(
+    fn backward_f32(
         &self,
         op: &Unary,
         inputs: &[&Tensor],
@@ -351,13 +429,13 @@ impl Cuda {
     }
 }
 
-impl Run<Affine> for Cuda {
-    fn forward(&self, op: &Affine, inputs: &[&Tensor]) -> Result<Tensor> {
+impl InF32<Affine> for Cuda {
+    fn forward_f32(&self, op: &Affine, inputs: &[&Tensor]) -> Result<Tensor> {
         let signature = op.infer(inputs)?;
         self.affine(inputs[0], op.scale, op.bias, &signature.shape)
     }
 
-    fn backward(
+    fn backward_f32(
         &self,
         op: &Affine,
         inputs: &[&Tensor],
@@ -373,8 +451,8 @@ impl Run<Affine> for Cuda {
     }
 }
 
-impl Run<Binary> for Cuda {
-    fn forward(&self, op: &Binary, inputs: &[&Tensor]) -> Result<Tensor> {
+impl InF32<Binary> for Cuda {
+    fn forward_f32(&self, op: &Binary, inputs: &[&Tensor]) -> Result<Tensor> {
         let signature = op.infer(inputs)?;
         let code = binary_code(Binary::NAME, op.kind)?;
         let shape = &signature.shape;
@@ -390,7 +468,7 @@ impl Run<Binary> for Cuda {
         })
     }
 
-    fn backward(
+    fn backward_f32(
         &self,
         op: &Binary,
         inputs: &[&Tensor],
@@ -425,13 +503,40 @@ impl Run<Binary> for Cuda {
     }
 }
 
+/// Whether conversions between `from` and `to` run on the device: between
+/// `f32`, `bf16` and `f16`.
+fn on_device(from: DType, to: DType) -> bool {
+    let float = |d| matches!(d, DType::F32 | DType::BF16 | DType::F16);
+    float(from) && float(to)
+}
+
+impl Cuda {
+    /// `x` converted to `dtype`, rounding to nearest even as the reference
+    /// does: on the device between `f32`, `bf16` and `f16` (through the exact
+    /// `f32` value), otherwise through the host and each element's exact
+    /// value. Always a new row-major tensor.
+    fn cast(&self, x: &Tensor, dtype: DType) -> Result<Tensor> {
+        let op = Cast::NAME;
+        if x.dtype() == dtype && dtype.element_size().is_some() {
+            return self.materialize(op, x, x.layout());
+        }
+        if on_device(x.dtype(), dtype) {
+            let wide = self.widened(op, x)?;
+            return match dtype {
+                // `widened` copies 16-bit inputs; an `f32` one still needs its own.
+                DType::F32 => self.materialize(op, &wide, wide.layout()),
+                _ => self.narrowed(op, &wide, dtype),
+            };
+        }
+        let values = self.values(x)?;
+        self.encoded(&values, x.shape(), dtype)
+    }
+}
+
 impl Run<Cast> for Cuda {
-    /// Conversions go through the host and the exact value of each element, as
-    /// the reference does: they are rare, and must round exactly as it does.
     fn forward(&self, op: &Cast, inputs: &[&Tensor]) -> Result<Tensor> {
-        let signature = op.infer(inputs)?;
-        let values = self.values(inputs[0])?;
-        self.encoded(&values, &signature.shape, op.dtype)
+        op.infer(inputs)?;
+        self.cast(inputs[0], op.dtype)
     }
 
     fn backward(
@@ -447,12 +552,35 @@ impl Run<Cast> for Cuda {
         if !op.differentiable(0) || !dtype.is_float() {
             return Ok(vec![None]);
         }
-        let values = self.values(grad)?;
-        Ok(vec![Some(self.encoded(
-            &values,
-            inputs[0].shape(),
-            dtype,
-        )?)])
+        Ok(vec![Some(self.cast(grad, dtype)?)])
+    }
+}
+
+impl Run<Contiguous> for Cuda {
+    fn forward(&self, op: &Contiguous, inputs: &[&Tensor]) -> Result<Tensor> {
+        op.infer(inputs)?;
+        let x = inputs[0];
+        self.storage(Contiguous::NAME, x)?;
+        if x.is_contiguous() {
+            return Ok(x.clone());
+        }
+        self.materialize(Contiguous::NAME, x, x.layout())
+    }
+
+    fn backward(
+        &self,
+        op: &Contiguous,
+        inputs: &[&Tensor],
+        grad: &Tensor,
+    ) -> Result<Vec<Option<Tensor>>> {
+        op.infer_backward(inputs, grad)?;
+        // The gradient passes through, in the input's type; an integer input
+        // receives none.
+        let dtype = inputs[0].dtype();
+        if !dtype.is_float() {
+            return Ok(vec![None]);
+        }
+        Ok(vec![Some(self.cast(grad, dtype)?)])
     }
 }
 
@@ -478,9 +606,23 @@ impl Run<Matmul> for Cuda {
         let ga = self.forward(op, &[grad, &bt])?;
         let gb = self.forward(op, &[&at, grad])?;
         Ok(vec![
-            Some(self.sum_to(Matmul::NAME, &ga, a.shape())?),
-            Some(self.sum_to(Matmul::NAME, &gb, b.shape())?),
+            Some(self.summed_to(&ga, a.shape())?),
+            Some(self.summed_to(&gb, b.shape())?),
         ])
+    }
+}
+
+impl Cuda {
+    /// The gradient of a product, of its type, summed back to `target` over the
+    /// batch dimensions it was broadcast along: in `f32` (then rounded back),
+    /// when there is anything to sum.
+    fn summed_to(&self, full: &Tensor, target: &[usize]) -> Result<Tensor> {
+        let op = Matmul::NAME;
+        if full.shape() == target {
+            return Ok(full.clone());
+        }
+        let wide = self.widened(op, full)?;
+        self.narrowed(op, &self.sum_to(op, &wide, target)?, full.dtype())
     }
 }
 
@@ -489,10 +631,10 @@ fn leading(shape: &[usize]) -> usize {
     shape[..shape.len().saturating_sub(1)].iter().product()
 }
 
-impl Run<QuantizedMatmul> for Cuda {
+impl InF32<QuantizedMatmul> for Cuda {
     /// The weights are dequantized on the host, then multiplied. Kernels that
     /// read the codes directly come with the inference engine.
-    fn forward(&self, op: &QuantizedMatmul, inputs: &[&Tensor]) -> Result<Tensor> {
+    fn forward_f32(&self, op: &QuantizedMatmul, inputs: &[&Tensor]) -> Result<Tensor> {
         let signature = op.infer(inputs)?;
         let (x, w) = (inputs[0], inputs[1]);
         let k = w.shape()[1];
@@ -506,7 +648,7 @@ impl Run<QuantizedMatmul> for Cuda {
         self.matmul(&x, &wt, &shape)?.reshape(&signature.shape)
     }
 
-    fn backward(
+    fn backward_f32(
         &self,
         op: &QuantizedMatmul,
         inputs: &[&Tensor],
@@ -527,8 +669,8 @@ impl Run<QuantizedMatmul> for Cuda {
     }
 }
 
-impl Run<Sum> for Cuda {
-    fn forward(&self, op: &Sum, inputs: &[&Tensor]) -> Result<Tensor> {
+impl InF32<Sum> for Cuda {
+    fn forward_f32(&self, op: &Sum, inputs: &[&Tensor]) -> Result<Tensor> {
         let signature = op.infer(inputs)?;
         let x = self.flat(Sum::NAME, inputs[0])?;
         self.reduce(
@@ -541,7 +683,12 @@ impl Run<Sum> for Cuda {
         )
     }
 
-    fn backward(&self, op: &Sum, inputs: &[&Tensor], grad: &Tensor) -> Result<Vec<Option<Tensor>>> {
+    fn backward_f32(
+        &self,
+        op: &Sum,
+        inputs: &[&Tensor],
+        grad: &Tensor,
+    ) -> Result<Vec<Option<Tensor>>> {
         op.infer_backward(inputs, grad)?;
         Ok(vec![Some(self.spread(
             Sum::NAME,
@@ -557,8 +704,8 @@ fn count(shape: &[usize], dims: &[usize]) -> f32 {
     dims.iter().map(|&d| shape[d]).product::<usize>() as f32
 }
 
-impl Run<Mean> for Cuda {
-    fn forward(&self, op: &Mean, inputs: &[&Tensor]) -> Result<Tensor> {
+impl InF32<Mean> for Cuda {
+    fn forward_f32(&self, op: &Mean, inputs: &[&Tensor]) -> Result<Tensor> {
         let signature = op.infer(inputs)?;
         let x = self.flat(Mean::NAME, inputs[0])?;
         let shape = inputs[0].shape();
@@ -572,7 +719,7 @@ impl Run<Mean> for Cuda {
         )
     }
 
-    fn backward(
+    fn backward_f32(
         &self,
         op: &Mean,
         inputs: &[&Tensor],
@@ -636,13 +783,18 @@ impl Cuda {
     }
 }
 
-impl Run<Max> for Cuda {
-    fn forward(&self, op: &Max, inputs: &[&Tensor]) -> Result<Tensor> {
+impl InF32<Max> for Cuda {
+    fn forward_f32(&self, op: &Max, inputs: &[&Tensor]) -> Result<Tensor> {
         let signature = op.infer(inputs)?;
         Ok(self.line_max(inputs[0], op.dim, &signature.shape)?.0)
     }
 
-    fn backward(&self, op: &Max, inputs: &[&Tensor], grad: &Tensor) -> Result<Vec<Option<Tensor>>> {
+    fn backward_f32(
+        &self,
+        op: &Max,
+        inputs: &[&Tensor],
+        grad: &Tensor,
+    ) -> Result<Vec<Option<Tensor>>> {
         let signature = op.infer_backward(inputs, grad)?;
         let (_, at, lines) = self.line_max(inputs[0], op.dim, &signature.shape)?;
         // `infer_backward` checked that the gradient has one value per line.
@@ -684,13 +836,13 @@ impl Cuda {
     }
 }
 
-impl Run<Softmax> for Cuda {
-    fn forward(&self, op: &Softmax, inputs: &[&Tensor]) -> Result<Tensor> {
+impl InF32<Softmax> for Cuda {
+    fn forward_f32(&self, op: &Softmax, inputs: &[&Tensor]) -> Result<Tensor> {
         op.infer(inputs)?;
         self.softmax(Softmax::NAME, 0, inputs[0], op.dim, None)
     }
 
-    fn backward(
+    fn backward_f32(
         &self,
         op: &Softmax,
         inputs: &[&Tensor],
@@ -707,13 +859,13 @@ impl Run<Softmax> for Cuda {
     }
 }
 
-impl Run<LogSoftmax> for Cuda {
-    fn forward(&self, op: &LogSoftmax, inputs: &[&Tensor]) -> Result<Tensor> {
+impl InF32<LogSoftmax> for Cuda {
+    fn forward_f32(&self, op: &LogSoftmax, inputs: &[&Tensor]) -> Result<Tensor> {
         op.infer(inputs)?;
         self.softmax(LogSoftmax::NAME, 1, inputs[0], op.dim, None)
     }
 
-    fn backward(
+    fn backward_f32(
         &self,
         op: &LogSoftmax,
         inputs: &[&Tensor],
@@ -728,6 +880,11 @@ impl Run<LogSoftmax> for Cuda {
             Some(grad),
         )?)])
     }
+}
+
+/// The threads of `count` warps, one per row of a normalization.
+fn warps(op: &'static str, count: usize) -> Result<usize> {
+    count.checked_mul(32).ok_or(Error::Overflow { op })
 }
 
 /// A normalization: its kind (`rms` = 0 for LayerNorm, 1 for RMSNorm), its
@@ -758,12 +915,12 @@ impl Cuda {
         }
     }
 
-    /// `tensor` in `dtype`: itself, or a conversion (through the host).
+    /// `tensor` in `dtype`: itself, or a conversion.
     fn converted(&self, tensor: &Tensor, dtype: DType) -> Result<Tensor> {
         if tensor.dtype() == dtype {
             Ok(tensor.clone())
         } else {
-            self.forward(&Cast { dtype }, &[tensor])
+            self.cast(tensor, dtype)
         }
     }
 
@@ -778,7 +935,7 @@ impl Cuda {
         self.output(&shape, false, |out, n| {
             self.launch(
                 "norm_rows",
-                rows,
+                warps(op, rows)?,
                 Args::new()
                     .u32(norm.rms)
                     .flat(&x)
@@ -811,7 +968,7 @@ impl Cuda {
         let gx = self.output(&shape, false, |out, n| {
             self.launch(
                 "norm_rows_backward",
-                rows,
+                warps(op, rows)?,
                 Args::new()
                     .u32(norm.rms)
                     .flat(&x)
@@ -841,13 +998,13 @@ impl Cuda {
     }
 }
 
-impl Run<LayerNorm> for Cuda {
-    fn forward(&self, op: &LayerNorm, inputs: &[&Tensor]) -> Result<Tensor> {
+impl InF32<LayerNorm> for Cuda {
+    fn forward_f32(&self, op: &LayerNorm, inputs: &[&Tensor]) -> Result<Tensor> {
         op.infer(inputs)?;
         self.norm_forward(&layer_norm(op, inputs), inputs[0])
     }
 
-    fn backward(
+    fn backward_f32(
         &self,
         op: &LayerNorm,
         inputs: &[&Tensor],
@@ -890,13 +1047,13 @@ fn rms_norm<'a>(op: &RmsNorm, inputs: &[&'a Tensor]) -> Norm<'a> {
     }
 }
 
-impl Run<RmsNorm> for Cuda {
-    fn forward(&self, op: &RmsNorm, inputs: &[&Tensor]) -> Result<Tensor> {
+impl InF32<RmsNorm> for Cuda {
+    fn forward_f32(&self, op: &RmsNorm, inputs: &[&Tensor]) -> Result<Tensor> {
         op.infer(inputs)?;
         self.norm_forward(&rms_norm(op, inputs), inputs[0])
     }
 
-    fn backward(
+    fn backward_f32(
         &self,
         op: &RmsNorm,
         inputs: &[&Tensor],
@@ -938,7 +1095,7 @@ impl Cuda {
     /// Turns every vector of `x` by its position's angles; `direction` is 1 for
     /// the rotation, −1 for its transpose (the backward pass).
     ///
-    /// The angles are computed on the host in `f64`, once per distinct position
+    /// The angles are computed in `f64` (`rope_table`), once per position
     /// entry: positions in the hundreds of thousands times a frequency near 1
     /// would lose their phase in `f32`.
     fn rope(&self, op: &Rope, x: &Tensor, positions: &Tensor, direction: f64) -> Result<Tensor> {
@@ -946,18 +1103,35 @@ impl Cuda {
         let shape = x.shape().to_vec();
         let d = *shape.last().expect("checked by infer");
         let r = op.rotated(d);
-        let frequencies = op.frequencies(r);
-        let factor = op.attention_factor();
-        let entries = self.indices(name, positions, usize::MAX)?;
-        let table: Vec<f32> = entries
-            .iter()
-            .flat_map(|&p| {
-                frequencies.iter().flat_map(move |&w| {
-                    let (sin, cos) = (direction * p as f64 * w).sin_cos();
-                    [(factor * cos) as f32, (factor * sin) as f32]
-                })
-            })
+        // The factor, then the frequencies, as the halves of their bits.
+        let constants: Vec<u64> = std::iter::once(op.attention_factor())
+            .chain(op.frequencies(r))
+            .map(f64::to_bits)
             .collect();
+        let key: Vec<usize> = constants.iter().map(|&c| c as usize).collect();
+        let constants = self.table("rope constants", &key, || {
+            Ok(constants
+                .iter()
+                .flat_map(|&c| [c as u32, (c >> 32) as u32])
+                .collect())
+        })?;
+        let signed = u32::from(positions.dtype() == DType::I32);
+        let positions = self.materialize(name, positions, positions.layout())?;
+        let entries = positions.numel();
+        let p = self.storage(name, &positions)?;
+        let half = r / 2;
+        let table = self.output(&[entries * half * 2], false, |out, n| {
+            self.launch(
+                "rope_table",
+                entries * half,
+                Args::new()
+                    .list(p, entries)
+                    .u32(signed)
+                    .slice(constants.storage.pointer(), half + 1)
+                    .f32(direction as f32)
+                    .slice(out, n),
+            )
+        })?;
         let vectors = &shape[..shape.len() - 1];
         let entry = self.table(
             "rope entries",
@@ -971,7 +1145,6 @@ impl Cuda {
             },
         )?;
         let x = self.flat(name, x)?;
-        let table = self.upload_f32(&table, &[table.len()])?;
         let table = self.flat(name, &table)?;
         let half_pairs = u32::from(op.layout == RopeLayout::Half);
         self.output(&shape, false, |out, n| {
@@ -991,13 +1164,13 @@ impl Cuda {
     }
 }
 
-impl Run<Rope> for Cuda {
-    fn forward(&self, op: &Rope, inputs: &[&Tensor]) -> Result<Tensor> {
+impl InF32<Rope> for Cuda {
+    fn forward_f32(&self, op: &Rope, inputs: &[&Tensor]) -> Result<Tensor> {
         op.infer(inputs)?;
         self.rope(op, inputs[0], inputs[1], 1.0)
     }
 
-    fn backward(
+    fn backward_f32(
         &self,
         op: &Rope,
         inputs: &[&Tensor],
@@ -1009,12 +1182,17 @@ impl Run<Rope> for Cuda {
 }
 
 impl Run<GatherRows> for Cuda {
+    /// The rows are copied bit for bit, in `f32`, `bf16` or `f16`.
     fn forward(&self, op: &GatherRows, inputs: &[&Tensor]) -> Result<Tensor> {
+        let name = GatherRows::NAME;
         let signature = op.infer(inputs)?;
         let shape = inputs[0].shape();
-        let rows = self.indices(GatherRows::NAME, inputs[1], shape[0])?;
+        let rows = self.indices(name, inputs[1], shape[0])?;
         let width = shape[1..].iter().product();
-        self.gather(GatherRows::NAME, inputs[0], &rows, width, &signature.shape)
+        match inputs[0].dtype() {
+            DType::BF16 | DType::F16 => self.gather_16(inputs[0], &rows, width, &signature),
+            _ => self.gather(name, inputs[0], &rows, width, &signature.shape),
+        }
     }
 
     fn backward(
@@ -1023,16 +1201,54 @@ impl Run<GatherRows> for Cuda {
         inputs: &[&Tensor],
         grad: &Tensor,
     ) -> Result<Vec<Option<Tensor>>> {
+        let name = GatherRows::NAME;
         op.infer_backward(inputs, grad)?;
         let shape = inputs[0].shape();
-        let rows = self.indices(GatherRows::NAME, inputs[1], shape[0])?;
-        let out = self.scatter(GatherRows::NAME, grad, &rows, shape[0], shape)?;
-        Ok(vec![Some(out), None])
+        let rows = self.indices(name, inputs[1], shape[0])?;
+        let g = self.widened(name, grad)?;
+        let out = self.scatter(name, &g, &rows, shape[0], shape)?;
+        Ok(vec![
+            Some(self.narrowed(name, &out, inputs[0].dtype())?),
+            None,
+        ])
     }
 }
 
-impl Run<ScatterAddRows> for Cuda {
-    fn forward(&self, op: &ScatterAddRows, inputs: &[&Tensor]) -> Result<Tensor> {
+impl Cuda {
+    /// `gather` for a source in 16 bits.
+    fn gather_16(
+        &self,
+        src: &Tensor,
+        rows: &[usize],
+        width: usize,
+        signature: &kapel_ops::Signature,
+    ) -> Result<Tensor> {
+        let op = GatherRows::NAME;
+        let src = if src.is_contiguous() {
+            src.clone()
+        } else {
+            self.materialize(op, src, src.layout())?
+        };
+        let storage = self.storage(op, &src)?;
+        let start = src.layout().offset();
+        let pointer = storage.pointer() + start as u64 * 2;
+        let r = self.upload_u32(&smalls(op, rows)?)?;
+        self.output_as(&signature.shape, signature.dtype, false, |out, n| {
+            self.launch(
+                "gather_rows_16",
+                n,
+                Args::new()
+                    .slice(pointer, src.numel())
+                    .list(&r, rows.len())
+                    .u32(small(op, width)?)
+                    .slice(out, n),
+            )
+        })
+    }
+}
+
+impl InF32<ScatterAddRows> for Cuda {
+    fn forward_f32(&self, op: &ScatterAddRows, inputs: &[&Tensor]) -> Result<Tensor> {
         let signature = op.infer(inputs)?;
         let rows = self.indices(ScatterAddRows::NAME, inputs[1], op.rows)?;
         self.scatter(
@@ -1044,7 +1260,7 @@ impl Run<ScatterAddRows> for Cuda {
         )
     }
 
-    fn backward(
+    fn backward_f32(
         &self,
         op: &ScatterAddRows,
         inputs: &[&Tensor],
