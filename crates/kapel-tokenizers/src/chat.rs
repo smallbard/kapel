@@ -6,6 +6,12 @@
 //! blocks trimmed (`trim_blocks`, `lstrip_blocks`), Python string methods
 //! available, `raise_exception` and `strftime_now` defined, and `tojson` writing
 //! JSON as Python's `json.dumps` does.
+//!
+//! A template comes with the model, from strangers: a rendering is bounded in
+//! work ([`FUEL`] instructions) and in output ([`MAX_OUTPUT`] bytes). Within a
+//! rendering, a single string repetition (`'x' * n`) is bounded by minijinja
+//! (100 MB); strings built by repeated concatenation are bounded only through
+//! the fuel, which does not limit their size (see `SECURITY.md`).
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -16,7 +22,11 @@ use serde_json::Value;
 use crate::{TokenizerError, bad};
 
 /// The most instructions one rendering may run.
-const FUEL: u64 = 10_000_000;
+pub const FUEL: u64 = 10_000_000;
+
+/// The longest text a rendering may produce: 1 MiB, far above any prompt a
+/// model takes (a long conversation of a 128k-token context is about 500 kB).
+pub const MAX_OUTPUT: usize = 1 << 20;
 
 /// A message of a conversation.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -43,6 +53,38 @@ pub struct ChatTemplate {
     source: String,
     /// `bos_token`, `eos_token`… as `tokenizer_config.json` gives them.
     tokens: BTreeMap<String, String>,
+    /// The time `strftime_now` sees: the local time, or a fixed one.
+    clock: Clock,
+}
+
+/// The clock of `strftime_now`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Clock {
+    /// The local time of the system, as Python's `datetime.now()`.
+    Local,
+    /// A fixed wall-clock time, in seconds from 1970-01-01 00:00:00.
+    Fixed(i64),
+}
+
+/// A writer that refuses to grow past [`MAX_OUTPUT`] bytes.
+struct Capped {
+    text: Vec<u8>,
+    overflowed: bool,
+}
+
+impl std::io::Write for Capped {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.text.len() + buf.len() > MAX_OUTPUT {
+            self.overflowed = true;
+            return Err(std::io::Error::other("output limit"));
+        }
+        self.text.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// A special token of `tokenizer_config.json`: a string, or an object with a
@@ -62,7 +104,23 @@ impl ChatTemplate {
         Self {
             source: source.into(),
             tokens,
+            clock: Clock::Local,
         }
+    }
+
+    /// The same template, with `strftime_now` giving the fixed wall-clock time
+    /// `date` (year, month, day) and `time` (hour, minute, second) instead of
+    /// the current local time: for reproducible renderings, such as tests.
+    #[must_use]
+    pub fn with_fixed_time(mut self, date: (i64, u32, u32), time: (u32, u32, u32)) -> Self {
+        let (year, month, day) = date;
+        let (hour, minute, second) = time;
+        let days = days_from_civil(year, i64::from(month), i64::from(day));
+        self.clock =
+            Clock::Fixed(days.saturating_mul(86_400).saturating_add(
+                i64::from(hour) * 3600 + i64::from(minute) * 60 + i64::from(second),
+            ));
+        self
     }
 
     /// The template of a model directory, if it has one.
@@ -107,8 +165,9 @@ impl ChatTemplate {
     ///
     /// # Errors
     ///
-    /// If the template is not valid, or rejects the conversation (many raise an
-    /// exception for a role they do not support).
+    /// If the template is not valid, rejects the conversation (many raise an
+    /// exception for a role they do not support), runs out of fuel ([`FUEL`]),
+    /// or writes more than [`MAX_OUTPUT`] bytes.
     pub fn render(
         &self,
         messages: &[Message],
@@ -127,7 +186,10 @@ impl ChatTemplate {
                 Err(JinjaError::new(ErrorKind::InvalidOperation, message))
             },
         );
-        env.add_function("strftime_now", |format: String| strftime_now(&format));
+        let clock = self.clock;
+        env.add_function("strftime_now", move |format: String| {
+            strftime_now(clock, &format)
+        });
         env.add_filter("tojson", tojson);
         let source = without_generation_tags(&self.source);
         env.add_template("chat", &source)
@@ -151,9 +213,21 @@ impl ChatTemplate {
             "add_generation_prompt".into(),
             JinjaValue::from(add_generation_prompt),
         );
-        env.get_template("chat")
-            .and_then(|t| t.render(context))
-            .map_err(|e| TokenizerError::Template(e.to_string()))
+        let mut out = Capped {
+            text: Vec::new(),
+            overflowed: false,
+        };
+        let rendered = env
+            .get_template("chat")
+            .and_then(|t| t.render_captured_to(context, &mut out).map(drop));
+        if out.overflowed {
+            return Err(TokenizerError::Template(format!(
+                "the rendering is longer than {MAX_OUTPUT} bytes"
+            )));
+        }
+        rendered.map_err(|e| TokenizerError::Template(e.to_string()))?;
+        String::from_utf8(out.text)
+            .map_err(|_| TokenizerError::Template("the rendering is not UTF-8".into()))
     }
 }
 
@@ -224,18 +298,79 @@ fn write_json(value: &Value, indent: Option<usize>, depth: usize, out: &mut Stri
     }
 }
 
-/// The current local date and time, formatted with the common `strftime`
-/// directives (`%d %m %Y %y %b %B %a %A %H %M %S %j %%`). Templates use it to
-/// write today's date in the system prompt.
-fn strftime_now(format: &str) -> Result<String, JinjaError> {
-    let seconds = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|e| JinjaError::new(ErrorKind::InvalidOperation, e.to_string()))?
-        .as_secs() as i64;
-    Ok(format_time(seconds, format))
+/// The current date and time, formatted with the common `strftime` directives
+/// (`%d %e %m %Y %y %b %B %a %A %H %M %S %j %%`). Templates use it to write
+/// today's date in the system prompt.
+///
+/// As in `transformers` (Python's `datetime.now()`), the time is local: on
+/// Unix, from the system's time zone (`localtime_r`); elsewhere, Kapel has no
+/// time zone database and uses UTC.
+fn strftime_now(clock: Clock, format: &str) -> Result<String, JinjaError> {
+    let wall = match clock {
+        Clock::Fixed(wall) => wall,
+        Clock::Local => {
+            let seconds = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| JinjaError::new(ErrorKind::InvalidOperation, e.to_string()))?
+                .as_secs();
+            let seconds = i64::try_from(seconds).unwrap_or(i64::MAX);
+            local_wall_clock(seconds).unwrap_or(seconds)
+        }
+    };
+    Ok(format_time(wall, format))
 }
 
-/// Formats a Unix time (UTC) with `strftime` directives.
+/// The local wall-clock time of the Unix time `seconds`, as seconds from
+/// 1970-01-01 00:00:00 local time; `None` if the system cannot tell.
+#[cfg(unix)]
+fn local_wall_clock(seconds: i64) -> Option<i64> {
+    let time = libc::time_t::try_from(seconds).ok()?;
+    // SAFETY: `tm` is a plain C struct of integers (and, on some systems, a
+    // pointer to the zone name): all zeros is a valid value of it.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: both pointers are valid for the call; `localtime_r` is the
+    // reentrant form and writes only to `tm`. It may read the `TZ` variable,
+    // which safe Rust cannot change concurrently (`std::env::set_var` is
+    // `unsafe`, its callers vouch for that).
+    let result = unsafe { libc::localtime_r(&time, &mut tm) };
+    if result.is_null() {
+        return None;
+    }
+    let days = days_from_civil(
+        i64::from(tm.tm_year) + 1900,
+        i64::from(tm.tm_mon) + 1,
+        i64::from(tm.tm_mday),
+    );
+    Some(
+        days * 86_400
+            + i64::from(tm.tm_hour) * 3600
+            + i64::from(tm.tm_min) * 60
+            + i64::from(tm.tm_sec),
+    )
+}
+
+#[cfg(not(unix))]
+fn local_wall_clock(_seconds: i64) -> Option<i64> {
+    None
+}
+
+/// Days from 1970-01-01 to a civil date (Howard Hinnant's algorithm); months
+/// and days out of range carry over.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = year.clamp(-1_000_000, 1_000_000) + (month - 1).div_euclid(12);
+    let month = (month - 1).rem_euclid(12) + 1;
+    let day = day.clamp(-1_000_000, 1_000_000);
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// Formats a wall-clock time (seconds from 1970-01-01 00:00:00) with
+/// `strftime` directives.
 fn format_time(seconds: i64, format: &str) -> String {
     const MONTHS: [&str; 12] = [
         "January",
@@ -314,6 +449,9 @@ mod tests {
 
     use super::*;
 
+    /// The time `tools/parity/chat_reference.py` renders at (`FIXED_NOW`).
+    const PARITY_TIME: ((i64, u32, u32), (u32, u32, u32)) = ((2026, 10, 20), (12, 0, 0));
+
     #[test]
     fn dates_are_formatted_as_strftime_does() {
         // 2024-02-29 13:05:09 UTC, a Thursday.
@@ -322,12 +460,60 @@ mod tests {
             "29 Feb 2024 13:05:09 Thu 060 24 February"
         );
         assert_eq!(format_time(0, "%A %d %m %Y"), "Thursday 01 01 1970");
+        for (y, m, d) in [
+            (1970, 1, 1),
+            (2024, 2, 29),
+            (2000, 3, 1),
+            (1969, 12, 31),
+            (2026, 10, 20),
+        ] {
+            let seconds = days_from_civil(y, m, d) * 86_400;
+            assert_eq!(
+                format_time(seconds, "%Y-%m-%d"),
+                format!("{y:04}-{m:02}-{d:02}")
+            );
+        }
+        assert_eq!(days_from_civil(2024, 2, 29), 1_709_211_909 / 86_400);
+        // Out-of-range parts carry over, without a panic.
+        assert_eq!(days_from_civil(2024, 13, 1), days_from_civil(2025, 1, 1));
+        let _ = format_time(days_from_civil(i64::MAX, 0, i64::MIN) * 86_400, "%c %Y");
+    }
+
+    #[test]
+    fn strftime_now_gives_the_fixed_time_or_the_local_one() {
+        let template = ChatTemplate::new("{{ strftime_now('%d %b %Y %H:%M') }}", BTreeMap::new());
+        let fixed = template.clone().with_fixed_time((2026, 10, 20), (9, 5, 0));
+        assert_eq!(fixed.render(&[], false).unwrap(), "20 Oct 2026 09:05");
+        let now = template.render(&[], false).unwrap();
+        assert_eq!(now.len(), "20 Oct 2026 09:05".len(), "{now}");
+    }
+
+    #[test]
+    fn a_rendering_is_bounded_in_size() {
+        // Output growing step by step.
+        let template = ChatTemplate::new(
+            "{% for i in range(100000) %}{{ 'xxxxxxxxxxxxxxxxxxxx' }}{% endfor %}",
+            BTreeMap::new(),
+        );
+        let error = template.render(&[], false).unwrap_err().to_string();
+        assert!(error.contains("longer than"), "{error}");
+        // One huge string at once: minijinja refuses repetitions past 100 MB…
+        let template = ChatTemplate::new("{{ 'x' * 1000000000000 }}", BTreeMap::new());
+        let error = template.render(&[], false).unwrap_err().to_string();
+        assert!(error.contains("too large"), "{error}");
+        // …and the output limit catches those below.
+        let template = ChatTemplate::new("{{ 'x' * 2000000 }}", BTreeMap::new());
+        let error = template.render(&[], false).unwrap_err().to_string();
+        assert!(error.contains("longer than"), "{error}");
+        // Just below the limit is fine.
+        let template = ChatTemplate::new(format!("{{{{ 'x' * {MAX_OUTPUT} }}}}"), BTreeMap::new());
+        assert_eq!(template.render(&[], false).unwrap().len(), MAX_OUTPUT);
     }
 
     #[test]
     fn a_template_that_never_ends_is_stopped() {
         let template = ChatTemplate::new(
-            "{% for i in range(10000) %}{% for j in range(10000) %}{% for k in range(10000) %}x{% endfor %}{% endfor %}{% endfor %}",
+            "{% for i in range(10000) %}{% for j in range(10000) %}{% for k in range(10000) %}{% if false %}x{% endif %}{% endfor %}{% endfor %}{% endfor %}",
             BTreeMap::new(),
         );
         let error = template.render(&[], false).unwrap_err().to_string();
@@ -343,11 +529,14 @@ mod tests {
     }
 
     /// Every `chat_cases.json` written by `tools/parity/chat_reference.py`;
-    /// without them (in continuous integration), the test checks nothing.
+    /// without them (in continuous integration), the test is skipped, or fails
+    /// with `KAPEL_REQUIRE_PARITY=1`. Both sides render at the fixed time
+    /// [`PARITY_TIME`], so that templates writing today's date compare.
     #[test]
     fn renderings_match_transformers() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/parity");
         let Ok(dirs) = std::fs::read_dir(&root) else {
+            crate::parity_skipped("data/parity");
             return;
         };
         let mut failures = Vec::new();
@@ -357,9 +546,11 @@ mod tests {
                 continue;
             };
             let name = dir.file_name().to_string_lossy().into_owned();
+            let (date, time) = PARITY_TIME;
             let template = ChatTemplate::from_dir(dir.path())
                 .unwrap()
-                .expect("a template");
+                .expect("a template")
+                .with_fixed_time(date, time);
             let cases: Value = serde_json::from_str(&text).unwrap();
             for case in cases.as_array().unwrap() {
                 checked += 1;
@@ -381,6 +572,9 @@ mod tests {
                     )),
                 }
             }
+        }
+        if checked == 0 {
+            crate::parity_skipped("data/parity/*/chat_cases.json");
         }
         eprintln!("{checked} conversations checked");
         assert!(

@@ -100,6 +100,8 @@ fn infer_norm(op: &'static str, inputs: &[&Tensor], max_inputs: usize) -> Result
 /// `y = (x − μ) / √(σ² + eps) · weight + bias`.
 ///
 /// Inputs: `x [..., C]`, then optionally `weight [C]`, then optionally `bias [C]`.
+/// The vectors may be in any float type, not necessarily that of `x`; their
+/// gradients come in their own type.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LayerNorm {
     /// Added to the variance.
@@ -121,8 +123,9 @@ impl Operation for LayerNorm {
 /// Root-mean-square normalization over the last dimension:
 /// `y = x / √(mean(x²) + eps) · (weight_offset + weight)`.
 ///
-/// Inputs: `x [..., C]`, then optionally `weight [C]`. `weight_offset` is 0 for
-/// Llama and Qwen, 1 for Gemma, which stores `weight − 1`.
+/// Inputs: `x [..., C]`, then optionally `weight [C]`, in any float type.
+/// `weight_offset` is 0 for Llama and Qwen, 1 for Gemma, which stores
+/// `weight − 1`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RmsNorm {
     /// Added to the mean of the squares.

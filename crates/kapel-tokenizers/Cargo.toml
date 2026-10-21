@@ -12,8 +12,14 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+# Already in the tree through the regex engine: finds the added tokens.
+aho-corasick = "1"
 fancy-regex.workspace = true
 serde_json.workspace = true
 unicode-normalization.workspace = true
 minijinja.workspace = true
 minijinja-contrib.workspace = true
+
+# `localtime_r`, for the local time of `strftime_now` in chat templates.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

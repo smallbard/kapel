@@ -94,10 +94,24 @@ pub struct Config {
     pub lm_head_bias: bool,
 }
 
+// Bounds far above any model, so that a hostile file cannot make Kapel allocate
+// without limit, or overflow when sizes are multiplied together: with these, a
+// product of two of them fits in 48 bits.
+
 /// The most layers a configuration may have.
 pub const MAX_LAYERS: usize = 4096;
 /// The most heads a configuration may have.
 pub const MAX_HEADS: usize = 4096;
+/// The widest hidden states a configuration may have (the largest models have
+/// a few tens of thousands).
+pub const MAX_HIDDEN: usize = 1 << 20;
+/// The widest head a configuration may have (models use 64 to 256).
+pub const MAX_HEAD_DIM: usize = 1 << 14;
+/// The widest MLP a configuration may have.
+pub const MAX_INTERMEDIATE: usize = 1 << 24;
+/// The largest vocabulary a configuration may have (token ids are `u32`;
+/// models have up to a few hundred thousand).
+pub const MAX_VOCAB: usize = 1 << 24;
 
 /// A field of the configuration, under any of its names.
 fn field<'a>(json: &'a Value, names: &[&str]) -> Option<&'a Value> {
@@ -199,8 +213,13 @@ impl Config {
         let kv_heads = usize_field(json, &["num_key_value_heads"]).unwrap_or(heads);
         let head_dim =
             usize_field(json, &["head_dim"]).unwrap_or(hidden.checked_div(heads).unwrap_or(0));
-        let intermediate =
-            usize_field(json, &["intermediate_size", "n_inner"]).unwrap_or(4 * hidden);
+        let intermediate = match usize_field(json, &["intermediate_size", "n_inner"]) {
+            Ok(n) => n,
+            Err(_) => hidden
+                .checked_mul(4)
+                .ok_or_else(|| ModelError::Config(format!("an MLP of 4 × {hidden} is too wide")))?,
+        };
+        let vocab = usize_field(json, &["vocab_size"])?;
         let act_name = field(
             json,
             &["hidden_activation", "hidden_act", "activation_function"],
@@ -227,12 +246,14 @@ impl Config {
             let rotary = ((head_dim as f64 * partial) as usize) & !1;
             Some((theta, scaling(json)?, rotary))
         };
-        // Bounds far above any model, so that a hostile file cannot make Kapel
-        // allocate per layer or per head without limit.
         for (name, value, limit) in [
             ("layers", layers, MAX_LAYERS),
             ("heads", heads, MAX_HEADS),
             ("key heads", kv_heads, MAX_HEADS),
+            ("hidden width", hidden, MAX_HIDDEN),
+            ("head width", head_dim, MAX_HEAD_DIM),
+            ("MLP width", intermediate, MAX_INTERMEDIATE),
+            ("vocabulary size", vocab, MAX_VOCAB),
         ] {
             if value > limit {
                 return Err(ModelError::Config(format!(
@@ -288,7 +309,7 @@ impl Config {
             block,
             norm,
             eps,
-            vocab: usize_field(json, &["vocab_size"])?,
+            vocab,
             hidden,
             layers,
             heads,
@@ -349,5 +370,45 @@ mod tests {
         ] {
             assert!(llama(change).is_err());
         }
+    }
+
+    /// Sizes near `usize::MAX` once overflowed `4 * hidden`; every size has a
+    /// bound now.
+    #[test]
+    fn huge_sizes_are_errors_not_overflows() {
+        let huge = u64::MAX / 2;
+        for key in [
+            "hidden_size",
+            "head_dim",
+            "intermediate_size",
+            "vocab_size",
+            "num_attention_heads",
+            "num_key_value_heads",
+        ] {
+            for value in [huge, u64::MAX, 1 << 40] {
+                let error = llama(|j| {
+                    j[key] = value.into();
+                    if key == "hidden_size" {
+                        j.as_object_mut().unwrap().remove("intermediate_size");
+                    }
+                })
+                .unwrap_err()
+                .to_string();
+                assert!(
+                    error.contains("accepted") || error.contains("too wide"),
+                    "{key} = {value}: {error}"
+                );
+            }
+        }
+        // GPT-2 derives its MLP width from the hidden one.
+        let gpt2 = serde_json::json!({
+            "model_type": "gpt2", "n_embd": u64::MAX / 2, "n_head": 1, "n_layer": 1,
+            "vocab_size": 10,
+        });
+        assert!(Config::from_json(&gpt2).is_err());
+        let gpt2 = serde_json::json!({
+            "model_type": "gpt2", "n_embd": 64, "n_head": 4, "n_layer": 1, "vocab_size": 10,
+        });
+        assert_eq!(Config::from_json(&gpt2).unwrap().intermediate, 256);
     }
 }

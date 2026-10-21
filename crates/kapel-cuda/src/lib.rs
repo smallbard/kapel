@@ -24,6 +24,7 @@ mod attention;
 mod device;
 #[cfg(feature = "cuda")]
 mod ops;
+mod signatures;
 #[cfg(feature = "cuda")]
 mod tile;
 
@@ -212,6 +213,235 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn one_device_has_one_backend() {
+        let (a, b) = (cuda(), cuda());
+        assert!(std::sync::Arc::ptr_eq(&a.inner, &b.inner));
+        // A tensor of one is a tensor of the other: same stream, same pool.
+        let x = a
+            .upload(&Tensor::from_slice(&[1.0f32, -2.0], &[2]).unwrap())
+            .unwrap();
+        let y = b
+            .forward(
+                &kapel_ops::Unary {
+                    kind: kapel_ops::UnaryKind::Abs,
+                },
+                &[&x],
+            )
+            .unwrap();
+        assert_eq!(a.download(&y).unwrap().to_vec::<f32>().unwrap(), [1.0, 2.0]);
+    }
+
+    #[test]
+    fn launches_beyond_32_bit_positions_are_refused() {
+        use kapel_core::Error;
+
+        use crate::device::Args;
+        let cuda = cuda();
+        let too_many = u32::MAX as usize + 1;
+        let args = || Args::new().u32(0).slice(0, 4).slice(0, 4);
+        // Nothing is launched: the checks come first.
+        assert!(matches!(
+            cuda.launch("unary_forward", too_many, args()),
+            Err(Error::Overflow { .. })
+        ));
+        let long = Args::new().u32(0).slice(0, too_many).slice(0, 4);
+        assert!(matches!(
+            cuda.launch("unary_forward", 1, long),
+            Err(Error::Overflow { .. })
+        ));
+        // Arguments that do not match the kernel's parameters.
+        let wrong = Args::new().slice(0, 4).slice(0, 4);
+        assert!(matches!(
+            cuda.launch("unary_forward", 1, wrong),
+            Err(Error::Device { .. })
+        ));
+    }
+
+    /// Masks whose rows are entirely `−∞` (zeros, no gradient), entirely
+    /// `f32::MIN` (uniform weights over the visible keys), or padding with
+    /// `f32::MIN`, over several tiles, compared to the reference; with the
+    /// mask in `bf16` as well, converted by the backend.
+    #[test]
+    fn attention_with_extreme_masks_matches_the_reference() {
+        use kapel_ops::Attention;
+        let cuda = cuda();
+        let (b, hq, hkv, tq, tk, d) = (1, 2, 1, 70, 90, 64);
+        let values = |len: usize, seed: usize| -> Vec<f32> {
+            (0..len)
+                .map(|i| ((i * 7919 + seed * 104_729) % 1000) as f32 / 500.0 - 1.0)
+                .collect()
+        };
+        let mask: Vec<f32> = (0..tq * tk)
+            .map(|n| {
+                let (i, j) = (n / tk, n % tk);
+                match i % 5 {
+                    0 => f32::NEG_INFINITY,
+                    1 => f32::MIN,
+                    2 if j >= tk - 20 => f32::MIN,
+                    3 if j % 3 == 0 => f32::NEG_INFINITY,
+                    _ => (j % 7) as f32 / 7.0 - 0.5,
+                }
+            })
+            .collect();
+        let windowed = Attention {
+            window: Some(40),
+            ..Attention::causal()
+        };
+        let free = Attention {
+            causal: false,
+            ..Attention::causal()
+        };
+        for op in [free, Attention::causal(), windowed] {
+            for (dtype, mask_dtype) in [
+                (DType::F32, DType::F32),
+                (DType::BF16, DType::F32),
+                (DType::F32, DType::BF16),
+            ] {
+                let cast = |x: Tensor, dtype: DType| {
+                    Run::<kapel_ops::Cast>::forward(
+                        &kapel_ref::Reference,
+                        &kapel_ops::Cast { dtype },
+                        &[&x],
+                    )
+                    .unwrap()
+                };
+                let host = |len: usize, seed: usize, shape: &[usize]| {
+                    cast(
+                        Tensor::from_slice(&values(len, seed), shape).unwrap(),
+                        dtype,
+                    )
+                };
+                let m = cast(
+                    Tensor::from_slice(&mask, &[1, 1, tq, tk]).unwrap(),
+                    mask_dtype,
+                );
+                let inputs = [
+                    host(b * hq * tq * d, 1, &[b, hq, tq, d]),
+                    host(b * hkv * tk * d, 2, &[b, hkv, tk, d]),
+                    host(b * hkv * tk * d, 3, &[b, hkv, tk, d]),
+                    m,
+                ];
+                let g = host(b * hq * tq * d, 4, &[b, hq, tq, d]);
+                let refs: Vec<&Tensor> = inputs.iter().collect();
+                let reference = kapel_ref::Reference;
+                let mut expected = vec![reference.forward(&op, &refs).unwrap()];
+                expected.extend(
+                    reference
+                        .backward(&op, &refs, &g)
+                        .unwrap()
+                        .into_iter()
+                        .take(3)
+                        .map(Option::unwrap),
+                );
+                let on_device: Vec<Tensor> =
+                    inputs.iter().map(|x| cuda.upload(x).unwrap()).collect();
+                let on_device: Vec<&Tensor> = on_device.iter().collect();
+                let dg = cuda.upload(&g).unwrap();
+                let mut got = vec![cuda.forward(&op, &on_device).unwrap()];
+                got.extend(
+                    cuda.backward(&op, &on_device, &dg)
+                        .unwrap()
+                        .into_iter()
+                        .take(3)
+                        .map(Option::unwrap),
+                );
+                let tolerance = match dtype {
+                    DType::F32 => conformity::tolerance(dtype),
+                    _ => 4.0 * conformity::tolerance(dtype),
+                };
+                for (n, (e, g)) in expected.iter().zip(&got).enumerate() {
+                    let e = e.to_f64_vec().unwrap();
+                    let g = cuda.download(g).unwrap().to_f64_vec().unwrap();
+                    let tol = tolerance * e.iter().fold(1.0f64, |m, v| m.max(v.abs()));
+                    for (i, (a, b)) in e.iter().zip(&g).enumerate() {
+                        assert!(
+                            (a - b).abs() <= tol,
+                            "{op:?} {dtype} mask {mask_dtype} result {n} element {i}: \
+                             {b}, expected {a}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Normalization weights in another float type than `x`: converted, and
+    /// their gradients given back in their own type.
+    #[test]
+    fn norms_take_weights_of_any_float_type() {
+        use kapel_ops::{LayerNorm, RmsNorm};
+        let cuda = cuda();
+        let reference = kapel_ref::Reference;
+        let values: Vec<f32> = (0..4 * 6)
+            .map(|i| ((i * 7919) % 1000) as f32 / 500.0 - 1.0)
+            .collect();
+        let x = Tensor::from_slice(&values, &[4, 6]).unwrap();
+        let w = Run::<kapel_ops::Cast>::forward(
+            &reference,
+            &kapel_ops::Cast { dtype: DType::BF16 },
+            &[&Tensor::from_slice(&values[..6], &[6]).unwrap()],
+        )
+        .unwrap();
+        let bias = Tensor::from_slice(&values[6..12], &[6]).unwrap();
+        let g = Tensor::from_slice(&values, &[4, 6]).unwrap();
+        let (dx, dw, db, dg) = (
+            cuda.upload(&x).unwrap(),
+            cuda.upload(&w).unwrap(),
+            cuda.upload(&bias).unwrap(),
+            cuda.upload(&g).unwrap(),
+        );
+        let check = |expected: Vec<Tensor>, got: Vec<Tensor>| {
+            for (e, g) in expected.iter().zip(&got) {
+                let g = cuda.download(g).unwrap();
+                let (e, g) = (e.to_f64_vec().unwrap(), g.to_f64_vec().unwrap());
+                for (a, b) in e.iter().zip(&g) {
+                    // Gradients in `bf16` are rounded to 8 bits.
+                    assert!(
+                        (a - b).abs() <= 1e-2 * a.abs().max(1.0),
+                        "{b}, expected {a}"
+                    );
+                }
+            }
+        };
+        let layer = LayerNorm { eps: 1e-5 };
+        let host = [&x, &w, &bias];
+        let device = [&dx, &dw, &db];
+        let mut expected = vec![reference.forward(&layer, &host).unwrap()];
+        expected.extend(
+            reference
+                .backward(&layer, &host, &g)
+                .unwrap()
+                .into_iter()
+                .flatten(),
+        );
+        let grads = cuda.backward(&layer, &device, &dg).unwrap();
+        assert_eq!(grads[1].as_ref().unwrap().dtype(), DType::BF16);
+        let mut got = vec![cuda.forward(&layer, &device).unwrap()];
+        got.extend(grads.into_iter().flatten());
+        check(expected, got);
+        let rms = RmsNorm {
+            eps: 1e-6,
+            weight_offset: 1.0,
+        };
+        let mut expected = vec![reference.forward(&rms, &[&x, &w]).unwrap()];
+        expected.extend(
+            reference
+                .backward(&rms, &[&x, &w], &g)
+                .unwrap()
+                .into_iter()
+                .flatten(),
+        );
+        let mut got = vec![cuda.forward(&rms, &[&dx, &dw]).unwrap()];
+        got.extend(
+            cuda.backward(&rms, &[&dx, &dw], &dg)
+                .unwrap()
+                .into_iter()
+                .flatten(),
+        );
+        check(expected, got);
     }
 
     #[test]

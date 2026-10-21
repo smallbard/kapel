@@ -263,6 +263,29 @@ mod x86 {
                 b = b.add(32);
             }
         }
+        // SAFETY: the caller guarantees that `c` covers the `rows × cols`
+        // block.
+        unsafe { store_14x32(&acc, c, ldc, rows, cols, accumulate) };
+    }
+
+    /// Writes the `14 × 32` block of accumulators to `C`, keeping only
+    /// `rows × cols` of its elements: masked loads and stores, which neither
+    /// read nor write the columns beyond `cols`.
+    ///
+    /// # Safety
+    ///
+    /// AVX-512F; `c` covers `rows ≤ 14` rows of `cols ≤ 32` elements, `ldc`
+    /// elements apart.
+    #[target_feature(enable = "avx512f")]
+    #[inline]
+    unsafe fn store_14x32(
+        acc: &[[__m512; 2]; 14],
+        c: *mut f32,
+        ldc: usize,
+        rows: usize,
+        cols: usize,
+        accumulate: bool,
+    ) {
         // The useful columns of each half, as a mask.
         let low_mask: __mmask16 = if cols >= 16 {
             0xffff
@@ -335,34 +358,8 @@ mod x86 {
                 b = b.add(32);
             }
         }
-        let low_mask: __mmask16 = if cols >= 16 {
-            0xffff
-        } else {
-            ((1u32 << cols) - 1) as u16
-        };
-        let high_mask: __mmask16 = if cols >= 32 {
-            0xffff
-        } else if cols > 16 {
-            ((1u32 << (cols - 16)) - 1) as u16
-        } else {
-            0
-        };
-        for (i, line) in acc.iter().enumerate().take(rows) {
-            // SAFETY: `i < rows`, and the masks keep loads and stores within
-            // the `cols` columns covered by `c`.
-            unsafe {
-                let target = c.add(i * ldc);
-                let (mut low, mut high) = (line[0], line[1]);
-                if accumulate {
-                    low = _mm512_add_ps(low, _mm512_maskz_loadu_ps(low_mask, target));
-                    high = _mm512_add_ps(
-                        high,
-                        _mm512_maskz_loadu_ps(high_mask, target.wrapping_add(16)),
-                    );
-                }
-                _mm512_mask_storeu_ps(target, low_mask, low);
-                _mm512_mask_storeu_ps(target.wrapping_add(16), high_mask, high);
-            }
-        }
+        // SAFETY: the caller guarantees that `c` covers the `rows × cols`
+        // block; AVX512-BF16 implies AVX-512F.
+        unsafe { store_14x32(&acc, c, ldc, rows, cols, accumulate) };
     }
 }

@@ -48,7 +48,7 @@ impl Run<Rope> for Reference {
         inputs: &[&Tensor],
         grad: &Tensor,
     ) -> Result<Vec<Option<Tensor>>> {
-        op.infer(inputs)?;
+        op.infer_backward(inputs, grad)?;
         Ok(vec![
             Some(rotate(op, &Array::of(grad)?, inputs[1], -1.0)?.tensor()?),
             None,

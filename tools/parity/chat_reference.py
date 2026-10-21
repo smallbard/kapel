@@ -3,13 +3,36 @@
 For each model of data/parity with a chat template, writes chat_cases.json:
 conversations and the text `apply_chat_template` renders for them.
 
+Templates that write today's date (`strftime_now`, as Llama 3 does) render at the
+fixed time FIXED_NOW, which the Rust test pins too (`PARITY_TIME` in
+crates/kapel-tokenizers/src/chat.rs): change both together.
+
 Usage: python tools/parity/chat_reference.py
 """
 
+import datetime
 import json
 from pathlib import Path
 
 from transformers import AutoTokenizer
+from transformers.utils import chat_template_utils
+
+# The local time `strftime_now` sees while rendering.
+FIXED_NOW = datetime.datetime(2026, 10, 20, 12, 0, 0)
+
+
+class FixedDatetime(datetime.datetime):
+    """`datetime` whose `now()` is FIXED_NOW."""
+
+    @classmethod
+    def now(cls, tz=None):
+        return FIXED_NOW if tz is None else FIXED_NOW.replace(tzinfo=tz)
+
+
+# transformers defines `strftime_now` as `datetime.now().strftime(format)`, with
+# `datetime` imported in this module.
+assert hasattr(chat_template_utils, "datetime"), "transformers changed strftime_now"
+chat_template_utils.datetime = FixedDatetime
 
 CONVERSATIONS = [
     [{"role": "user", "content": "Hello!"}],

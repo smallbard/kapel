@@ -6,7 +6,7 @@ use kapel_core::{BufferPool, Device, Error, Result, Tensor};
 use kapel_ops::Transfer;
 
 use crate::pool::{Pool, SharedMut};
-use crate::{Isa, default_threads};
+use crate::{Isa, IsaKind, default_threads};
 
 /// Elements per task for operations that treat elements independently: large
 /// enough that a task outweighs its scheduling, small enough to spread a
@@ -39,19 +39,16 @@ impl Cpu {
         }
     }
 
-    /// The same backend, restricted to the instructions `isa`.
+    /// The same backend, restricted to the instructions `kind`.
     ///
     /// # Errors
     ///
     /// [`Error::InvalidArgument`] if the processor does not have them.
-    pub fn with_isa(mut self, isa: Isa) -> Result<Self> {
-        if !isa.available() {
-            return Err(Error::InvalidArgument {
-                op: "Cpu::with_isa",
-                message: format!("this processor does not support {isa:?}"),
-            });
-        }
-        self.isa = isa;
+    pub fn with_isa(mut self, kind: IsaKind) -> Result<Self> {
+        self.isa = Isa::new(kind).ok_or_else(|| Error::InvalidArgument {
+            op: "Cpu::with_isa",
+            message: format!("this processor does not support {kind:?}"),
+        })?;
         Ok(self)
     }
 

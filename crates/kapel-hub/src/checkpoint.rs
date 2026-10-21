@@ -29,6 +29,14 @@ pub fn read_json(path: &Path) -> Result<Value> {
         .map_err(|e| HubError::format(path, format!("not valid JSON: {e}")))
 }
 
+/// Whether `name` is the name of a file directly in a directory: not empty, not
+/// `.` or `..`, without a separator (`/` or `\`), a drive (`:`) or a NUL.
+/// Names read from files (a `weight_map`, a Hub listing) are checked with it
+/// before they are joined to a directory, so that they cannot reach outside.
+pub(crate) fn is_plain_file_name(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\', ':', '\0'])
+}
+
 impl Checkpoint {
     /// Opens the weights of a model directory.
     ///
@@ -50,6 +58,12 @@ impl Checkpoint {
                 .collect();
             names.sort();
             names.dedup();
+            if let Some(bad) = names.iter().find(|n| !is_plain_file_name(n)) {
+                return Err(HubError::format(
+                    &index,
+                    format!("the shard {bad:?} is not a file of the model directory"),
+                ));
+            }
             names.into_iter().map(|n| dir.join(n)).collect()
         } else if dir.join("model.safetensors").exists() {
             vec![dir.join("model.safetensors")]
@@ -110,5 +124,45 @@ impl Checkpoint {
     /// If the file is missing or not valid JSON.
     pub fn config(&self) -> Result<Value> {
         read_json(&self.dir.join("config.json"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shards_outside_the_directory_are_rejected() {
+        let dir = std::env::temp_dir().join(format!("kapel-checkpoint-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for shard in [
+            "../model.safetensors",
+            "/etc/passwd",
+            "sub/model.safetensors",
+            "sub\\model.safetensors",
+            "C:model.safetensors",
+            "..",
+            "",
+        ] {
+            let index = serde_json::json!({ "weight_map": { "w": shard } });
+            std::fs::write(dir.join("model.safetensors.index.json"), index.to_string()).unwrap();
+            let error = Checkpoint::open(&dir).err().unwrap().to_string();
+            assert!(
+                error.contains("not a file of the model directory"),
+                "{shard}: {error}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn plain_file_names() {
+        for name in [
+            "model.safetensors",
+            "model-00001-of-00002.safetensors",
+            "a..b",
+        ] {
+            assert!(is_plain_file_name(name), "{name}");
+        }
     }
 }

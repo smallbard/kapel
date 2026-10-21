@@ -6,7 +6,8 @@
 //! ```
 //! # use kapel_core::DType;
 //! # let backend = kapel_ref::Reference;
-//! kapel_ref::conformity::assert_conforms(&backend, DType::F32);
+//! // The reference returns f64: it conforms to itself in f64.
+//! kapel_ref::conformity::assert_conforms(&backend, DType::F64);
 //! ```
 //!
 //! For each case, the inputs are drawn in `f64`, rounded to the data type under
@@ -14,12 +15,20 @@
 //! measures the backend's own computation, not the rounding of its inputs. The
 //! forward outputs are compared, then the gradients of the backward pass for a
 //! random output gradient. A value passes if it is within
-//! [`tolerance`]`(dtype) × max(1, max |reference|)` of the reference.
+//! [`tolerance`]`(dtype) × max(1, max |reference|)` of the reference. The
+//! forward output must also have the type of the operation's signature, and a
+//! backward call with an output gradient of the wrong shape must return an
+//! error.
+//!
+//! The cases include empty tensors (a dimension of size 0), strided inputs
+//! (transposed, narrowed, broadcast with zero strides), and attention with
+//! padding masks that hide every key of a query, with `−∞` or with `f32::MIN`.
 //!
 //! [`gradient_failures`] checks the reference's own gradients against finite
 //! differences.
 
 use std::fmt;
+use std::panic::{self, AssertUnwindSafe};
 
 use kapel_core::{DType, Result, Tensor};
 use kapel_ops::{
@@ -107,20 +116,37 @@ pub(crate) fn gradient_check() -> (usize, Vec<Failure>) {
     (visitor.checked, visitor.failures)
 }
 
-/// An input of a case: a host tensor, possibly seen through a transposition of
-/// its last two dimensions, applied after upload so that backends see a strided
-/// view.
+/// How an input is seen: the view is applied after upload, so that backends
+/// receive a strided tensor.
+#[derive(Clone, Debug)]
+enum View {
+    /// The tensor itself, contiguous.
+    Whole,
+    /// Two dimensions swapped.
+    Transpose(usize, usize),
+    /// `len` elements of dimension `dim` from `start`.
+    Narrow {
+        dim: usize,
+        start: usize,
+        len: usize,
+    },
+    /// Repeated to a larger shape, with zero strides.
+    Broadcast(Vec<usize>),
+}
+
+/// An input of a case: a host tensor and the view backends see of it.
 struct Arg {
     base: Tensor,
-    transposed: bool,
+    view: View,
 }
 
 impl Arg {
     fn view(&self, tensor: &Tensor) -> Result<Tensor> {
-        if self.transposed {
-            tensor.transpose(tensor.rank() - 2, tensor.rank() - 1)
-        } else {
-            Ok(tensor.clone())
+        match &self.view {
+            View::Whole => Ok(tensor.clone()),
+            &View::Transpose(a, b) => tensor.transpose(a, b),
+            &View::Narrow { dim, start, len } => tensor.narrow(dim, start, len),
+            View::Broadcast(shape) => tensor.broadcast_to(shape),
         }
     }
 }
@@ -133,6 +159,17 @@ trait Visitor {
     where
         Self::B: Run<O>,
         Reference: Run<O>;
+
+    /// A case whose output rounds away the effect of some inputs: its gradient
+    /// is the exact derivative, which finite differences cannot see. It is
+    /// compared to the reference, but not checked by finite differences.
+    fn visit_rounded<O: Operation>(&mut self, op: &O, case: String, args: Vec<Arg>)
+    where
+        Self::B: Run<O>,
+        Reference: Run<O>,
+    {
+        self.visit(op, case, args);
+    }
 }
 
 /// Values drawn in `[lo, hi)`, rounded to `dtype`.
@@ -178,8 +215,21 @@ fn indices(rng: &mut Rng, shape: &[usize], below: usize) -> Tensor {
 fn plain(tensor: Tensor) -> Arg {
     Arg {
         base: tensor,
-        transposed: false,
+        view: View::Whole,
     }
+}
+
+/// `tensor` seen with its last two dimensions swapped.
+fn transposed(tensor: Tensor) -> Arg {
+    let rank = tensor.rank();
+    Arg {
+        base: tensor,
+        view: View::Transpose(rank - 2, rank - 1),
+    }
+}
+
+fn viewed(tensor: Tensor, view: View) -> Arg {
+    Arg { base: tensor, view }
 }
 
 /// Every case of the suite. The generator has a fixed seed: the cases are the
@@ -262,14 +312,11 @@ fn cases<V: Visitor>(v: &mut V, dtype: DType) {
         "[3, 4] · [2, 4, 5], broadcast".into(),
         vec![x(rng, &[3, 4]), x(rng, &[2, 4, 5])],
     );
-    let transposed = Arg {
-        base: random(rng, &[5, 4], dtype, -1.0, 1.0),
-        transposed: true,
-    };
+    let strided = transposed(random(rng, &[5, 4], dtype, -1.0, 1.0));
     v.visit(
         &Matmul,
         "[2, 3, 4] · [5, 4]ᵀ, strided".into(),
-        vec![x(rng, &[2, 3, 4]), transposed],
+        vec![x(rng, &[2, 3, 4]), strided],
     );
     for format in [
         DType::int8(32).expect("valid"),
@@ -494,6 +541,320 @@ fn cases<V: Visitor>(v: &mut V, dtype: DType) {
         "[2, 3, 4] into 6 rows".into(),
         args,
     );
+
+    // Drawn after the cases above, so that adding them did not change those.
+    empty_cases(v, rng, dtype);
+    strided_cases(v, rng, dtype);
+    masked_attention_cases(v, rng, dtype);
+}
+
+/// Cases with a dimension of size 0: the results are empty, or zeros where
+/// they sum over nothing (a product with `K = 0`, the gradient of a weight
+/// applied to no row).
+fn empty_cases<V: Visitor>(v: &mut V, rng: &mut Rng, dtype: DType) {
+    let x = |rng: &mut Rng, shape: &[usize]| plain(random(rng, shape, dtype, -1.0, 1.0));
+    v.visit(
+        &Unary {
+            kind: UnaryKind::Exp,
+        },
+        "Exp [0, 3], empty".into(),
+        vec![x(rng, &[0, 3])],
+    );
+    v.visit(
+        &Binary {
+            kind: BinaryKind::Mul,
+        },
+        "Mul [2, 0, 3] · [3], empty".into(),
+        vec![x(rng, &[2, 0, 3]), x(rng, &[3])],
+    );
+    v.visit(
+        &Binary {
+            kind: BinaryKind::Add,
+        },
+        "Add [0, 3] · [1, 3], empty".into(),
+        vec![x(rng, &[0, 3]), x(rng, &[1, 3])],
+    );
+    v.visit(
+        &Cast { dtype: DType::F32 },
+        "to f32, [0, 3], empty".into(),
+        vec![x(rng, &[0, 3])],
+    );
+    v.visit(
+        &Matmul,
+        "[2, 0, 4] · [2, 4, 5], no rows".into(),
+        vec![x(rng, &[2, 0, 4]), x(rng, &[2, 4, 5])],
+    );
+    v.visit(
+        &Matmul,
+        "[3, 0] · [0, 5], K = 0: zeros".into(),
+        vec![x(rng, &[3, 0]), x(rng, &[0, 5])],
+    );
+    v.visit(
+        &Matmul,
+        "[0, 3, 4] · [4, 2], empty batch".into(),
+        vec![x(rng, &[0, 3, 4]), x(rng, &[4, 2])],
+    );
+    v.visit(
+        &Matmul,
+        "[3, 4] · [4, 0], N = 0".into(),
+        vec![x(rng, &[3, 4]), x(rng, &[4, 0])],
+    );
+    for format in [
+        DType::int8(32).expect("valid"),
+        DType::Quantized(kapel_core::QuantFormat::Q8_0),
+    ] {
+        let w = plain(random_quantized(rng, &[5, 64], format));
+        v.visit(
+            &QuantizedMatmul,
+            format!("[0, 64] · {format} [5, 64]ᵀ, no rows"),
+            vec![x(rng, &[0, 64]), w],
+        );
+        let w = plain(random_quantized(rng, &[0, 64], format));
+        v.visit(
+            &QuantizedMatmul,
+            format!("[3, 64] · {format} [0, 64]ᵀ, N = 0"),
+            vec![x(rng, &[3, 64]), w],
+        );
+        let w = plain(random_quantized(rng, &[5, 0], format));
+        v.visit(
+            &QuantizedMatmul,
+            format!("[3, 0] · {format} [5, 0]ᵀ, K = 0: zeros"),
+            vec![x(rng, &[3, 0]), w],
+        );
+    }
+    v.visit(
+        &Sum {
+            dims: vec![1],
+            keepdim: false,
+        },
+        "dim 1 of [2, 0, 3]: zeros".into(),
+        vec![x(rng, &[2, 0, 3])],
+    );
+    v.visit(
+        &Sum {
+            dims: vec![1],
+            keepdim: true,
+        },
+        "dim 1 of [0, 4], kept, empty".into(),
+        vec![x(rng, &[0, 4])],
+    );
+    v.visit(
+        &Mean {
+            dims: vec![1],
+            keepdim: false,
+        },
+        "dim 1 of [0, 4], empty".into(),
+        vec![x(rng, &[0, 4])],
+    );
+    v.visit(
+        &Max {
+            dim: 1,
+            keepdim: false,
+        },
+        "dim 1 of [0, 4], empty".into(),
+        vec![x(rng, &[0, 4])],
+    );
+    v.visit(
+        &Softmax { dim: 1 },
+        "dim 1 of [0, 5], empty".into(),
+        vec![x(rng, &[0, 5])],
+    );
+    v.visit(
+        &LogSoftmax { dim: 0 },
+        "dim 0 of [0, 5], empty".into(),
+        vec![x(rng, &[0, 5])],
+    );
+    v.visit(
+        &LayerNorm { eps: 1e-5 },
+        "[0, 6], weight and bias: zero gradients".into(),
+        vec![x(rng, &[0, 6]), x(rng, &[6]), x(rng, &[6])],
+    );
+    v.visit(
+        &RmsNorm {
+            eps: 1e-6,
+            weight_offset: 0.0,
+        },
+        "[2, 0, 6], weight: zero gradient".into(),
+        vec![x(rng, &[2, 0, 6]), x(rng, &[6])],
+    );
+    v.visit(
+        &Attention::causal(),
+        "causal, no queries: zero key and value gradients".into(),
+        vec![
+            x(rng, &[2, 2, 0, 8]),
+            x(rng, &[2, 1, 3, 8]),
+            x(rng, &[2, 1, 3, 6]),
+        ],
+    );
+    v.visit(
+        &Attention::causal(),
+        "causal, empty batch".into(),
+        vec![
+            x(rng, &[0, 2, 3, 8]),
+            x(rng, &[0, 2, 3, 8]),
+            x(rng, &[0, 2, 3, 6]),
+        ],
+    );
+    v.visit(
+        &Rope {
+            theta: 10_000.0,
+            layout: RopeLayout::Half,
+            rotary_dim: None,
+            scaling: RopeScaling::None,
+        },
+        "[0, 4, 16], empty".into(),
+        vec![x(rng, &[0, 4, 16]), plain(indices(rng, &[4], 100))],
+    );
+    v.visit(
+        &GatherRows,
+        "[6, 4] by [0]: zero gradient".into(),
+        vec![x(rng, &[6, 4]), plain(indices(rng, &[0], 6))],
+    );
+}
+
+/// Cases whose inputs are strided views: transposed, narrowed, or broadcast
+/// with zero strides.
+fn strided_cases<V: Visitor>(v: &mut V, rng: &mut Rng, dtype: DType) {
+    let r = |rng: &mut Rng, shape: &[usize]| random(rng, shape, dtype, -1.0, 1.0);
+    v.visit(
+        &Unary {
+            kind: UnaryKind::Silu,
+        },
+        "Silu [4, 3]ᵀ, strided".into(),
+        vec![transposed(r(rng, &[4, 3]))],
+    );
+    let narrowed = viewed(
+        r(rng, &[3, 7]),
+        View::Narrow {
+            dim: 1,
+            start: 2,
+            len: 4,
+        },
+    );
+    v.visit(
+        &Binary {
+            kind: BinaryKind::Mul,
+        },
+        "Mul [4, 3]ᵀ · [3, 7][:, 2..6], strided".into(),
+        vec![transposed(r(rng, &[4, 3])), narrowed],
+    );
+    let repeated = viewed(r(rng, &[3, 1]), View::Broadcast(vec![2, 3, 4]));
+    v.visit(
+        &Binary {
+            kind: BinaryKind::Sub,
+        },
+        "Sub [2, 3, 4] · [3, 1] broadcast to [2, 3, 4], zero strides".into(),
+        vec![plain(r(rng, &[2, 3, 4])), repeated],
+    );
+    v.visit(
+        &Sum {
+            dims: vec![1],
+            keepdim: false,
+        },
+        "dim 1 of [4, 3]ᵀ, strided".into(),
+        vec![transposed(r(rng, &[4, 3]))],
+    );
+    v.visit(
+        &Softmax { dim: 1 },
+        "dim 1 of [5, 3]ᵀ, strided".into(),
+        vec![transposed(r(rng, &[5, 3]))],
+    );
+    let narrowed = viewed(
+        r(rng, &[4, 9]),
+        View::Narrow {
+            dim: 1,
+            start: 3,
+            len: 6,
+        },
+    );
+    v.visit(
+        &LogSoftmax { dim: 1 },
+        "dim 1 of [4, 9][:, 3..9], strided".into(),
+        vec![narrowed],
+    );
+    v.visit(
+        &LayerNorm { eps: 1e-5 },
+        "[6, 4]ᵀ, weight and bias, strided".into(),
+        vec![
+            transposed(r(rng, &[6, 4])),
+            plain(r(rng, &[6])),
+            plain(r(rng, &[6])),
+        ],
+    );
+    let narrowed = viewed(
+        r(rng, &[4, 10]),
+        View::Narrow {
+            dim: 1,
+            start: 2,
+            len: 6,
+        },
+    );
+    v.visit(
+        &RmsNorm {
+            eps: 1e-6,
+            weight_offset: 0.0,
+        },
+        "[4, 10][:, 2..8], weight, strided".into(),
+        vec![narrowed, plain(r(rng, &[6]))],
+    );
+    // The layout of a model's projections: [B, T, H, D] seen as [B, H, T, D].
+    let heads = |rng: &mut Rng, h: usize, t: usize, d: usize| {
+        viewed(r(rng, &[2, t, h, d]), View::Transpose(1, 2))
+    };
+    v.visit(
+        &Attention::causal(),
+        "causal, [B, T, H, D] inputs seen as [B, H, T, D], strided".into(),
+        vec![
+            heads(rng, 4, 5, 8),
+            heads(rng, 2, 5, 8),
+            heads(rng, 2, 5, 6),
+        ],
+    );
+}
+
+/// Attention with padding masks. The masks are `f32` whatever the type under
+/// test (a mask may be in any float type): `f32::MIN` rounds to `−∞` in `bf16`
+/// and `f16`.
+fn masked_attention_cases<V: Visitor>(v: &mut V, rng: &mut Rng, dtype: DType) {
+    let r = |rng: &mut Rng, shape: &[usize]| random(rng, shape, dtype, -1.0, 1.0);
+    let free = Attention {
+        causal: false,
+        ..Attention::causal()
+    };
+    // Mask [2, 1, 3, 4]: in batch 0, query 1 has every key masked; in batch 1,
+    // query 0 has its keys 1 and 3 masked.
+    let mask = |rng: &mut Rng, value: f32| {
+        let mut values: Vec<f32> = (0..24).map(|_| rng.uniform(-2.0, 0.0) as f32).collect();
+        values[4..8].fill(value);
+        values[12 + 1] = value;
+        values[12 + 3] = value;
+        plain(Tensor::from_slice(&values, &[2, 1, 3, 4]).expect("sizes agree"))
+    };
+    let mut args = vec![
+        plain(r(rng, &[2, 2, 3, 8])),
+        plain(r(rng, &[2, 2, 4, 8])),
+        plain(r(rng, &[2, 2, 4, 6])),
+    ];
+    args.push(mask(rng, f32::NEG_INFINITY));
+    v.visit(
+        &free,
+        "not causal, f32 padding mask of −∞, one query fully masked: zeros".into(),
+        args,
+    );
+    let mut args = vec![
+        plain(r(rng, &[2, 2, 3, 8])),
+        plain(r(rng, &[2, 2, 4, 8])),
+        plain(r(rng, &[2, 2, 4, 6])),
+    ];
+    args.push(mask(rng, f32::MIN));
+    // A query whose keys are all at f32::MIN: the scores vanish next to the
+    // mask, its weights are uniform, and finite differences see no change, but
+    // the gradient is the derivative of the softmax, as for any finite mask.
+    v.visit_rounded(
+        &free,
+        "not causal, f32 padding mask of f32::MIN, one query fully masked: uniform".into(),
+        args,
+    );
 }
 
 /// Compares a backend to the reference.
@@ -531,6 +892,13 @@ impl<B: Backend + Transfer> Conformity<'_, B> {
         } else {
             0.0
         };
+        if got.dtype() != signature.dtype {
+            problems.push(format!(
+                "output: type {}, expected {}",
+                got.dtype(),
+                signature.dtype
+            ));
+        }
         compare("output", &expected, &got, tol, &mut problems)?;
 
         if !signature.dtype.is_float() {
@@ -561,6 +929,30 @@ impl<B: Backend + Transfer> Conformity<'_, B> {
                 (None, None) => {}
                 _ => problems.push(format!("gradient {i}: present for only one side")),
             }
+        }
+
+        // A gradient of the wrong shape is user input: it must be refused.
+        let mut wrong = signature.shape.clone();
+        match wrong.last_mut() {
+            Some(last) => *last += 1,
+            None => wrong.push(2),
+        }
+        let bad = self
+            .backend
+            .upload(&random(&mut rng, &wrong, self.dtype, -1.0, 1.0))?;
+        let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+            Run::<O>::backward(self.backend, op, &device_refs, &bad).is_ok()
+        }));
+        match outcome {
+            Ok(false) => {}
+            Ok(true) => problems.push(format!(
+                "backward accepted a gradient of shape {wrong:?} for an output of shape {:?}",
+                signature.shape
+            )),
+            Err(_) => problems.push(format!(
+                "backward panicked on a gradient of shape {wrong:?} for an output of shape {:?}",
+                signature.shape
+            )),
         }
         Ok(problems)
     }
@@ -687,6 +1079,12 @@ impl FiniteDifferences {
 
 impl Visitor for FiniteDifferences {
     type B = Reference;
+
+    fn visit_rounded<O: Operation>(&mut self, _: &O, _: String, _: Vec<Arg>)
+    where
+        Reference: Run<O>,
+    {
+    }
 
     fn visit<O: Operation>(&mut self, op: &O, case: String, args: Vec<Arg>)
     where

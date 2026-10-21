@@ -58,6 +58,49 @@ pub trait Operation: fmt::Debug + Sync {
     /// Whether input `index` receives a gradient. Indices, masks and quantized
     /// weights do not.
     fn differentiable(&self, index: usize) -> bool;
+
+    /// Checks the inputs and the gradient of a backward call: [`infer`], then
+    /// a floating-point `grad` with the output's shape, on the inputs' device.
+    /// Every [`Run::backward`] starts with it.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`infer`], [`Error::ShapeMismatch`], [`Error::UnsupportedDType`]
+    /// or [`Error::DeviceMismatch`].
+    ///
+    /// [`infer`]: Operation::infer
+    fn infer_backward(&self, inputs: &[&Tensor], grad: &Tensor) -> Result<Signature> {
+        let signature = self.infer(inputs)?;
+        check_grad(Self::NAME, inputs, grad, &signature)?;
+        Ok(signature)
+    }
+}
+
+/// Checks that `grad` can be the gradient of an output with `signature`.
+fn check_grad(
+    op: &'static str,
+    inputs: &[&Tensor],
+    grad: &Tensor,
+    signature: &Signature,
+) -> Result<()> {
+    if grad.shape() != signature.shape.as_slice() {
+        return Err(Error::ShapeMismatch {
+            op,
+            expected: signature.shape.clone(),
+            got: grad.shape().to_vec(),
+        });
+    }
+    float(op, grad)?;
+    if let Some(first) = inputs.first()
+        && grad.device() != first.device()
+    {
+        return Err(Error::DeviceMismatch {
+            op,
+            expected: first.device(),
+            got: grad.device(),
+        });
+    }
+    Ok(())
 }
 
 /// A backend's implementation of operation `O`.
@@ -75,7 +118,7 @@ pub trait Run<O: Operation> {
     ///
     /// # Errors
     ///
-    /// Those of [`Operation::infer`], and those of the backend.
+    /// Those of [`Operation::infer_backward`], and those of the backend.
     fn backward(&self, op: &O, inputs: &[&Tensor], grad: &Tensor) -> Result<Vec<Option<Tensor>>>;
 }
 

@@ -25,38 +25,87 @@
 //! same order. So the result does not depend on the number of threads.
 
 use std::cell::RefCell;
+use std::thread::LocalKey;
 
-use crate::Isa;
+use kapel_core::{Error, Result};
+
 use crate::kernels::{MicroKernel, Scalar};
 use crate::pool::{Pool, SharedMut};
+use crate::{Isa, IsaKind};
 
 /// A matrix read with arbitrary strides: element `(i, j)` is
 /// `data[i × row_stride + j × col_stride]`. Transposing a matrix just swaps
-/// the strides.
+/// the strides; a stride of zero repeats a row or a column (broadcasting).
+///
+/// A `Matrix` always fits in its data: the kernels read it through raw
+/// pointers, so the constructors check that its last element,
+/// `(rows − 1) × row_stride + (cols − 1) × col_stride`, lies within `data`,
+/// and the fields are private so that this cannot be undone.
 #[derive(Clone, Copy, Debug)]
 pub struct Matrix<'a> {
-    /// The underlying elements.
-    pub data: &'a [f32],
-    /// Number of rows.
-    pub rows: usize,
-    /// Number of columns.
-    pub cols: usize,
-    /// Distance in `data` between two consecutive rows.
-    pub row_stride: usize,
-    /// Distance in `data` between two consecutive columns.
-    pub col_stride: usize,
+    data: &'a [f32],
+    rows: usize,
+    cols: usize,
+    row_stride: usize,
+    col_stride: usize,
 }
 
 impl<'a> Matrix<'a> {
     /// A matrix stored row by row.
-    pub fn new(data: &'a [f32], rows: usize, cols: usize) -> Self {
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidArgument`] if `data` holds fewer than `rows × cols`
+    /// elements.
+    pub fn new(data: &'a [f32], rows: usize, cols: usize) -> Result<Self> {
+        Self::strided(data, rows, cols, cols, 1)
+    }
+
+    /// A matrix with any strides, possibly zero.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidArgument`] if an element lies beyond `data` (or its
+    /// position overflows), unless the matrix is empty.
+    pub fn strided(
+        data: &'a [f32],
+        rows: usize,
+        cols: usize,
+        row_stride: usize,
+        col_stride: usize,
+    ) -> Result<Self> {
+        if rows > 0 && cols > 0 {
+            let last = (rows - 1)
+                .checked_mul(row_stride)
+                .zip((cols - 1).checked_mul(col_stride))
+                .and_then(|(r, c)| r.checked_add(c));
+            if !last.is_some_and(|last| last < data.len()) {
+                return Err(Error::InvalidArgument {
+                    op: "Matrix",
+                    message: format!(
+                        "a {rows} × {cols} matrix with strides ({row_stride}, {col_stride}) \
+                         reads beyond its {} elements",
+                        data.len()
+                    ),
+                });
+            }
+        }
+        Ok(Self {
             data,
             rows,
             cols,
-            row_stride: cols,
-            col_stride: 1,
-        }
+            row_stride,
+            col_stride,
+        })
+    }
+
+    /// A matrix stored row by row, in a buffer the crate sized itself.
+    ///
+    /// # Panics
+    ///
+    /// If `data` is too short: an internal invariant is broken.
+    pub(crate) fn contiguous(data: &'a [f32], rows: usize, cols: usize) -> Self {
+        Self::new(data, rows, cols).expect("a buffer sized for its matrix")
     }
 
     /// The transpose, without copying anything.
@@ -68,6 +117,42 @@ impl<'a> Matrix<'a> {
             row_stride: self.col_stride,
             col_stride: self.row_stride,
         }
+    }
+
+    /// Number of rows.
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    /// Number of columns.
+    pub fn cols(&self) -> usize {
+        self.cols
+    }
+
+    /// Distance in the data between two consecutive rows.
+    pub fn row_stride(&self) -> usize {
+        self.row_stride
+    }
+
+    /// Distance in the data between two consecutive columns.
+    pub fn col_stride(&self) -> usize {
+        self.col_stride
+    }
+
+    /// Columns `begin..end`. The result still fits in its data: it starts
+    /// `begin` columns further and ends no later.
+    fn columns(self, begin: usize, end: usize) -> Self {
+        debug_assert!(begin < end && end <= self.cols);
+        Self {
+            data: &self.data[begin * self.col_stride..],
+            cols: end - begin,
+            ..self
+        }
+    }
+
+    /// Rows `begin..end`, as [`Matrix::columns`].
+    fn row_range(self, begin: usize, end: usize) -> Self {
+        self.t().columns(begin, end).t()
     }
 
     #[inline(always)]
@@ -138,13 +223,42 @@ thread_local! {
     static PACKED_B: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
 }
 
+/// Checks the shapes of a product. These checks, with the invariant of
+/// [`Matrix`], are what make every access of the kernels in bounds.
+fn check_shapes(a: &Matrix, b: &Matrix, c: &[f32]) {
+    assert_eq!(
+        a.cols, b.rows,
+        "gemm: A has {} columns but B has {} rows",
+        a.cols, b.rows
+    );
+    let size = a.rows.checked_mul(b.cols);
+    assert_eq!(
+        size,
+        Some(c.len()),
+        "gemm: C must hold {} × {} elements",
+        a.rows,
+        b.cols
+    );
+}
+
 /// `C = A · B`, or `C += A · B` with `accumulate`. `C` is stored row by row,
-/// `a.rows × b.cols`.
+/// `a.rows() × b.cols()`.
+///
+/// # Panics
+///
+/// If `a.cols() != b.rows()`, or if `c` does not hold `a.rows() × b.cols()`
+/// elements. This is a low-level function: the backend checks the shapes of
+/// its tensors, with typed errors, before calling it.
 pub fn gemm(pool: &Pool, isa: Isa, a: Matrix, b: Matrix, c: &mut [f32], accumulate: bool) {
     gemm_with_blocks(pool, isa, a, b, c, accumulate, Blocks::ZEN4);
 }
 
-/// Like [`gemm`], with given block sizes: for benchmarking them.
+/// Like [`gemm`], with given block sizes: for benchmarking them. Sizes of
+/// zero are taken as one.
+///
+/// # Panics
+///
+/// As [`gemm`].
 pub fn gemm_with_blocks(
     pool: &Pool,
     isa: Isa,
@@ -154,8 +268,13 @@ pub fn gemm_with_blocks(
     accumulate: bool,
     blocks: Blocks,
 ) {
-    assert_eq!(a.cols, b.rows, "gemm: incompatible shapes");
-    assert_eq!(c.len(), a.rows * b.cols, "gemm: unexpected output size");
+    check_shapes(&a, &b, c);
+    let blocks = Blocks {
+        kc: blocks.kc.max(1),
+        mc: blocks.mc.max(1),
+        nc: blocks.nc.max(1),
+        ..blocks
+    };
     if c.is_empty() {
         return;
     }
@@ -174,17 +293,134 @@ pub fn gemm_with_blocks(
         few_rows(pool, isa, a, b, c, accumulate);
         return;
     }
-    match isa {
+    match isa.kind() {
+        // SAFETY: an `Isa` of kind `Avx512` proves that the processor has
+        // AVX-512F, the instructions of this micro-kernel.
         #[cfg(target_arch = "x86_64")]
-        Isa::Avx512 => blocked::<crate::kernels::Avx512>(pool, a, b, c, accumulate, blocks),
+        IsaKind::Avx512 => unsafe {
+            blocked::<F32<crate::kernels::Avx512>>(pool, a, b, c, accumulate, blocks)
+        },
+        // SAFETY: an `Isa` of kind `Avx2` proves AVX2 and FMA.
         #[cfg(target_arch = "x86_64")]
-        Isa::Avx2 => blocked::<crate::kernels::Avx2>(pool, a, b, c, accumulate, blocks),
-        _ => blocked::<Scalar>(pool, a, b, c, accumulate, blocks),
+        IsaKind::Avx2 => unsafe {
+            blocked::<F32<crate::kernels::Avx2>>(pool, a, b, c, accumulate, blocks)
+        },
+        // SAFETY: the scalar kernel needs no particular instructions.
+        _ => unsafe { blocked::<F32<Scalar>>(pool, a, b, c, accumulate, blocks) },
     }
 }
 
-/// The blocked product, for a given micro-kernel.
-fn blocked<K: MicroKernel>(
+/// How the blocked product packs its operands and multiplies the panels: in
+/// `f32` with a [`MicroKernel`], or by pairs of `bf16`.
+trait Packing {
+    /// A packed element.
+    type Packed: Copy + Default + Send + Sync + 'static;
+    /// Rows of the block of `C`.
+    const MR: usize;
+    /// Columns of the block of `C`.
+    const NR: usize;
+
+    /// The packed length of `depth` shared indices.
+    fn packed(depth: usize) -> usize;
+
+    /// Packs `rows ≤ MR` rows of `A` from `row`, over `depth` shared indices
+    /// from `pc`, padded with zeros, into `out` (`MR × packed(depth)`).
+    fn pack_a(
+        a: Matrix,
+        row: usize,
+        rows: usize,
+        pc: usize,
+        depth: usize,
+        out: &mut [Self::Packed],
+    );
+
+    /// Packs `cols ≤ NR` columns of `B` from `col`, over `depth` shared
+    /// indices from `pc`, padded with zeros, into `out` (`NR × packed(depth)`).
+    fn pack_b(
+        b: Matrix,
+        pc: usize,
+        depth: usize,
+        col: usize,
+        cols: usize,
+        out: &mut [Self::Packed],
+    );
+
+    /// `C[..rows, ..cols] (+)= A · B` over `packed` packed indices.
+    ///
+    /// # Safety
+    ///
+    /// As [`MicroKernel::run`].
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn run(
+        packed: usize,
+        a: *const Self::Packed,
+        b: *const Self::Packed,
+        c: *mut f32,
+        ldc: usize,
+        rows: usize,
+        cols: usize,
+        accumulate: bool,
+    );
+
+    /// The packed block of `A`, private to each thread.
+    fn scratch_a() -> &'static LocalKey<RefCell<Vec<Self::Packed>>>;
+    /// The packed slice of `B`, private to the thread that starts the product.
+    fn scratch_b() -> &'static LocalKey<RefCell<Vec<Self::Packed>>>;
+}
+
+/// The `f32` product with micro-kernel `K`.
+struct F32<K>(std::marker::PhantomData<K>);
+
+impl<K: MicroKernel> Packing for F32<K> {
+    type Packed = f32;
+    const MR: usize = K::MR;
+    const NR: usize = K::NR;
+
+    #[inline(always)]
+    fn packed(depth: usize) -> usize {
+        depth
+    }
+
+    fn pack_a(a: Matrix, row: usize, rows: usize, pc: usize, depth: usize, out: &mut [f32]) {
+        pack_a(a, row, rows, pc, depth, K::MR, out);
+    }
+
+    fn pack_b(b: Matrix, pc: usize, depth: usize, col: usize, cols: usize, out: &mut [f32]) {
+        pack_b(b, pc, depth, col, cols, K::NR, out);
+    }
+
+    #[inline(always)]
+    unsafe fn run(
+        packed: usize,
+        a: *const f32,
+        b: *const f32,
+        c: *mut f32,
+        ldc: usize,
+        rows: usize,
+        cols: usize,
+        accumulate: bool,
+    ) {
+        // SAFETY: the caller upholds the contract of `MicroKernel::run`.
+        unsafe { K::run(packed, a, b, c, ldc, rows, cols, accumulate) }
+    }
+
+    fn scratch_a() -> &'static LocalKey<RefCell<Vec<f32>>> {
+        &PACKED_A
+    }
+
+    fn scratch_b() -> &'static LocalKey<RefCell<Vec<f32>>> {
+        &PACKED_B
+    }
+}
+
+/// The blocked product (see the module documentation), for a given packing
+/// and micro-kernel.
+///
+/// # Safety
+///
+/// The processor must support the instructions of `P::run`. The shapes must
+/// have been checked by `check_shapes`, and `C` must not be empty.
+unsafe fn blocked<P: Packing>(
     pool: &Pool,
     a: Matrix,
     b: Matrix,
@@ -193,9 +429,9 @@ fn blocked<K: MicroKernel>(
     blocks: Blocks,
 ) {
     let (m, k, n) = (a.rows, a.cols, b.cols);
-    let (mr, nr) = (K::MR, K::NR);
-    let kc = blocks.kc;
-    let nc = blocks.nc.div_ceil(nr) * nr;
+    let (mr, nr) = (P::MR, P::NR);
+    let kc = blocks.kc.max(1);
+    let nc = blocks.nc.max(1).div_ceil(nr) * nr;
     let threads = pool.threads();
 
     // Row blocks: at most `mc` rows, and enough of them for at least
@@ -212,7 +448,7 @@ fn blocked<K: MicroKernel>(
     let row_blocks = m.div_ceil(mc);
 
     let out = SharedMut::new(c);
-    PACKED_B.with(|packed_b| {
+    P::scratch_b().with(|packed_b| {
         let mut packed_b = packed_b.borrow_mut();
         for jc in (0..n).step_by(nc) {
             let width = nc.min(n - jc);
@@ -228,26 +464,20 @@ fn blocked<K: MicroKernel>(
             let col_groups = panels.div_ceil(per_group);
             for pc in (0..k).step_by(kc) {
                 let depth = kc.min(k - pc);
+                let packed = P::packed(depth);
                 let accumulate = accumulate || pc > 0;
 
                 // The slice of B, packed in panels of NR columns.
-                let size = panels * nr * depth;
+                let size = panels * nr * packed;
                 if packed_b.len() < size {
-                    packed_b.resize(size, 0.0);
+                    packed_b.resize(size, P::Packed::default());
                 }
                 let shared_b = SharedMut::new(&mut packed_b[..size]);
                 pool.run(panels, |panel| {
                     // SAFETY: each task packs its own panel of `packed_b`.
-                    let target = unsafe { shared_b.slice(panel * nr * depth, nr * depth) };
-                    pack_b(
-                        b,
-                        pc,
-                        depth,
-                        jc + panel * nr,
-                        nr.min(width - panel * nr),
-                        nr,
-                        target,
-                    );
+                    let target = unsafe { shared_b.slice(panel * nr * packed, nr * packed) };
+                    let col = jc + panel * nr;
+                    P::pack_b(b, pc, depth, col, nr.min(width - panel * nr), target);
                 });
                 let packed_b = &packed_b[..size];
 
@@ -257,42 +487,39 @@ fn blocked<K: MicroKernel>(
                     let height = mc.min(m - ic);
                     let first = group * per_group;
                     let last = panels.min(first + per_group);
-                    PACKED_A.with(|packed_a| {
+                    P::scratch_a().with(|packed_a| {
                         let mut packed_a = packed_a.borrow_mut();
                         let row_panels = height.div_ceil(mr);
-                        let size = row_panels * mr * depth;
+                        let size = row_panels * mr * packed;
                         if packed_a.len() < size {
-                            packed_a.resize(size, 0.0);
+                            packed_a.resize(size, P::Packed::default());
                         }
                         for panel in 0..row_panels {
                             let rows = mr.min(height - panel * mr);
-                            pack_a(
-                                a,
-                                ic + panel * mr,
-                                rows,
-                                pc,
-                                depth,
-                                mr,
-                                &mut packed_a[panel * mr * depth..][..mr * depth],
-                            );
+                            let target = &mut packed_a[panel * mr * packed..][..mr * packed];
+                            P::pack_a(a, ic + panel * mr, rows, pc, depth, target);
                         }
                         for jr in first..last {
                             let col = jc + jr * nr;
                             let cols = nr.min(n - col);
-                            let panel_b = packed_b[jr * nr * depth..].as_ptr();
+                            let panel_b = packed_b[jr * nr * packed..][..nr * packed].as_ptr();
                             for ir in 0..row_panels {
                                 let row = ic + ir * mr;
                                 let rows = mr.min(m - row);
-                                // SAFETY: each task writes its own rows and
-                                // columns of C, and the packed panels cover
-                                // `depth` indices.
+                                let panel_a = packed_a[ir * mr * packed..][..mr * packed].as_ptr();
+                                // SAFETY: the caller guarantees the
+                                // instructions of `P::run`. The packed panels
+                                // hold `mr × packed` and `nr × packed`
+                                // elements. `C` holds `m × n` elements (checked
+                                // by `check_shapes`), so the `rows × cols`
+                                // block at `(row, col)` lies within it; each
+                                // task writes its own rows and columns.
                                 unsafe {
-                                    let target = out.ptr(row * n + col);
-                                    K::run(
-                                        depth,
-                                        packed_a[ir * mr * depth..].as_ptr(),
+                                    P::run(
+                                        packed,
+                                        panel_a,
                                         panel_b,
-                                        target,
+                                        out.ptr(row * n + col),
                                         n,
                                         rows,
                                         cols,
@@ -314,39 +541,42 @@ fn blocked<K: MicroKernel>(
 pub fn bf16_available() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
-        Isa::Avx512.available() && is_x86_feature_detected!("avx512bf16")
+        IsaKind::Avx512.available() && is_x86_feature_detected!("avx512bf16")
     }
     #[cfg(not(target_arch = "x86_64"))]
     false
 }
 
-/// `f32` rounded to the nearest `bf16`, ties to even: keeps the 16 most
-/// significant bits.
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-fn to_bf16(x: f32) -> u32 {
-    let bits = x.to_bits();
-    (bits + 0x7fff + ((bits >> 16) & 1)) >> 16
-}
-
 /// Like [`gemm`], with the operands of a large product rounded to `bf16` and
 /// their products accumulated in `f32`: mixed precision. Products with few
-/// rows, which are memory-bound, stay in `f32`, as on the GPU.
+/// rows, which are memory-bound, stay in `f32`, as on the GPU, and so does
+/// everything on a processor without `vdpbf16ps`.
+///
+/// # Panics
+///
+/// As [`gemm`].
 pub fn gemm_mixed(pool: &Pool, isa: Isa, a: Matrix, b: Matrix, c: &mut [f32], accumulate: bool) {
-    let limit = if b.col_stride == 1 {
-        FEW_ROWS
-    } else {
-        FEW_ROWS_TRANSPOSED
-    };
-    if a.rows <= limit || a.cols == 0 || c.is_empty() || isa != Isa::Avx512 || !bf16_available() {
-        gemm(pool, isa, a, b, c, accumulate);
-        return;
+    check_shapes(&a, &b, c);
+    #[cfg(target_arch = "x86_64")]
+    {
+        let limit = if b.col_stride == 1 {
+            FEW_ROWS
+        } else {
+            FEW_ROWS_TRANSPOSED
+        };
+        let large = a.rows > limit && a.cols > 0 && !c.is_empty();
+        if large && isa.kind() == IsaKind::Avx512 && bf16_available() {
+            // SAFETY: `bf16_available` checked AVX-512F and AVX512-BF16, the
+            // instructions of the kernel; the shapes are checked and `C` is
+            // not empty.
+            unsafe { blocked::<Bf16>(pool, a, b, c, accumulate, Blocks::ZEN4) };
+            return;
+        }
     }
-    assert_eq!(a.cols, b.rows, "gemm: incompatible shapes");
-    assert_eq!(c.len(), a.rows * b.cols, "gemm: unexpected output size");
-    blocked_bf16(pool, a, b, c, accumulate, Blocks::ZEN4);
+    gemm(pool, isa, a, b, c, accumulate);
 }
 
+#[cfg(target_arch = "x86_64")]
 thread_local! {
     /// The packed `bf16` pairs of a block of `A`, private to each thread.
     static PAIRS_A: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
@@ -355,135 +585,78 @@ thread_local! {
     static PAIRS_B: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
 }
 
-/// The blocked product of [`blocked`], with pairs of `bf16`: the `kc` slice
-/// is counted in indices, and packed by pairs.
+/// The mixed-precision product: the `kc` slice is counted in indices, and
+/// packed by pairs of `bf16` in a `u32`, the lower index in the low half.
 #[cfg(target_arch = "x86_64")]
-fn blocked_bf16(
-    pool: &Pool,
-    a: Matrix,
-    b: Matrix,
-    c: &mut [f32],
-    accumulate: bool,
-    blocks: Blocks,
-) {
-    const MR: usize = 14;
-    const NR: usize = 32;
-    let (m, k, n) = (a.rows, a.cols, b.cols);
-    let kc = blocks.kc;
-    let nc = blocks.nc.div_ceil(NR) * NR;
-    let threads = pool.threads();
-    let wanted = TASKS_PER_THREAD * threads;
-    let row_panels = m.div_ceil(MR);
-    let row_blocks = m.div_ceil(blocks.mc.max(MR)).max(wanted.min(row_panels));
-    let mc = row_panels.div_ceil(row_blocks) * MR;
-    let row_blocks = m.div_ceil(mc);
-    let out = SharedMut::new(c);
-    PAIRS_B.with(|packed_b| {
-        let mut packed_b = packed_b.borrow_mut();
-        for jc in (0..n).step_by(nc) {
-            let width = nc.min(n - jc);
-            let panels = width.div_ceil(NR);
-            let col_groups = wanted.div_ceil(row_blocks).min(panels.div_ceil(2)).max(1);
-            let per_group = panels.div_ceil(col_groups);
-            let col_groups = panels.div_ceil(per_group);
-            for pc in (0..k).step_by(kc) {
-                let depth = kc.min(k - pc);
-                let pairs = depth.div_ceil(2);
-                let accumulate = accumulate || pc > 0;
-                let size = panels * NR * pairs;
-                if packed_b.len() < size {
-                    packed_b.resize(size, 0);
-                }
-                let shared_b = SharedMut::new(&mut packed_b[..size]);
-                pool.run(panels, |panel| {
-                    // SAFETY: each task packs its own panel of `packed_b`.
-                    let target = unsafe { shared_b.slice(panel * NR * pairs, NR * pairs) };
-                    let (col, cols) = (jc + panel * NR, NR.min(width - panel * NR));
-                    target.fill(0);
-                    for p in 0..pairs {
-                        for j in 0..cols {
-                            let low = to_bf16(b.at(pc + 2 * p, col + j));
-                            let high = if 2 * p + 1 < depth {
-                                to_bf16(b.at(pc + 2 * p + 1, col + j))
-                            } else {
-                                0
-                            };
-                            target[p * NR + j] = low | (high << 16);
-                        }
-                    }
-                });
-                let packed_b = &packed_b[..size];
-                pool.run(row_blocks * col_groups, |task| {
-                    let (row_block, group) = (task / col_groups, task % col_groups);
-                    let ic = row_block * mc;
-                    let height = mc.min(m - ic);
-                    let first = group * per_group;
-                    let last = panels.min(first + per_group);
-                    PAIRS_A.with(|packed_a| {
-                        let mut packed_a = packed_a.borrow_mut();
-                        let panels_a = height.div_ceil(MR);
-                        let size = panels_a * MR * pairs;
-                        if packed_a.len() < size {
-                            packed_a.resize(size, 0);
-                        }
-                        for panel in 0..panels_a {
-                            let target = &mut packed_a[panel * MR * pairs..][..MR * pairs];
-                            target.fill(0);
-                            let rows = MR.min(height - panel * MR);
-                            for p in 0..pairs {
-                                for i in 0..rows {
-                                    let row = ic + panel * MR + i;
-                                    let low = to_bf16(a.at(row, pc + 2 * p));
-                                    let high = if 2 * p + 1 < depth {
-                                        to_bf16(a.at(row, pc + 2 * p + 1))
-                                    } else {
-                                        0
-                                    };
-                                    target[p * MR + i] = low | (high << 16);
-                                }
-                            }
-                        }
-                        for jr in first..last {
-                            let col = jc + jr * NR;
-                            let cols = NR.min(n - col);
-                            let panel_b = packed_b[jr * NR * pairs..].as_ptr();
-                            for ir in 0..panels_a {
-                                let row = ic + ir * MR;
-                                let rows = MR.min(m - row);
-                                // SAFETY: `bf16_available` checked the
-                                // instructions; each task writes its own rows
-                                // and columns of C.
-                                unsafe {
-                                    crate::kernels::bf16_14x32(
-                                        pairs,
-                                        packed_a[ir * MR * pairs..].as_ptr(),
-                                        panel_b,
-                                        out.ptr(row * n + col),
-                                        n,
-                                        rows,
-                                        cols,
-                                        accumulate,
-                                    );
-                                }
-                            }
-                        }
-                    });
-                });
-            }
-        }
-    });
+struct Bf16;
+
+#[cfg(target_arch = "x86_64")]
+impl Bf16 {
+    /// The pair of `bf16` of elements `(p, p + 1)` read by `at`; zero beyond
+    /// `depth`.
+    #[inline(always)]
+    fn pair(at: impl Fn(usize) -> f32, p: usize, depth: usize) -> u32 {
+        let low = u32::from(crate::io::to_bf16(at(p)));
+        let high = if p + 1 < depth {
+            u32::from(crate::io::to_bf16(at(p + 1)))
+        } else {
+            0
+        };
+        low | (high << 16)
+    }
 }
 
-#[cfg(not(target_arch = "x86_64"))]
-fn blocked_bf16(
-    pool: &Pool,
-    a: Matrix,
-    b: Matrix,
-    c: &mut [f32],
-    accumulate: bool,
-    blocks: Blocks,
-) {
-    blocked::<Scalar>(pool, a, b, c, accumulate, blocks)
+#[cfg(target_arch = "x86_64")]
+impl Packing for Bf16 {
+    type Packed = u32;
+    const MR: usize = 14;
+    const NR: usize = 32;
+
+    #[inline(always)]
+    fn packed(depth: usize) -> usize {
+        depth.div_ceil(2)
+    }
+
+    fn pack_a(a: Matrix, row: usize, rows: usize, pc: usize, depth: usize, out: &mut [u32]) {
+        out.fill(0);
+        for p in 0..depth.div_ceil(2) {
+            for i in 0..rows {
+                out[p * Self::MR + i] = Self::pair(|q| a.at(row + i, pc + q), 2 * p, depth);
+            }
+        }
+    }
+
+    fn pack_b(b: Matrix, pc: usize, depth: usize, col: usize, cols: usize, out: &mut [u32]) {
+        out.fill(0);
+        for p in 0..depth.div_ceil(2) {
+            for j in 0..cols {
+                out[p * Self::NR + j] = Self::pair(|q| b.at(pc + q, col + j), 2 * p, depth);
+            }
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn run(
+        packed: usize,
+        a: *const u32,
+        b: *const u32,
+        c: *mut f32,
+        ldc: usize,
+        rows: usize,
+        cols: usize,
+        accumulate: bool,
+    ) {
+        // SAFETY: the caller upholds the contract, AVX512-BF16 included.
+        unsafe { crate::kernels::bf16_14x32(packed, a, b, c, ldc, rows, cols, accumulate) }
+    }
+
+    fn scratch_a() -> &'static LocalKey<RefCell<Vec<u32>>> {
+        &PAIRS_A
+    }
+
+    fn scratch_b() -> &'static LocalKey<RefCell<Vec<u32>>> {
+        &PAIRS_B
+    }
 }
 
 /// Packs `rows` rows of `A`, starting at `row`, over `depth` shared indices
@@ -582,16 +755,7 @@ fn few_rows(pool: &Pool, isa: Isa, a: Matrix, b: Matrix, c: &mut [f32], accumula
             let first = group * width;
             let end = n.min(first + width);
             let (begin, stop) = (slice * depth, k.min((slice + 1) * depth));
-            let a = Matrix {
-                data: &a.data[begin * a.col_stride..],
-                cols: stop - begin,
-                ..a
-            };
-            let b = Matrix {
-                data: &b.data[begin * b.row_stride..],
-                rows: stop - begin,
-                ..b
-            };
+            let (a, b) = (a.columns(begin, stop), b.row_range(begin, stop));
             // The first slice writes into C, the others into separate buffers.
             let (target, accumulate) = if slice == 0 {
                 (out, accumulate)
@@ -655,7 +819,9 @@ fn few_rows(pool: &Pool, isa: Isa, a: Matrix, b: Matrix, c: &mut [f32], accumula
             }
         });
     } else {
-        blocked::<Scalar>(pool, a, b, c, accumulate, Blocks::ZEN4);
+        // SAFETY: the scalar kernel needs no particular instructions; the
+        // caller checked the shapes, and `C` is not empty.
+        unsafe { blocked::<F32<Scalar>>(pool, a, b, c, accumulate, Blocks::ZEN4) };
     }
 }
 
@@ -718,7 +884,15 @@ fn direct_body<const R: usize, const W: usize, const FMA: bool>(block: Block) {
     }
 }
 
+/// `C[rows, W columns] (+)= A · B` for a block of `C` with `rows` rows (four at
+/// most are used) and `block.width ≤ W` columns.
 fn direct<const W: usize>(isa: Isa, block: Block, rows: usize) {
+    assert!(
+        block.width <= W
+            && block.start + block.width <= block.b.cols
+            && block.row + rows.min(4) <= block.a.rows,
+        "a block within C"
+    );
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2,fma")]
     unsafe fn avx2<const R: usize, const W: usize>(block: Block) {
@@ -726,17 +900,19 @@ fn direct<const W: usize>(isa: Isa, block: Block, rows: usize) {
     }
 
     fn with<const R: usize, const W: usize>(isa: Isa, block: Block) {
-        match isa {
+        match isa.kind() {
             #[cfg(target_arch = "x86_64")]
-            // SAFETY: `Isa::Avx512` is only chosen when the processor has
-            // these instructions; `W == 64` is four 16-lane registers.
-            Isa::Avx512 if W == 64 => unsafe { x86::direct_avx512::<R, 4>(block) },
+            // SAFETY: an `Isa` of kind `Avx512` proves AVX-512F. `W == 64` is
+            // four 16-lane registers, and `direct` passes at most `W` columns
+            // and `R` rows that exist (see `direct_avx512`).
+            IsaKind::Avx512 if W == 64 => unsafe { x86::direct_avx512::<R, 4>(block) },
             #[cfg(target_arch = "x86_64")]
             // SAFETY: as above; `W == 256` is sixteen 16-lane registers.
-            Isa::Avx512 if W == 256 && R == 1 => unsafe { x86::direct_avx512::<1, 16>(block) },
+            IsaKind::Avx512 if W == 256 && R == 1 => unsafe { x86::direct_avx512::<1, 16>(block) },
             #[cfg(target_arch = "x86_64")]
-            // SAFETY: both ISAs imply AVX2 and FMA support.
-            Isa::Avx2 | Isa::Avx512 => unsafe { avx2::<R, W>(block) },
+            // SAFETY: an `Isa` of either kind proves AVX2 and FMA;
+            // `direct_body` only makes checked accesses.
+            IsaKind::Avx2 | IsaKind::Avx512 => unsafe { avx2::<R, W>(block) },
             _ => direct_body::<R, W, false>(block),
         }
     }
@@ -758,6 +934,13 @@ mod x86 {
     /// The product without packing in AVX-512: `R` rows of `16 × V` columns,
     /// that is `R × V` accumulators, which stay in registers from start to
     /// finish. Columns beyond `width` are masked out.
+    ///
+    /// # Safety
+    ///
+    /// The processor has AVX-512F; `row + R ≤ a.rows`, `width ≤ 16 × V`,
+    /// `start + width ≤ b.cols`, `a.cols == b.rows`; `out` points to a
+    /// row-major `C` of `n` columns with at least `row + R` rows and
+    /// `n ≥ start + width`, whose block this task alone writes.
     #[target_feature(enable = "avx512f")]
     pub(super) unsafe fn direct_avx512<const R: usize, const V: usize>(block: Block) {
         let Block {
@@ -778,8 +961,11 @@ mod x86 {
         let a_data = a.data.as_ptr();
         let mut line = b.data.as_ptr().wrapping_add(start);
         for p in 0..a.cols {
-            // SAFETY: the caller guarantees that the rows, columns and slice
-            // exist; masked-out columns are not read.
+            // SAFETY: `row + r < a.rows` and `p < a.cols`, so the element of
+            // `A` lies within `a.data` (invariant of `Matrix`). `line + 16v +
+            // lane` is element `(p, start + 16v + lane)` of `B`, which exists
+            // for every unmasked lane since `start + width ≤ b.cols` and
+            // `p < b.rows`; masked-out lanes are not read.
             unsafe {
                 let x: [__m512; R] = std::array::from_fn(|r| {
                     _mm512_set1_ps(*a_data.add((row + r) * a.row_stride + p * a.col_stride))
@@ -794,8 +980,10 @@ mod x86 {
             line = line.wrapping_add(b.row_stride);
         }
         for (r, sums) in acc.iter().enumerate() {
-            // SAFETY: each task writes its own columns of C; masked-out
-            // columns are neither read nor written.
+            // SAFETY: row `row + r` of `C` exists and its columns
+            // `start..start + width` lie within its `n` columns; this task
+            // alone writes them, and masked-out columns are neither read nor
+            // written.
             unsafe {
                 let target = out.ptr((row + r) * n + start);
                 for (v, &mask) in masks.iter().enumerate() {
@@ -849,23 +1037,18 @@ mod tests {
             .collect()
     }
 
-    fn check(isa: Isa, m: usize, k: usize, n: usize, transpose_a: bool, transpose_b: bool) {
-        let pool = Pool::new(4);
-        let data_a = values(m * k, 1);
-        let data_b = values(k * n, 2);
-        let a = if transpose_a {
-            Matrix::new(&data_a, k, m).t()
+    /// A row-major `rows × cols` matrix, or the transpose of a `cols × rows`
+    /// one.
+    fn matrix(data: &[f32], rows: usize, cols: usize, transpose: bool) -> Matrix<'_> {
+        if transpose {
+            Matrix::new(data, cols, rows).unwrap().t()
         } else {
-            Matrix::new(&data_a, m, k)
-        };
-        let b = if transpose_b {
-            Matrix::new(&data_b, n, k).t()
-        } else {
-            Matrix::new(&data_b, k, n)
-        };
-        let expected = reference(a, b);
-        let mut c = vec![f32::NAN; m * n];
-        let blocks = Blocks {
+            Matrix::new(data, rows, cols).unwrap()
+        }
+    }
+
+    fn blocks(m: usize, k: usize, n: usize) -> Blocks {
+        Blocks {
             kc: 48,
             mc: 40,
             nc: 64,
@@ -875,12 +1058,20 @@ mod tests {
                 Split::Columns
             },
             few_rows: FEW_ROWS,
-        };
+        }
+    }
+
+    /// Checks `A · B`, then `A · B` accumulated, against the definition.
+    fn check_matrices(isa: Isa, a: Matrix, b: Matrix, blocks: Blocks, what: &str) {
+        let pool = Pool::new(4);
+        let (m, k, n) = (a.rows, a.cols, b.cols);
+        let expected = reference(a, b);
+        let mut c = vec![f32::NAN; m * n];
         gemm_with_blocks(&pool, isa, a, b, &mut c, false, blocks);
         for (index, (&got, &want)) in c.iter().zip(&expected).enumerate() {
             assert!(
                 (got as f64 - want).abs() < 1e-4 * (k as f64).sqrt(),
-                "{isa:?} {m}×{k}×{n} (tA {transpose_a}, tB {transpose_b}), element {index}: {got} instead of {want}",
+                "{isa:?} {m}×{k}×{n} {what}, element {index}: {got} instead of {want}",
             );
         }
         // Accumulating adds the same product a second time.
@@ -890,11 +1081,17 @@ mod tests {
         }
     }
 
+    fn check(isa: Isa, m: usize, k: usize, n: usize, transpose_a: bool, transpose_b: bool) {
+        let data_a = values(m * k, 1);
+        let data_b = values(k * n, 2);
+        let a = matrix(&data_a, m, k, transpose_a);
+        let b = matrix(&data_b, k, n, transpose_b);
+        let what = format!("(tA {transpose_a}, tB {transpose_b})");
+        check_matrices(isa, a, b, blocks(m, k, n), &what);
+    }
+
     fn isas() -> Vec<Isa> {
-        [Isa::Scalar, Isa::Avx2, Isa::Avx512]
-            .into_iter()
-            .filter(|isa| isa.available())
-            .collect()
+        Isa::all_available().collect()
     }
 
     #[test]
@@ -927,11 +1124,139 @@ mod tests {
     }
 
     #[test]
+    fn any_strides_match_the_definition() {
+        for isa in isas() {
+            // Rows of 1, 3 and 300 cover the products with few rows, by rows
+            // of `B` and by dot products, and the blocked one.
+            for &(m, k, n) in &[(1, 70, 40), (3, 70, 300), (300, 70, 40)] {
+                let data = values(4 * (m + n + 3) * (k + 3), 9);
+                // Padded rows, and every second column.
+                let a = Matrix::strided(&data, m, k, 2 * k + 3, 2).unwrap();
+                let b = Matrix::strided(&data[5..], k, n, 1, k + 7).unwrap();
+                check_matrices(isa, a, b, blocks(m, k, n), "padded");
+                let b = Matrix::strided(&data, k, n, 2 * n + 1, 2).unwrap();
+                check_matrices(isa, a, b, blocks(m, k, n), "every second column");
+                // A stride of zero repeats a row or a column: broadcasting.
+                let a = Matrix::strided(&data, m, k, 0, 1).unwrap();
+                let b = Matrix::strided(&data, k, n, 1, 0).unwrap();
+                check_matrices(isa, a, b, blocks(m, k, n), "broadcast A, B");
+                let a = Matrix::strided(&data, m, k, 1, 0).unwrap();
+                let b = Matrix::strided(&data, k, n, 0, 1).unwrap();
+                check_matrices(isa, a, b, blocks(m, k, n), "broadcast Aᵀ, Bᵀ");
+                let b = Matrix::strided(&data, k, n, 0, 0).unwrap();
+                check_matrices(isa, a, b, blocks(m, k, n), "a single value");
+            }
+        }
+    }
+
+    #[test]
+    fn matrices_must_fit_in_their_data() {
+        let data = [0.0f32; 12];
+        assert!(Matrix::new(&data, 3, 4).is_ok());
+        assert!(Matrix::new(&data, 4, 4).is_err());
+        assert!(Matrix::strided(&data, 2, 2, 10, 1).is_ok());
+        assert!(Matrix::strided(&data, 2, 2, 11, 1).is_err());
+        assert!(Matrix::strided(&data, 1 << 40, 3, 0, 1).is_ok());
+        assert!(Matrix::strided(&data, usize::MAX, 2, usize::MAX, 1).is_err());
+        assert!(Matrix::strided(&data, 2, 2, usize::MAX / 2 + 1, 1).is_err());
+        // An empty matrix reads nothing.
+        assert!(Matrix::strided(&[], 0, 5, 7, 1).is_ok());
+        assert!(Matrix::strided(&[], 5, 0, 7, 1).is_ok());
+    }
+
+    #[test]
+    #[should_panic(expected = "C must hold")]
+    fn a_short_output_is_refused() {
+        let data = [1.0f32; 4];
+        let a = Matrix::new(&data, 2, 2).unwrap();
+        gemm(&Pool::new(1), Isa::detect(), a, a, &mut [0.0; 3], false);
+    }
+
+    #[test]
+    #[should_panic(expected = "C must hold")]
+    fn an_overflowing_output_is_refused() {
+        let data = [1.0f32; 4];
+        let a = Matrix::strided(&data, 1 << 33, 2, 0, 1).unwrap();
+        let b = Matrix::strided(&data, 2, 1 << 31, 1, 0).unwrap();
+        gemm(&Pool::new(1), Isa::detect(), a, b, &mut [0.0; 0], false);
+    }
+
+    #[test]
+    fn zero_block_sizes_are_taken_as_one() {
+        let data = values(40 * 30, 3);
+        let a = Matrix::new(&data, 40, 30).unwrap();
+        let b = Matrix::new(&data[..30 * 20], 30, 20).unwrap();
+        let blocks = Blocks {
+            kc: 0,
+            mc: 0,
+            nc: 0,
+            split: Split::Rows,
+            few_rows: 0,
+        };
+        for isa in isas() {
+            check_matrices(isa, a, b, blocks, "with blocks of zero");
+        }
+    }
+
+    /// `NaN` and infinities propagate: a `NaN` in row `i` of `A` makes row `i`
+    /// of `C` `NaN`, a `+∞` in column `j` of `B` makes column `j` `+∞` where
+    /// `A` is positive.
+    fn check_special_values(isa: Isa, mixed: bool) {
+        let pool = Pool::new(3);
+        for &(m, k, n) in &[(3, 40, 70), (20, 40, 70), (300, 600, 70)] {
+            for (ta, tb) in [(false, false), (true, true), (false, true)] {
+                let positive = |len, seed| -> Vec<f32> {
+                    values(len, seed).iter().map(|v| 1.0 + 0.5 * v).collect()
+                };
+                let (mut data_a, mut data_b) = (positive(m * k, 1), positive(k * n, 2));
+                let (row, col) = (m / 2, n - 1);
+                // Element `(row, 7)` of A and `(k - 1, col)` of B, whichever
+                // the storage.
+                data_a[if ta { 7 * m + row } else { row * k + 7 }] = f32::NAN;
+                data_b[if tb {
+                    col * k + k - 1
+                } else {
+                    (k - 1) * n + col
+                }] = f32::INFINITY;
+                let (a, b) = (matrix(&data_a, m, k, ta), matrix(&data_b, k, n, tb));
+                let mut c = vec![0.0; m * n];
+                if mixed {
+                    gemm_mixed(&pool, isa, a, b, &mut c, false);
+                } else {
+                    gemm(&pool, isa, a, b, &mut c, false);
+                }
+                for i in 0..m {
+                    for j in 0..n {
+                        let value = c[i * n + j];
+                        let what = format!("{isa:?} {m}×{k}×{n} ({ta}, {tb}) at ({i}, {j})");
+                        if i == row {
+                            assert!(value.is_nan(), "{what}: {value}");
+                        } else if j == col {
+                            assert_eq!(value, f32::INFINITY, "{what}");
+                        } else {
+                            assert!(value.is_finite(), "{what}: {value}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn nan_and_infinities_propagate() {
+        for isa in isas() {
+            check_special_values(isa, false);
+            check_special_values(isa, true);
+        }
+    }
+
+    #[test]
     fn mixed_products_are_exact_on_small_integers_and_close_otherwise() {
         if !bf16_available() {
             return;
         }
         let pool = Pool::new(4);
+        let isa = Isa::new(IsaKind::Avx512).unwrap();
         for &(m, k, n, ta, tb) in &[
             (300, 70, 150, false, false),
             (290, 33, 65, true, false),
@@ -949,18 +1274,10 @@ mod tests {
                 (small(m * k, 5), small(k * n, 6), true),
                 (values(m * k, 7), values(k * n, 8), false),
             ] {
-                let a = if ta {
-                    Matrix::new(&data_a, k, m).t()
-                } else {
-                    Matrix::new(&data_a, m, k)
-                };
-                let b = if tb {
-                    Matrix::new(&data_b, n, k).t()
-                } else {
-                    Matrix::new(&data_b, k, n)
-                };
+                let a = matrix(&data_a, m, k, ta);
+                let b = matrix(&data_b, k, n, tb);
                 let mut c = vec![0.0; m * n];
-                gemm_mixed(&pool, Isa::Avx512, a, b, &mut c, false);
+                gemm_mixed(&pool, isa, a, b, &mut c, false);
                 let expected = reference(a, b);
                 for (i, (&got, &want)) in c.iter().zip(&expected).enumerate() {
                     if exact {
@@ -980,19 +1297,32 @@ mod tests {
 
     #[test]
     fn the_result_does_not_depend_on_the_number_of_threads() {
-        let (m, k, n) = (300, 700, 200);
-        let data_a = values(m * k, 3);
-        let data_b = values(k * n, 4);
-        let (a, b) = (Matrix::new(&data_a, m, k), Matrix::new(&data_b, k, n));
-        let run = |threads: usize, isa: Isa| {
-            let mut c = vec![0.0; m * n];
-            gemm(&Pool::new(threads), isa, a, b, &mut c, false);
-            c
-        };
-        for isa in isas() {
-            let one = run(1, isa);
-            assert_eq!(one, run(2, isa));
-            assert_eq!(one, run(7, isa));
+        // Blocked, with few rows by rows of `B`, with few rows by dot products.
+        for (m, k, n, tb) in [
+            (300, 700, 200, false),
+            (7, 700, 900, false),
+            (5, 300, 200, true),
+        ] {
+            let data_a = values(m * k, 3);
+            let data_b = values(k * n, 4);
+            let (a, b) = (matrix(&data_a, m, k, false), matrix(&data_b, k, n, tb));
+            let run = |threads: usize, isa: Isa, mixed: bool| {
+                let mut c = vec![0.0; m * n];
+                let pool = Pool::new(threads);
+                if mixed {
+                    gemm_mixed(&pool, isa, a, b, &mut c, false);
+                } else {
+                    gemm(&pool, isa, a, b, &mut c, false);
+                }
+                c
+            };
+            for isa in isas() {
+                for mixed in [false, true] {
+                    let one = run(1, isa, mixed);
+                    assert_eq!(one, run(2, isa, mixed), "{isa:?} {m}×{k}×{n}");
+                    assert_eq!(one, run(7, isa, mixed), "{isa:?} {m}×{k}×{n}");
+                }
+            }
         }
     }
 }

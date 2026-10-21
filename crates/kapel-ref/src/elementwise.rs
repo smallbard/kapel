@@ -3,7 +3,7 @@
 use std::f64::consts::PI;
 use std::sync::Arc;
 
-use kapel_core::{HostStorage, Layout, Result, Tensor};
+use kapel_core::{Error, HostStorage, Layout, Result, Tensor};
 use kapel_ops::{Affine, Binary, BinaryKind, Cast, Operation, Run, Unary, UnaryKind};
 
 use crate::Reference;
@@ -13,9 +13,9 @@ fn sigmoid(x: f64) -> f64 {
     1.0 / (1.0 + (-x).exp())
 }
 
-/// `f(x)` and `f'(x)`.
-fn unary(kind: UnaryKind, x: f64) -> (f64, f64) {
-    match kind {
+/// `f(x)` and `f'(x)`, or an error for a function this backend does not know.
+fn unary(kind: UnaryKind, x: f64) -> Result<(f64, f64)> {
+    Ok(match kind {
         UnaryKind::Neg => (-x, -1.0),
         UnaryKind::Exp => (x.exp(), x.exp()),
         UnaryKind::Log => (x.ln(), 1.0 / x),
@@ -56,7 +56,15 @@ fn unary(kind: UnaryKind, x: f64) -> (f64, f64) {
             let dt = (1.0 - t * t) * c * (1.0 + 3.0 * 0.044_715 * x * x);
             (0.5 * x * (1.0 + t), 0.5 * (1.0 + t) + 0.5 * x * dt)
         }
-        _ => unreachable!("every unary function is defined above"),
+        _ => return Err(unsupported(Unary::NAME, format!("{kind:?}"))),
+    })
+}
+
+/// The error for a function added to the catalogue after this backend.
+fn unsupported(op: &'static str, kind: String) -> Error {
+    Error::InvalidArgument {
+        op,
+        message: format!("the reference backend does not implement {kind}"),
     }
 }
 
@@ -64,7 +72,11 @@ impl Run<Unary> for Reference {
     fn forward(&self, op: &Unary, inputs: &[&Tensor]) -> Result<Tensor> {
         op.infer(inputs)?;
         let x = Array::of(inputs[0])?;
-        let data = x.data.iter().map(|&v| unary(op.kind, v).0).collect();
+        let data = x
+            .data
+            .iter()
+            .map(|&v| Ok(unary(op.kind, v)?.0))
+            .collect::<Result<_>>()?;
         Array::new(&x.shape, data).tensor()
     }
 
@@ -74,21 +86,22 @@ impl Run<Unary> for Reference {
         inputs: &[&Tensor],
         grad: &Tensor,
     ) -> Result<Vec<Option<Tensor>>> {
-        op.infer(inputs)?;
+        op.infer_backward(inputs, grad)?;
         let (x, g) = (Array::of(inputs[0])?, Array::of(grad)?);
         let data = x
             .data
             .iter()
             .zip(&g.data)
-            .map(|(&v, &g)| g * unary(op.kind, v).1)
-            .collect();
+            .map(|(&v, &g)| Ok(g * unary(op.kind, v)?.1))
+            .collect::<Result<_>>()?;
         Ok(vec![Some(Array::new(&x.shape, data).tensor()?)])
     }
 }
 
-/// `f(a, b)`, `∂f/∂a` and `∂f/∂b`.
-fn binary(kind: BinaryKind, a: f64, b: f64) -> (f64, f64, f64) {
-    match kind {
+/// `f(a, b)`, `∂f/∂a` and `∂f/∂b`, or an error for a function this backend
+/// does not know.
+fn binary(kind: BinaryKind, a: f64, b: f64) -> Result<(f64, f64, f64)> {
+    Ok(match kind {
         BinaryKind::Add => (a + b, 1.0, 1.0),
         BinaryKind::Sub => (a - b, 1.0, -1.0),
         BinaryKind::Mul => (a * b, b, a),
@@ -97,8 +110,8 @@ fn binary(kind: BinaryKind, a: f64, b: f64) -> (f64, f64, f64) {
         BinaryKind::Max => (b, 0.0, 1.0),
         BinaryKind::Min if a <= b => (a, 1.0, 0.0),
         BinaryKind::Min => (b, 0.0, 1.0),
-        _ => unreachable!("every binary function is defined above"),
-    }
+        _ => return Err(unsupported(Binary::NAME, format!("{kind:?}"))),
+    })
 }
 
 /// The two inputs of a binary operation, and for each output element, the
@@ -139,8 +152,8 @@ impl Run<Binary> for Reference {
         let data = map_a
             .iter()
             .zip(&map_b)
-            .map(|(&i, &j)| binary(op.kind, a.data[i], b.data[j]).0)
-            .collect();
+            .map(|(&i, &j)| Ok(binary(op.kind, a.data[i], b.data[j])?.0))
+            .collect::<Result<_>>()?;
         Array::new(&shape, data).tensor()
     }
 
@@ -150,6 +163,7 @@ impl Run<Binary> for Reference {
         inputs: &[&Tensor],
         grad: &Tensor,
     ) -> Result<Vec<Option<Tensor>>> {
+        op.infer_backward(inputs, grad)?;
         let Pair {
             shape,
             a,
@@ -160,7 +174,7 @@ impl Run<Binary> for Reference {
         let g = Array::of(grad)?;
         let (mut ga, mut gb) = (Array::zeros(&shape), Array::zeros(&shape));
         for (n, (&i, &j)) in map_a.iter().zip(&map_b).enumerate() {
-            let (_, da, db) = binary(op.kind, a.data[i], b.data[j]);
+            let (_, da, db) = binary(op.kind, a.data[i], b.data[j])?;
             ga.data[n] = g.data[n] * da;
             gb.data[n] = g.data[n] * db;
         }
@@ -185,7 +199,7 @@ impl Run<Affine> for Reference {
         inputs: &[&Tensor],
         grad: &Tensor,
     ) -> Result<Vec<Option<Tensor>>> {
-        op.infer(inputs)?;
+        op.infer_backward(inputs, grad)?;
         let g = Array::of(grad)?;
         let data = g.data.iter().map(|&v| op.scale * v).collect();
         Ok(vec![Some(Array::new(&g.shape, data).tensor()?)])
@@ -218,8 +232,10 @@ impl Run<Cast> for Reference {
         inputs: &[&Tensor],
         grad: &Tensor,
     ) -> Result<Vec<Option<Tensor>>> {
-        op.infer(inputs)?;
-        if !op.differentiable(0) {
+        op.infer_backward(inputs, grad)?;
+        // Between float types the gradient passes through; an integer input or
+        // output receives none.
+        if !op.differentiable(0) || !inputs[0].dtype().is_float() {
             return Ok(vec![None]);
         }
         Ok(vec![Some(Array::of(grad)?.tensor()?)])

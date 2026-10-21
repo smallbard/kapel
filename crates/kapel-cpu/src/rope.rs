@@ -76,7 +76,7 @@ impl Run<Rope> for Cpu {
         inputs: &[&Tensor],
         grad: &Tensor,
     ) -> Result<Vec<Option<Tensor>>> {
-        let signature = op.infer(inputs)?;
+        let signature = op.infer_backward(inputs, grad)?;
         let g = io::contiguous(Rope::NAME, grad)?;
         let out = rotate(self, op, &g, &signature.shape, inputs[1], -1.0)?;
         Ok(vec![

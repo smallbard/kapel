@@ -50,7 +50,7 @@ impl Run<Sum> for Reference {
     }
 
     fn backward(&self, op: &Sum, inputs: &[&Tensor], grad: &Tensor) -> Result<Vec<Option<Tensor>>> {
-        op.infer(inputs)?;
+        op.infer_backward(inputs, grad)?;
         Ok(vec![Some(spread(inputs[0].shape(), &op.dims, grad, 1.0)?)])
     }
 }
@@ -69,7 +69,7 @@ impl Run<Mean> for Reference {
         inputs: &[&Tensor],
         grad: &Tensor,
     ) -> Result<Vec<Option<Tensor>>> {
-        op.infer(inputs)?;
+        op.infer_backward(inputs, grad)?;
         let count = op
             .dims
             .iter()
@@ -108,7 +108,7 @@ impl Run<Max> for Reference {
     }
 
     fn backward(&self, op: &Max, inputs: &[&Tensor], grad: &Tensor) -> Result<Vec<Option<Tensor>>> {
-        op.infer(inputs)?;
+        op.infer_backward(inputs, grad)?;
         let (x, g) = (Array::of(inputs[0])?, Array::of(grad)?);
         let mut gx = Array::zeros(&x.shape);
         for (line, at) in argmax(&x, op.dim).into_iter().enumerate() {

@@ -11,7 +11,10 @@ mod model;
 
 use std::fmt;
 
-pub use config::{Block, Config, MAX_HEADS, MAX_LAYERS, Norm};
+pub use config::{
+    Block, Config, MAX_HEAD_DIM, MAX_HEADS, MAX_HIDDEN, MAX_INTERMEDIATE, MAX_LAYERS, MAX_VOCAB,
+    Norm,
+};
 pub use model::Model;
 
 /// What can go wrong with a model.

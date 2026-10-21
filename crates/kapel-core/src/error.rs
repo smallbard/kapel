@@ -25,6 +25,8 @@ pub enum Error {
     },
     /// A shape cannot be broadcast to another.
     BroadcastIncompatible {
+        /// The operation that failed.
+        op: &'static str,
         /// The shape being broadcast.
         from: Vec<usize>,
         /// The target shape.
@@ -169,9 +171,9 @@ impl fmt::Display for Error {
             Self::ShapeMismatch { op, expected, got } => {
                 write!(f, "{op}: expected shape {expected:?}, got {got:?}")
             }
-            Self::BroadcastIncompatible { from, to } => write!(
+            Self::BroadcastIncompatible { op, from, to } => write!(
                 f,
-                "broadcast: shape {from:?} cannot be broadcast to {to:?}; each dimension \
+                "{op}: shape {from:?} cannot be broadcast to {to:?}; each dimension \
                  must be equal to the target or 1"
             ),
             Self::ElementCountMismatch { op, expected, got } => write!(

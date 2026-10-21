@@ -1,5 +1,7 @@
 //! Normalizers and pre-tokenizers: from a text to the pieces BPE encodes.
 
+use std::sync::OnceLock;
+
 use fancy_regex::Regex;
 use serde_json::Value;
 use unicode_normalization::UnicodeNormalization;
@@ -162,7 +164,8 @@ pub(crate) enum Behavior {
 pub(crate) enum PreTokenizer {
     ByteLevel {
         add_prefix_space: bool,
-        regex: Option<Regex>,
+        /// GPT-2's regex, compiled once, unless `use_regex` is false.
+        regex: Option<Pattern>,
     },
     Split {
         pattern: Pattern,
@@ -174,9 +177,8 @@ pub(crate) enum PreTokenizer {
         prepend: Prepend,
         split: bool,
     },
-    Digits {
-        individual: bool,
-    },
+    /// Digits, one by one or in runs: the regex is compiled once.
+    Digits(Pattern),
     Sequence(Vec<PreTokenizer>),
 }
 
@@ -207,7 +209,7 @@ impl PreTokenizer {
             "ByteLevel" => Self::ByteLevel {
                 add_prefix_space: flag("add_prefix_space", false),
                 regex: flag("use_regex", true)
-                    .then(|| Regex::new(GPT2).expect("the GPT-2 regex is valid")),
+                    .then(|| Pattern::Regex(Regex::new(GPT2).expect("the GPT-2 regex is valid"))),
             },
             "Split" => Self::Split {
                 pattern: Pattern::from_json(
@@ -238,9 +240,14 @@ impl PreTokenizer {
                 },
                 split: flag("split", true),
             },
-            "Digits" => Self::Digits {
-                individual: flag("individual_digits", false),
-            },
+            "Digits" => Self::Digits(Pattern::Regex(
+                Regex::new(if flag("individual_digits", false) {
+                    r"\p{N}"
+                } else {
+                    r"\p{N}+"
+                })
+                .expect("the digit regexes are valid"),
+            )),
             "Sequence" => Self::Sequence(
                 json.get("pretokenizers")
                     .and_then(Value::as_array)
@@ -295,7 +302,7 @@ impl PreTokenizer {
                     text.insert(0, ' ');
                 }
                 let parts = match regex {
-                    Some(r) => split(&text, &Pattern::Regex(r.clone()), Behavior::Isolated, false)?,
+                    Some(pattern) => split(&text, pattern, Behavior::Isolated, false)?,
                     None => vec![text],
                 };
                 make(parts.into_iter().map(|p| byte_level(&p)).collect())
@@ -334,12 +341,7 @@ impl PreTokenizer {
                     make(vec![text])
                 }
             }
-            Self::Digits { individual } => {
-                let pattern = Pattern::Regex(
-                    Regex::new(if *individual { r"\p{N}" } else { r"\p{N}+" }).expect("valid"),
-                );
-                make(split(&piece.text, &pattern, Behavior::Isolated, false)?)
-            }
+            Self::Digits(pattern) => make(split(&piece.text, pattern, Behavior::Isolated, false)?),
             Self::Sequence(_) => unreachable!("sequences are applied piece list by piece list"),
         })
     }
@@ -418,7 +420,8 @@ pub(crate) fn bytes_to_chars() -> [char; 256] {
 }
 
 fn byte_level(text: &str) -> String {
-    let map = bytes_to_chars();
+    static MAP: OnceLock<[char; 256]> = OnceLock::new();
+    let map = MAP.get_or_init(bytes_to_chars);
     text.bytes().map(|b| map[usize::from(b)]).collect()
 }
 

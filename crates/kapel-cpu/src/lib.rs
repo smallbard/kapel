@@ -38,14 +38,17 @@ macro_rules! multiversion {
             unsafe fn narrow($($arg: $ty),*) -> $ret {
                 $body::<true>($($arg),*)
             }
-            match isa {
-                // SAFETY: `Isa::Avx512` is only chosen when the processor has
-                // these instructions (`Isa::available`).
+            match isa.kind() {
+                // SAFETY: an `Isa` of kind `Avx512` can only be built by
+                // `Isa::new` or `Isa::detect`, after checking that the
+                // processor has AVX-512 F/BW/DQ/VL, AVX2 and FMA: the
+                // instructions `wide` is compiled with.
                 #[cfg(target_arch = "x86_64")]
-                $crate::Isa::Avx512 => unsafe { wide($($arg),*) },
-                // SAFETY: likewise for AVX2 and FMA.
+                $crate::IsaKind::Avx512 => unsafe { wide($($arg),*) },
+                // SAFETY: likewise, an `Isa` of kind `Avx2` proves AVX2 and
+                // FMA, the instructions of `narrow`.
                 #[cfg(target_arch = "x86_64")]
-                $crate::Isa::Avx2 => unsafe { narrow($($arg),*) },
+                $crate::IsaKind::Avx2 => unsafe { narrow($($arg),*) },
                 _ => $body::<false>($($arg),*),
             }
         }
@@ -69,7 +72,7 @@ mod reduce;
 mod rope;
 
 pub use backend::Cpu;
-pub use isa::{Isa, default_threads};
+pub use isa::{Isa, IsaKind, default_threads};
 
 /// `a × b + c`, fused when the processor can.
 #[inline(always)]
@@ -94,9 +97,10 @@ mod tests {
 
     #[test]
     fn every_instruction_set_conforms() {
-        for isa in [Isa::Scalar, Isa::Avx2, Isa::Avx512] {
-            if let Ok(cpu) = Cpu::with_threads(4).with_isa(isa) {
-                conformity::assert_conforms(&cpu, DType::F32);
+        for kind in [IsaKind::Scalar, IsaKind::Avx2, IsaKind::Avx512] {
+            match Cpu::with_threads(4).with_isa(kind) {
+                Ok(cpu) => conformity::assert_conforms(&cpu, DType::F32),
+                Err(_) => assert!(!kind.available()),
             }
         }
     }
@@ -129,6 +133,70 @@ mod tests {
         for threads in [2, 3, 8] {
             assert_eq!(run(&Cpu::with_threads(threads)), one, "{threads} threads");
         }
+    }
+
+    #[test]
+    fn attention_does_not_depend_on_the_number_of_threads() {
+        // One batch element and two key heads: the queries are split in
+        // blocks, forward and backward, with a mask and a softcap.
+        let values = |n: usize, seed: usize| {
+            (0..n)
+                .map(|i| (((i + seed) * 7919) % 1000) as f32 / 500.0 - 1.0)
+                .collect::<Vec<_>>()
+        };
+        let (hq, hkv, tq, tk, d) = (4, 2, 300, 320, 16);
+        let q = Tensor::from_slice(&values(hq * tq * d, 1), &[1, hq, tq, d]).unwrap();
+        let k = Tensor::from_slice(&values(hkv * tk * d, 2), &[1, hkv, tk, d]).unwrap();
+        let v = Tensor::from_slice(&values(hkv * tk * d, 3), &[1, hkv, tk, d]).unwrap();
+        let g = Tensor::from_slice(&values(hq * tq * d, 4), &[1, hq, tq, d]).unwrap();
+        let mask = Tensor::from_slice(&values(tq * tk, 5), &[1, 1, tq, tk]).unwrap();
+        let op = Attention {
+            softcap: Some(5.0),
+            ..Attention::causal()
+        };
+        let run = |cpu: &Cpu| {
+            let inputs = [&q, &k, &v, &mask];
+            let mut all = vec![cpu.forward(&op, &inputs).unwrap().to_vec::<f32>().unwrap()];
+            for grad in cpu
+                .backward(&op, &inputs, &g)
+                .unwrap()
+                .into_iter()
+                .flatten()
+            {
+                all.push(grad.to_vec::<f32>().unwrap());
+            }
+            all
+        };
+        let one = run(&Cpu::with_threads(1));
+        for threads in [2, 5, 16] {
+            assert!(run(&Cpu::with_threads(threads)) == one, "{threads} threads");
+        }
+    }
+
+    #[test]
+    fn attention_keeps_nan_apart_from_masked_rows() {
+        let cpu = Cpu::with_threads(2);
+        let q = Tensor::from_slice(&[1.0f32; 3 * 4], &[1, 1, 3, 4]).unwrap();
+        let k = Tensor::from_slice(&[0.5f32; 3 * 4], &[1, 1, 3, 4]).unwrap();
+        let ninf = f32::NEG_INFINITY;
+        // Row 0: every key masked, zeros. Row 1: masked but for a NaN, which
+        // propagates. Row 2: ordinary.
+        let mask = [ninf, ninf, ninf, ninf, f32::NAN, ninf, 0.0, 0.0, 0.0];
+        let mask = Tensor::from_slice(&mask, &[1, 1, 3, 3]).unwrap();
+        let y = cpu
+            .forward(
+                &Attention {
+                    causal: false,
+                    ..Attention::causal()
+                },
+                &[&q, &k, &k, &mask],
+            )
+            .unwrap()
+            .to_vec::<f32>()
+            .unwrap();
+        assert!(y[..4].iter().all(|&x| x == 0.0), "{y:?}");
+        assert!(y[4..8].iter().all(|x| x.is_nan()), "{y:?}");
+        assert!(y[8..].iter().all(|&x| (x - 0.5).abs() < 1e-6), "{y:?}");
     }
 
     #[test]

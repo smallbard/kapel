@@ -26,6 +26,8 @@ mod array;
 mod attention;
 pub mod conformity;
 mod elementwise;
+#[cfg(test)]
+mod golden;
 mod index;
 mod matmul;
 mod norm;
@@ -66,9 +68,24 @@ mod tests {
 
     #[test]
     fn the_reference_conforms_to_itself() {
+        let typed = Typed { exp_off: false };
         for dtype in [DType::F64, DType::F32, DType::BF16] {
-            conformity::assert_conforms(&Reference, dtype);
+            conformity::assert_conforms(&typed, dtype);
         }
+    }
+
+    #[test]
+    fn the_suite_checks_output_types() {
+        // The reference returns f64: in f32, every case but the casts to
+        // another type is reported.
+        let failures = conformity::check(&Reference, DType::F32);
+        assert!(failures.iter().any(|f| f.message.contains("type f64")));
+        assert!(
+            failures
+                .iter()
+                .all(|f| f.message == "output: type f64, expected f32"),
+            "{failures:?}"
+        );
     }
 
     #[test]
@@ -87,10 +104,23 @@ mod tests {
         );
     }
 
-    /// The reference, except that `exp` is a little off: the suite must see it.
-    struct Off;
+    /// The reference, with its outputs converted to the type of their
+    /// signature, as a backend returns them; with `exp_off`, `exp` is a little
+    /// off: the suite must see it.
+    struct Typed {
+        exp_off: bool,
+    }
 
-    impl Transfer for Off {
+    /// `y` converted to the type of `op`'s output.
+    fn typed<O: Operation>(op: &O, inputs: &[&Tensor], y: Tensor) -> Result<Tensor> {
+        let dtype = op.infer(inputs)?.dtype;
+        if y.dtype() == dtype {
+            return Ok(y);
+        }
+        Reference.forward(&kapel_ops::Cast { dtype }, &[&y])
+    }
+
+    impl Transfer for Typed {
         fn upload(&self, tensor: &Tensor) -> Result<Tensor> {
             Reference.upload(tensor)
         }
@@ -102,9 +132,9 @@ mod tests {
 
     macro_rules! delegate {
         ($($op:ty),*) => {$(
-            impl Run<$op> for Off {
+            impl Run<$op> for Typed {
                 fn forward(&self, op: &$op, inputs: &[&Tensor]) -> Result<Tensor> {
-                    Reference.forward(op, inputs)
+                    typed(op, inputs, Reference.forward(op, inputs)?)
                 }
 
                 fn backward(
@@ -138,18 +168,18 @@ mod tests {
         kapel_ops::ScatterAddRows
     );
 
-    impl Run<kapel_ops::Unary> for Off {
+    impl Run<kapel_ops::Unary> for Typed {
         fn forward(&self, op: &kapel_ops::Unary, inputs: &[&Tensor]) -> Result<Tensor> {
             let y = Reference.forward(op, inputs)?;
-            if op.kind != kapel_ops::UnaryKind::Exp {
-                return Ok(y);
+            if !self.exp_off || op.kind != kapel_ops::UnaryKind::Exp {
+                return typed(op, inputs, y);
             }
             let off: Vec<f64> = y
                 .to_vec::<f64>()?
                 .iter()
                 .map(|v| v * (1.0 + 1e-3))
                 .collect();
-            Tensor::from_slice(&off, y.shape())
+            typed(op, inputs, Tensor::from_slice(&off, y.shape())?)
         }
 
         fn backward(
@@ -164,7 +194,7 @@ mod tests {
 
     #[test]
     fn the_suite_sees_a_small_error() {
-        let failures = conformity::check(&Off, DType::F32);
+        let failures = conformity::check(&Typed { exp_off: true }, DType::F32);
         assert_eq!(failures.len(), 1, "{failures:?}");
         assert_eq!(failures[0].op, "unary");
         assert!(failures[0].case.starts_with("Exp"));
@@ -218,6 +248,84 @@ mod tests {
         let s = 1.0 / 2f64.sqrt();
         let a = 1.0 / (1.0 + s.exp());
         assert!((y[1] - (10.0 * a + 20.0 * (1.0 - a))).abs() < 1e-12);
+    }
+
+    /// Attention of 2 queries over 3 keys, not causal, with the mask `mask`
+    /// `[1, 1, 2, 3]`: the outputs and the gradients of q, k and v.
+    fn masked_attention(mask: [f32; 6]) -> (Vec<f64>, [Vec<f64>; 3]) {
+        let q = Tensor::from_slice(&[0.3f64, -0.2, 0.5, 0.1], &[1, 1, 2, 2]).unwrap();
+        let k = Tensor::from_slice(&[0.1f64, 0.4, -0.3, 0.2, 0.6, -0.5], &[1, 1, 3, 2]).unwrap();
+        let v = Tensor::from_slice(&[1.0f64, 2.0, 4.0], &[1, 1, 3, 1]).unwrap();
+        let mask = Tensor::from_slice(&mask, &[1, 1, 2, 3]).unwrap();
+        let op = Attention {
+            causal: false,
+            ..Attention::causal()
+        };
+        let inputs = [&q, &k, &v, &mask];
+        let y = Reference.forward(&op, &inputs).unwrap();
+        let g = Tensor::from_slice(&[1.0f64, 1.0], &[1, 1, 2, 1]).unwrap();
+        let grads = Reference.backward(&op, &inputs, &g).unwrap();
+        assert!(grads[3].is_none());
+        let grad = |i: usize| grads[i].as_ref().unwrap().to_vec::<f64>().unwrap();
+        (y.to_vec::<f64>().unwrap(), [grad(0), grad(1), grad(2)])
+    }
+
+    #[test]
+    fn a_query_whose_keys_are_all_masked_gives_zeros_and_no_gradient() {
+        let ninf = f32::NEG_INFINITY;
+        let (y, [gq, gk, gv]) = masked_attention([ninf, ninf, ninf, 0.0, ninf, 0.0]);
+        assert_eq!(y[0], 0.0);
+        assert_eq!(&gq[..2], &[0.0, 0.0]);
+        assert!(
+            y.iter()
+                .chain(&gq)
+                .chain(&gk)
+                .chain(&gv)
+                .all(|v| v.is_finite())
+        );
+        // The second query reads keys 0 and 2 only: key 1 receives nothing.
+        assert_eq!(&gk[2..4], &[0.0, 0.0]);
+        assert_eq!(gv[1], 0.0);
+    }
+
+    #[test]
+    fn a_query_whose_keys_are_all_at_f32_min_averages_the_values() {
+        let min = f32::MIN;
+        let (y, [gq, ..]) = masked_attention([min, min, min, 0.0, 0.0, 0.0]);
+        assert!((y[0] - 7.0 / 3.0).abs() < 1e-15, "{}", y[0]);
+        // The softmax still has a derivative there.
+        assert!(gq[..2].iter().any(|&g| g != 0.0));
+    }
+
+    #[test]
+    fn a_gradient_of_the_wrong_shape_is_an_error() {
+        let a = Tensor::from_slice(&[1.0f64; 6], &[2, 3]).unwrap();
+        let b = Tensor::from_slice(&[1.0f64; 12], &[3, 4]).unwrap();
+        let g = Tensor::from_slice(&[1.0f64; 6], &[2, 3]).unwrap();
+        assert!(
+            Reference
+                .backward(&kapel_ops::Matmul, &[&a, &b], &g)
+                .is_err()
+        );
+        let g = Tensor::from_slice(&[1u32; 8], &[2, 4]).unwrap();
+        assert!(
+            Reference
+                .backward(&kapel_ops::Matmul, &[&a, &b], &g)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_cast_to_or_from_an_integer_passes_no_gradient() {
+        let x = Tensor::from_slice(&[1i8, 2], &[2]).unwrap();
+        let g = Tensor::from_slice(&[1.0f32, 1.0], &[2]).unwrap();
+        let cast = kapel_ops::Cast { dtype: DType::F32 };
+        let grads = Reference.backward(&cast, &[&x], &g).unwrap();
+        assert!(grads.len() == 1 && grads[0].is_none());
+        let x = Tensor::from_slice(&[1.0f32, 2.0], &[2]).unwrap();
+        let cast = kapel_ops::Cast { dtype: DType::I8 };
+        let grads = Reference.backward(&cast, &[&x], &g).unwrap();
+        assert!(grads.len() == 1 && grads[0].is_none());
     }
 
     #[test]

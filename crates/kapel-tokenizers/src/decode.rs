@@ -1,11 +1,24 @@
 //! Decoders: from tokens back to text.
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use serde_json::Value;
 
 use crate::text::{Pattern, bytes_to_chars};
 use crate::{TokenizerError, bad, str_field};
+
+/// The inverse of GPT-2's map from bytes to characters, built once.
+fn chars_to_bytes() -> &'static HashMap<char, u8> {
+    static MAP: OnceLock<HashMap<char, u8>> = OnceLock::new();
+    MAP.get_or_init(|| {
+        bytes_to_chars()
+            .iter()
+            .zip(0..=255u8)
+            .map(|(&c, b)| (c, b))
+            .collect()
+    })
+}
 
 /// A decoder of `tokenizer.json`: it turns the list of token strings into another
 /// list, joined at the end.
@@ -29,7 +42,11 @@ pub(crate) enum Decoder {
 
 impl Decoder {
     pub(crate) fn from_json(json: &Value) -> Result<Self, TokenizerError> {
-        let count = |key: &str| json.get(key).and_then(Value::as_u64).unwrap_or(0) as usize;
+        let count = |key: &str| {
+            json.get(key)
+                .and_then(Value::as_u64)
+                .map_or(0, |n| usize::try_from(n).unwrap_or(usize::MAX))
+        };
         Ok(match str_field(json, "type")? {
             "ByteLevel" => Self::ByteLevel,
             "Metaspace" => Self::Metaspace {
@@ -74,19 +91,14 @@ impl Decoder {
     pub(crate) fn apply(&self, tokens: Vec<String>) -> Vec<String> {
         match self {
             Self::ByteLevel => {
-                let to_byte: HashMap<char, u8> = bytes_to_chars()
-                    .iter()
-                    .enumerate()
-                    .map(|(b, &c)| (c, b as u8))
-                    .collect();
-                let bytes: Vec<u8> = tokens
-                    .iter()
-                    .flat_map(|t| t.chars())
-                    .flat_map(|c| match to_byte.get(&c) {
-                        Some(&b) => vec![b],
-                        None => c.to_string().into_bytes(),
-                    })
-                    .collect();
+                let to_byte = chars_to_bytes();
+                let mut bytes: Vec<u8> = Vec::new();
+                for c in tokens.iter().flat_map(|t| t.chars()) {
+                    match to_byte.get(&c) {
+                        Some(&b) => bytes.push(b),
+                        None => bytes.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes()),
+                    }
+                }
                 vec![String::from_utf8_lossy(&bytes).into_owned()]
             }
             Self::Metaspace {

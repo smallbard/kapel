@@ -105,7 +105,7 @@ impl Operation for Binary {
             });
         }
         Ok(Signature {
-            shape: shape::broadcast(inputs[0].shape(), inputs[1].shape())?,
+            shape: shape::broadcast(Self::NAME, inputs[0].shape(), inputs[1].shape())?,
             dtype: inputs[0].dtype(),
         })
     }
@@ -142,8 +142,9 @@ impl Operation for Affine {
 }
 
 /// Converts each element to another scalar type, as [`DType::encode`] does:
-/// floats round to nearest, ties to even; integers round and saturate. The
-/// gradient passes through unchanged.
+/// floats round to nearest, ties to even; integers round and saturate. Between
+/// float types, the gradient passes through unchanged; an integer input or
+/// output receives none.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Cast {
     /// The target type.

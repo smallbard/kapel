@@ -11,7 +11,7 @@ use crate::array::{Array, broadcast_map, sum_to};
 fn product(a: &Array, b: &Array) -> Result<Array> {
     let (ra, rb) = (a.shape.len(), b.shape.len());
     let (m, k, n) = (a.shape[ra - 2], a.shape[ra - 1], b.shape[rb - 1]);
-    let batch = shape::broadcast(&a.shape[..ra - 2], &b.shape[..rb - 2])?;
+    let batch = shape::broadcast(Matmul::NAME, &a.shape[..ra - 2], &b.shape[..rb - 2])?;
     let (map_a, map_b) = (
         broadcast_map(&a.shape[..ra - 2], &batch),
         broadcast_map(&b.shape[..rb - 2], &batch),
@@ -47,7 +47,7 @@ impl Run<Matmul> for Reference {
         inputs: &[&Tensor],
         grad: &Tensor,
     ) -> Result<Vec<Option<Tensor>>> {
-        op.infer(inputs)?;
+        op.infer_backward(inputs, grad)?;
         let (a, b, g) = (
             Array::of(inputs[0])?,
             Array::of(inputs[1])?,
@@ -68,11 +68,14 @@ impl Run<QuantizedMatmul> for Reference {
         let (x, w) = (Array::of(inputs[0])?, Array::of(inputs[1])?);
         let (n, k) = (w.shape[0], w.shape[1]);
         let mut out = Array::zeros(&signature.shape);
-        for (row, y) in x.data.chunks(k).zip(out.data.chunks_mut(n)) {
-            for (j, y) in y.iter_mut().enumerate() {
-                *y = row
+        // Indexed rather than chunked: any of the sizes may be 0.
+        let rows: usize = x.shape[..x.shape.len() - 1].iter().product();
+        for r in 0..rows {
+            let row = &x.data[r * k..][..k];
+            for j in 0..n {
+                out.data[r * n + j] = row
                     .iter()
-                    .zip(&w.data[j * k..(j + 1) * k])
+                    .zip(&w.data[j * k..][..k])
                     .map(|(a, b)| a * b)
                     .sum();
             }
@@ -87,7 +90,7 @@ impl Run<QuantizedMatmul> for Reference {
         inputs: &[&Tensor],
         grad: &Tensor,
     ) -> Result<Vec<Option<Tensor>>> {
-        op.infer(inputs)?;
+        op.infer_backward(inputs, grad)?;
         let (x, w, g) = (
             Array::of(inputs[0])?,
             Array::of(inputs[1])?,
@@ -95,9 +98,13 @@ impl Run<QuantizedMatmul> for Reference {
         );
         let (n, k) = (w.shape[0], w.shape[1]);
         let mut gx = Array::zeros(&x.shape);
-        for (gy, gx) in g.data.chunks(n).zip(gx.data.chunks_mut(k)) {
-            for (j, &gy) in gy.iter().enumerate() {
-                for (gx, &w) in gx.iter_mut().zip(&w.data[j * k..(j + 1) * k]) {
+        // Indexed rather than chunked: any of the sizes may be 0.
+        let rows: usize = x.shape[..x.shape.len() - 1].iter().product();
+        for r in 0..rows {
+            let gx = &mut gx.data[r * k..][..k];
+            for j in 0..n {
+                let gy = g.data[r * n + j];
+                for (gx, &w) in gx.iter_mut().zip(&w.data[j * k..][..k]) {
                     *gx += gy * w;
                 }
             }

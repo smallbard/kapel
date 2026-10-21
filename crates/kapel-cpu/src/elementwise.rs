@@ -3,12 +3,52 @@
 use std::f32::consts::PI;
 use std::sync::Arc;
 
-use kapel_core::{HostStorage, Layout, Result, Tensor};
+use kapel_core::{Error, HostStorage, Layout, Result, Tensor};
 use kapel_ops::{Affine, Binary, BinaryKind, Cast, Operation, Run, Unary, UnaryKind};
 
 use crate::backend::{CHUNK, Cpu};
 use crate::io::{self, broadcast_offsets};
 use crate::math;
+
+/// Refuses, before any work starts, a function this backend does not know:
+/// the enumerations of `kapel-ops` may grow.
+fn check_unary(kind: UnaryKind) -> Result<()> {
+    match kind {
+        UnaryKind::Neg
+        | UnaryKind::Exp
+        | UnaryKind::Log
+        | UnaryKind::Sqrt
+        | UnaryKind::Rsqrt
+        | UnaryKind::Square
+        | UnaryKind::Abs
+        | UnaryKind::Sigmoid
+        | UnaryKind::Tanh
+        | UnaryKind::Relu
+        | UnaryKind::Silu
+        | UnaryKind::GeluTanh
+        | UnaryKind::GeluErf => Ok(()),
+        kind => Err(Error::InvalidArgument {
+            op: Unary::NAME,
+            message: format!("the CPU backend does not implement {kind:?}"),
+        }),
+    }
+}
+
+/// As [`check_unary`], for binary functions.
+fn check_binary(kind: BinaryKind) -> Result<()> {
+    match kind {
+        BinaryKind::Add
+        | BinaryKind::Sub
+        | BinaryKind::Mul
+        | BinaryKind::Div
+        | BinaryKind::Max
+        | BinaryKind::Min => Ok(()),
+        kind => Err(Error::InvalidArgument {
+            op: Binary::NAME,
+            message: format!("the CPU backend does not implement {kind:?}"),
+        }),
+    }
+}
 
 fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
@@ -32,7 +72,7 @@ fn unary_value(kind: UnaryKind, x: f32) -> f32 {
             0.5 * x * (1.0 + (c * (x + 0.044_715 * x * x * x)).tanh())
         }
         UnaryKind::GeluErf => (f64::from(x) * kapel_ops::special::normal_cdf(f64::from(x))) as f32,
-        _ => unimplemented!("unary function {kind:?}"),
+        _ => unreachable!("refused by `check_unary`"),
     }
 }
 
@@ -73,13 +113,14 @@ fn unary_derivative(kind: UnaryKind, x: f32) -> f32 {
             let phi = (-0.5 * x * x).exp() / (2.0 * std::f64::consts::PI).sqrt();
             (kapel_ops::special::normal_cdf(x) + x * phi) as f32
         }
-        _ => unimplemented!("unary function {kind:?}"),
+        _ => unreachable!("refused by `check_unary`"),
     }
 }
 
 impl Run<Unary> for Cpu {
     fn forward(&self, op: &Unary, inputs: &[&Tensor]) -> Result<Tensor> {
         let signature = op.infer(inputs)?;
+        check_unary(op.kind)?;
         let x = io::contiguous(Unary::NAME, inputs[0])?;
         let mut out = vec![0.0; x.len()];
         let isa = self.isa;
@@ -107,7 +148,8 @@ impl Run<Unary> for Cpu {
         inputs: &[&Tensor],
         grad: &Tensor,
     ) -> Result<Vec<Option<Tensor>>> {
-        let signature = op.infer(inputs)?;
+        let signature = op.infer_backward(inputs, grad)?;
+        check_unary(op.kind)?;
         let x = io::contiguous(Unary::NAME, inputs[0])?;
         let g = io::contiguous(Unary::NAME, grad)?;
         let mut out = vec![0.0; x.len()];
@@ -144,7 +186,7 @@ fn binary(kind: BinaryKind, a: f32, b: f32) -> (f32, f32, f32) {
         BinaryKind::Max => (b, 0.0, 1.0),
         BinaryKind::Min if a <= b => (a, 1.0, 0.0),
         BinaryKind::Min => (b, 0.0, 1.0),
-        _ => unimplemented!("binary function {kind:?}"),
+        _ => unreachable!("refused by `check_binary`"),
     }
 }
 
@@ -161,6 +203,7 @@ fn reduce_to(full: &[f32], offsets: &[usize], len: usize) -> Vec<f32> {
 impl Run<Binary> for Cpu {
     fn forward(&self, op: &Binary, inputs: &[&Tensor]) -> Result<Tensor> {
         let signature = op.infer(inputs)?;
+        check_binary(op.kind)?;
         let (a, b) = (
             io::strided(Binary::NAME, inputs[0])?,
             io::strided(Binary::NAME, inputs[1])?,
@@ -184,21 +227,20 @@ impl Run<Binary> for Cpu {
         inputs: &[&Tensor],
         grad: &Tensor,
     ) -> Result<Vec<Option<Tensor>>> {
-        let signature = op.infer(inputs)?;
+        let signature = op.infer_backward(inputs, grad)?;
+        check_binary(op.kind)?;
         let g = io::contiguous(Binary::NAME, grad)?;
+        let (a, b) = (
+            io::strided(Binary::NAME, inputs[0])?,
+            io::strided(Binary::NAME, inputs[1])?,
+        );
+        let (ia, ib) = (
+            broadcast_offsets(&a.layout, &signature.shape)?,
+            broadcast_offsets(&b.layout, &signature.shape)?,
+        );
         let mut grads = Vec::new();
-        for side in 0..2 {
+        for (side, input) in inputs.iter().take(2).enumerate() {
             // Each input's gradient, computed at full size, then summed back.
-            let x = io::contiguous(Binary::NAME, inputs[side])?;
-            let compact = Layout::contiguous(inputs[side].shape())?;
-            let (a, b) = (
-                io::strided(Binary::NAME, inputs[0])?,
-                io::strided(Binary::NAME, inputs[1])?,
-            );
-            let (ia, ib) = (
-                broadcast_offsets(&a.layout, &signature.shape)?,
-                broadcast_offsets(&b.layout, &signature.shape)?,
-            );
             let mut full = vec![0.0; g.len()];
             self.fill(&mut full, CHUNK, |start, part| {
                 for (n, y) in part.iter_mut().enumerate() {
@@ -207,19 +249,21 @@ impl Run<Binary> for Cpu {
                     *y = g[at] * if side == 0 { da } else { db };
                 }
             });
-            let values = if inputs[side].shape() == signature.shape.as_slice() {
+            let shape = input.shape();
+            let values = if shape == signature.shape.as_slice() {
                 full
             } else {
+                let compact = Layout::contiguous(shape)?;
                 reduce_to(
                     &full,
                     &broadcast_offsets(&compact, &signature.shape)?,
-                    x.len(),
+                    compact.numel(),
                 )
             };
             grads.push(Some(io::write(
                 &self.buffers,
                 &values,
-                inputs[side].shape(),
+                shape,
                 signature.dtype,
             )?));
         }
@@ -247,7 +291,7 @@ impl Run<Affine> for Cpu {
         inputs: &[&Tensor],
         grad: &Tensor,
     ) -> Result<Vec<Option<Tensor>>> {
-        let signature = op.infer(inputs)?;
+        let signature = op.infer_backward(inputs, grad)?;
         let g = io::contiguous(Affine::NAME, grad)?;
         let scale = op.scale as f32;
         let out: Vec<f32> = g.iter().map(|g| scale * g).collect();
@@ -287,16 +331,14 @@ impl Run<Cast> for Cpu {
         inputs: &[&Tensor],
         grad: &Tensor,
     ) -> Result<Vec<Option<Tensor>>> {
-        op.infer(inputs)?;
-        if !op.differentiable(0) {
+        op.infer_backward(inputs, grad)?;
+        // Between float types the gradient passes through, converted to the
+        // input's type; an integer input or output receives none.
+        let dtype = inputs[0].dtype();
+        if !op.differentiable(0) || !dtype.is_float() {
             return Ok(vec![None]);
         }
         let g = io::contiguous(Cast::NAME, grad)?;
-        let dtype = if inputs[0].dtype().is_float() {
-            inputs[0].dtype()
-        } else {
-            grad.dtype()
-        };
         io::supported(Cast::NAME, dtype)?;
         Ok(vec![Some(io::write(
             &self.buffers,

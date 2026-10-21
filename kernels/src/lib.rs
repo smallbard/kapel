@@ -10,6 +10,13 @@
 //!
 //! The arguments passed by value are defined in `kapel-cuda-abi`. A slice
 //! argument becomes two kernel parameters: its device pointer, then its length.
+//!
+//! Positions are `u32`: the backend refuses any launch with more than
+//! `u32::MAX` threads or a slice longer than `u32::MAX` elements. Reads go
+//! through bounds-checked indexing. Writes go through `DisjointSlice::get_mut`
+//! at the thread's own index, or, where a thread writes a whole line or row,
+//! through its raw pointer once the line's last position has been checked
+//! against the slice's length.
 
 // Kernels index explicitly: the indexing is the memory access each thread makes.
 #![allow(clippy::needless_range_loop, clippy::too_many_arguments)]
@@ -286,7 +293,7 @@ pub fn spread(g: &[f32], owner: &[u32], scale: f32, mut out: DisjointSlice<f32>)
 pub fn line_max(x: &[f32], starts: &[u32], step: u32, len: u32, mut value: DisjointSlice<f32>, mut at: DisjointSlice<u32>) {
     let idx = thread::index_1d();
     let l = idx.get();
-    if l < starts.len() {
+    if l < starts.len() && l < value.len() && l < at.len() {
         let start = starts[l];
         let mut best = start;
         for i in 1..len {
@@ -295,7 +302,8 @@ pub fn line_max(x: &[f32], starts: &[u32], step: u32, len: u32, mut value: Disjo
                 best = p;
             }
         }
-        // SAFETY: one thread per line, and each line has its own slot.
+        // SAFETY: `l` is below both lengths (checked above), and it is this
+        // thread's own index: no other thread writes slot `l`.
         unsafe {
             *value.as_mut_ptr().add(l) = x[best as usize];
             *at.as_mut_ptr().add(l) = best;
@@ -304,15 +312,33 @@ pub fn line_max(x: &[f32], starts: &[u32], step: u32, len: u32, mut value: Disjo
 }
 
 /// `out[at[l]] = g[l]` for every line; `out` starts at zero.
+///
+/// The positions in `at` must be distinct: the backend passes those that
+/// `line_max` found, each inside its own line, and lines do not overlap.
 #[kernel]
 #[launch_bounds(256)]
 pub fn place(g: &[f32], at: &[u32], mut out: DisjointSlice<f32>) {
     let idx = thread::index_1d();
     let l = idx.get();
     if l < at.len() {
-        // SAFETY: the positions of distinct lines are distinct elements.
-        unsafe { *out.as_mut_ptr().add(at[l] as usize) = g[l] };
+        let p = at[l] as usize;
+        if p < out.len() {
+            // SAFETY: `p` is in bounds (checked above), and no other thread
+            // writes it: the positions in `at` are distinct (see above).
+            unsafe { *out.as_mut_ptr().add(p) = g[l] };
+        }
     }
+}
+
+/// Whether the line of `len` elements `step` apart from `start` lies within a
+/// slice of `bound` elements, its positions computed in `u32` without
+/// wrapping.
+fn line_fits(start: u32, step: u32, len: u32, bound: usize) -> bool {
+    if len == 0 {
+        return true;
+    }
+    let last = start as usize + (len as usize - 1) * step as usize;
+    last < bound && last <= u32::MAX as usize
 }
 
 /// Softmax (`log` = 0) or log-softmax (`log` = 1) of every line, one thread per
@@ -322,7 +348,7 @@ pub fn place(g: &[f32], at: &[u32], mut out: DisjointSlice<f32>) {
 pub fn softmax_lines(log: u32, x: &[f32], starts: &[u32], step: u32, len: u32, mut out: DisjointSlice<f32>) {
     let idx = thread::index_1d();
     let l = idx.get();
-    if l < starts.len() {
+    if l < starts.len() && line_fits(starts[l], step, len, out.len()) {
         let start = starts[l];
         let mut max = f32::NEG_INFINITY;
         for i in 0..len {
@@ -339,7 +365,9 @@ pub fn softmax_lines(log: u32, x: &[f32], starts: &[u32], step: u32, len: u32, m
         for i in 0..len {
             let p = (start + i * step) as usize;
             let y = if log == 1 { x[p] - max - log_total } else { (x[p] - max).exp() / total };
-            // SAFETY: the elements of a line belong to it alone.
+            // SAFETY: `p` is on the line, which lies within `out` (checked
+            // above). The lines of the backend's `starts` do not overlap, and
+            // each is written by its own thread alone.
             unsafe { *out.as_mut_ptr().add(p) = y };
         }
     }
@@ -360,7 +388,7 @@ pub fn softmax_lines_backward(
 ) {
     let idx = thread::index_1d();
     let l = idx.get();
-    if l < starts.len() {
+    if l < starts.len() && line_fits(starts[l], step, len, out.len()) {
         let start = starts[l];
         let mut max = f32::NEG_INFINITY;
         for i in 0..len {
@@ -385,7 +413,8 @@ pub fn softmax_lines_backward(
             let p = (start + i * step) as usize;
             let y = (x[p] - max).exp() / total;
             let value = if log == 1 { g[p] - y * g_total } else { y * (g[p] - dot) };
-            // SAFETY: as in `softmax_lines`.
+            // SAFETY: as in `softmax_lines`: in bounds (checked above), and
+            // the line is this thread's alone.
             unsafe { *out.as_mut_ptr().add(p) = value };
         }
     }
@@ -399,8 +428,8 @@ pub fn norm_rows(rms: u32, x: &[f32], w: &[f32], b: &[f32], offset: f32, eps: f3
     let idx = thread::index_1d();
     let row = idx.get();
     let width = width as usize;
-    if row * width < x.len() {
-        let start = row * width;
+    let start = row * width;
+    if width > 0 && start + width <= x.len() && start + width <= out.len() {
         let mut mean = 0.0f32;
         if rms == 0 {
             for c in 0..width {
@@ -416,7 +445,8 @@ pub fn norm_rows(rms: u32, x: &[f32], w: &[f32], b: &[f32], offset: f32, eps: f3
         let inv = 1.0 / (squares / width as f32 + eps).sqrt();
         for c in 0..width {
             let hat = (x[start + c] - mean) * inv;
-            // SAFETY: each row is written by its own thread.
+            // SAFETY: `start + c < start + width ≤ out.len()` (checked
+            // above), and row `row` is written by this thread alone.
             unsafe { *out.as_mut_ptr().add(start + c) = hat * (offset + w[c]) + b[c] };
         }
     }
@@ -442,8 +472,9 @@ pub fn norm_rows_backward(
     let idx = thread::index_1d();
     let row = idx.get();
     let width = width as usize;
-    if row * width < x.len() {
-        let start = row * width;
+    let start = row * width;
+    let end = start + width;
+    if width > 0 && end <= x.len() && end <= gx.len() && end <= gw_rows.len() && end <= gb_rows.len() {
         let n = width as f32;
         let mut mean = 0.0f32;
         if rms == 0 {
@@ -473,7 +504,8 @@ pub fn norm_rows_backward(
         for c in 0..width {
             let hat = (x[start + c] - mean) * inv;
             let gh = g[start + c] * (offset + w[c]);
-            // SAFETY: each row is written by its own thread.
+            // SAFETY: `start + c < end`, within the three outputs (checked
+            // above), and row `row` is written by this thread alone.
             unsafe {
                 *gx.as_mut_ptr().add(start + c) = inv * (gh - mean_gh - hat * mean_ghh);
                 *gw_rows.as_mut_ptr().add(start + c) = g[start + c] * hat;

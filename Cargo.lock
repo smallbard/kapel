@@ -807,7 +807,9 @@ version = "0.1.0"
 name = "kapel-tokenizers"
 version = "0.1.0"
 dependencies = [
+ "aho-corasick",
  "fancy-regex",
+ "libc",
  "minijinja",
  "minijinja-contrib",
  "serde_json",

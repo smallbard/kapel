@@ -34,3 +34,7 @@ required-features = ["cuda"]
 [[example]]
 name = "attention"
 required-features = ["cuda"]
+
+[[example]]
+name = "reductions"
+required-features = ["cuda"]

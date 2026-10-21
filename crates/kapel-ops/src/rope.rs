@@ -175,6 +175,79 @@ impl Rope {
     }
 }
 
+impl Rope {
+    /// Checks that the frequencies of `r` rotated components are finite and
+    /// positive.
+    fn check_parameters(&self, r: usize) -> Result<()> {
+        let invalid = |message: String| {
+            Err(Error::InvalidArgument {
+                op: Self::NAME,
+                message,
+            })
+        };
+        let positive = |what: &str, value: f64| {
+            if value.is_finite() && value > 0.0 {
+                Ok(())
+            } else {
+                invalid(format!("{what} must be finite and positive, got {value}"))
+            }
+        };
+        positive("theta", self.theta)?;
+        match self.scaling {
+            RopeScaling::None => {}
+            RopeScaling::Linear { factor } => positive("factor", factor)?,
+            RopeScaling::Ntk { factor } => {
+                positive("factor", factor)?;
+                if r <= 2 {
+                    return invalid(format!(
+                        "NTK scaling needs more than 2 rotated components, got {r}"
+                    ));
+                }
+            }
+            RopeScaling::Llama3 {
+                factor,
+                low_freq_factor,
+                high_freq_factor,
+                original_max_position,
+            } => {
+                positive("factor", factor)?;
+                positive("low_freq_factor", low_freq_factor)?;
+                positive("high_freq_factor", high_freq_factor)?;
+                if high_freq_factor <= low_freq_factor {
+                    return invalid(format!(
+                        "high_freq_factor ({high_freq_factor}) must exceed low_freq_factor \
+                         ({low_freq_factor})"
+                    ));
+                }
+                if original_max_position == 0 {
+                    return invalid("original_max_position must be positive".into());
+                }
+            }
+            RopeScaling::Yarn {
+                factor,
+                original_max_position,
+                beta_fast,
+                beta_slow,
+                attention_factor,
+            } => {
+                positive("factor", factor)?;
+                positive("beta_fast", beta_fast)?;
+                positive("beta_slow", beta_slow)?;
+                if let Some(s) = attention_factor {
+                    positive("attention_factor", s)?;
+                }
+                if self.theta <= 1.0 {
+                    return invalid(format!("YaRN needs theta above 1, got {}", self.theta));
+                }
+                if original_max_position == 0 {
+                    return invalid("original_max_position must be positive".into());
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Operation for Rope {
     const NAME: &'static str = "rope";
 
@@ -193,9 +266,11 @@ impl Operation for Rope {
                 message: format!("{r} rotated components: need an even number, at most {d}"),
             });
         }
+        self.check_parameters(r)?;
         let lead = &x.shape()[..x.rank() - 1];
-        if shape::broadcast(positions.shape(), lead)? != lead {
+        if shape::broadcast(op, positions.shape(), lead)? != lead {
             return Err(Error::BroadcastIncompatible {
+                op,
                 from: positions.shape().to_vec(),
                 to: lead.to_vec(),
             });

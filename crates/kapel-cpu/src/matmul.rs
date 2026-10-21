@@ -9,7 +9,7 @@ use crate::io::{self, Strided};
 
 /// The matrix of batch `index` of a strided tensor `[…, R, C]`, broadcast to the
 /// batch shape `batch`.
-fn matrix<'a>(input: &'a Strided<'_>, batch: &[usize], index: usize) -> Matrix<'a> {
+fn matrix<'a>(input: &'a Strided<'_>, batch: &[usize], index: usize) -> Result<Matrix<'a>> {
     let layout = &input.layout;
     let rank = layout.rank();
     let (strides, shape) = (layout.strides(), layout.shape());
@@ -24,13 +24,14 @@ fn matrix<'a>(input: &'a Strided<'_>, batch: &[usize], index: usize) -> Matrix<'
             offset += coordinate * strides[d - lead];
         }
     }
-    Matrix {
-        data: &input.data[offset..],
-        rows: shape[rank - 2],
-        cols: shape[rank - 1],
-        row_stride: strides[rank - 2],
-        col_stride: strides[rank - 1],
-    }
+    // An empty tensor may have an offset at the end of its data.
+    Matrix::strided(
+        input.data.get(offset..).unwrap_or_default(),
+        shape[rank - 2],
+        shape[rank - 1],
+        strides[rank - 2],
+        strides[rank - 1],
+    )
 }
 
 /// For each batch element of the output, the batch element of an input of
@@ -53,9 +54,11 @@ impl Run<Matmul> for Cpu {
         let batch = &signature.shape[..rank - 2];
         let (m, n) = (signature.shape[rank - 2], signature.shape[rank - 1]);
         let count: usize = batch.iter().product();
+        let pairs = (0..count)
+            .map(|t| Ok((matrix(&a, batch, t)?, matrix(&b, batch, t)?)))
+            .collect::<Result<Vec<_>>>()?;
         io::output(&self.buffers, &signature.shape, signature.dtype, |out| {
-            for (t, c) in out.chunks_mut((m * n).max(1)).enumerate().take(count) {
-                let (left, right) = (matrix(&a, batch, t), matrix(&b, batch, t));
+            for (c, &(left, right)) in out.chunks_mut((m * n).max(1)).zip(&pairs) {
                 gemm::gemm(&self.pool, self.isa, left, right, c, false);
             }
         })
@@ -69,7 +72,7 @@ impl Run<Matmul> for Cpu {
         inputs: &[&Tensor],
         grad: &Tensor,
     ) -> Result<Vec<Option<Tensor>>> {
-        let signature = op.infer(inputs)?;
+        let signature = op.infer_backward(inputs, grad)?;
         let (a, b) = (
             io::strided(Matmul::NAME, inputs[0])?,
             io::strided(Matmul::NAME, inputs[1])?,
@@ -90,9 +93,9 @@ impl Run<Matmul> for Cpu {
                 let c = &mut out[target * rows * cols..(target + 1) * rows * cols];
                 let accumulate = std::mem::replace(&mut written[target], true);
                 let (left, right) = if side == 0 {
-                    (matrix(&g, batch, t), matrix(&b, batch, t).t())
+                    (matrix(&g, batch, t)?, matrix(&b, batch, t)?.t())
                 } else {
-                    (matrix(&a, batch, t).t(), matrix(&g, batch, t))
+                    (matrix(&a, batch, t)?.t(), matrix(&g, batch, t)?)
                 };
                 gemm::gemm(&self.pool, self.isa, left, right, c, accumulate);
             }
@@ -105,6 +108,13 @@ impl Run<Matmul> for Cpu {
         }
         Ok(grads)
     }
+}
+
+/// The number of rows of `x [..., K]`: the product of its leading
+/// dimensions, which `x.len() / K` cannot give when a dimension is zero.
+fn leading_rows(x: &Tensor) -> usize {
+    let shape = x.shape();
+    shape[..shape.len() - 1].iter().product()
 }
 
 /// The weights `[N, K]` dequantized to `f32`, row by row in parallel.
@@ -144,13 +154,13 @@ impl Run<QuantizedMatmul> for Cpu {
         let x = io::contiguous(QuantizedMatmul::NAME, inputs[0])?;
         let w = dequantized(self, inputs[1])?;
         let (n, k) = (inputs[1].shape()[0], inputs[1].shape()[1]);
-        let rows = x.len() / k.max(1);
+        let rows = leading_rows(inputs[0]);
         let mut out = vec![0.0; rows * n];
         gemm::gemm(
             &self.pool,
             self.isa,
-            Matrix::new(&x, rows, k),
-            Matrix::new(&w, n, k).t(),
+            Matrix::new(&x, rows, k)?,
+            Matrix::new(&w, n, k)?.t(),
             &mut out,
             false,
         );
@@ -163,17 +173,17 @@ impl Run<QuantizedMatmul> for Cpu {
         inputs: &[&Tensor],
         grad: &Tensor,
     ) -> Result<Vec<Option<Tensor>>> {
-        let signature = op.infer(inputs)?;
+        let signature = op.infer_backward(inputs, grad)?;
         let g = io::contiguous(QuantizedMatmul::NAME, grad)?;
         let w = dequantized(self, inputs[1])?;
         let (n, k) = (inputs[1].shape()[0], inputs[1].shape()[1]);
-        let rows = g.len() / n.max(1);
+        let rows = leading_rows(inputs[0]);
         let mut out = vec![0.0; rows * k];
         gemm::gemm(
             &self.pool,
             self.isa,
-            Matrix::new(&g, rows, n),
-            Matrix::new(&w, n, k),
+            Matrix::new(&g, rows, n)?,
+            Matrix::new(&w, n, k)?,
             &mut out,
             false,
         );

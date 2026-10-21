@@ -13,3 +13,9 @@ done
 cp "$data/gpt2/tokenizer.json" corpus/tokenizer_json/gpt2.json 2>/dev/null || true
 cp "$data/gguf/quants.gguf" corpus/gguf/ 2>/dev/null || true
 printf 'Hello world' > corpus/tokenizer_encode/hello
+# Inputs that once crashed a target (see README.md).
+for t in regressions/*/; do
+  n=$(basename "$t")
+  mkdir -p "corpus/$n"
+  cp "$t"* "corpus/$n/"
+done

@@ -295,10 +295,7 @@ mod tests {
     use super::*;
 
     fn isas() -> Vec<Isa> {
-        [Isa::Scalar, Isa::Avx2, Isa::Avx512]
-            .into_iter()
-            .filter(|isa| isa.available())
-            .collect()
+        Isa::all_available().collect()
     }
 
     #[test]

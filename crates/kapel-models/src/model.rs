@@ -91,25 +91,33 @@ impl Model {
     /// Writes the model to `dir` in the layout of the Hub: `config.json` and
     /// `model.safetensors`, which `transformers` loads back.
     ///
+    /// `dir` may be the directory the model was loaded from: each file is
+    /// written under a temporary name and renamed into place
+    /// ([`kapel_hub::write_atomic`]), so the weights mapped from the old file
+    /// stay valid. A `model.safetensors.index.json` in `dir` would take
+    /// precedence over the new `model.safetensors` when loading: it is removed
+    /// once the weights are written (the shards it listed are left).
+    ///
     /// # Errors
     ///
     /// If the directory or the files cannot be written.
     pub fn save(&self, dir: impl AsRef<std::path::Path>) -> Result<()> {
         let dir = dir.as_ref();
-        let io = |e: std::io::Error| {
-            ModelError::Hub(kapel_hub::HubError::Io {
-                path: dir.to_path_buf(),
-                source: e,
-            })
+        let io = |path: std::path::PathBuf, source: std::io::Error| {
+            ModelError::Hub(kapel_hub::HubError::Io { path, source })
         };
-        std::fs::create_dir_all(dir).map_err(io)?;
-        let json = serde_json::to_string_pretty(&self.raw_config).expect("a JSON value serializes");
-        std::fs::write(dir.join("config.json"), json).map_err(io)?;
+        std::fs::create_dir_all(dir).map_err(|e| io(dir.to_path_buf(), e))?;
+        let json = serde_json::to_vec_pretty(&self.raw_config).expect("a JSON value serializes");
+        kapel_hub::write_atomic(dir.join("config.json"), |w| w.write_all(&json))?;
         let tensors: Vec<(&str, &Tensor)> =
             self.weights.iter().map(|(n, t)| (n.as_str(), t)).collect();
         let metadata = BTreeMap::from([("format".to_string(), "pt".to_string())]);
         kapel_hub::safetensors::save(dir.join("model.safetensors"), &tensors, &metadata)?;
-        Ok(())
+        let index = dir.join("model.safetensors.index.json");
+        match std::fs::remove_file(&index) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(io(index, e)),
+            _ => Ok(()),
+        }
     }
 
     fn weight(&self, name: &str) -> Result<&Tensor> {
@@ -377,5 +385,63 @@ impl Model {
                 bias,
             )?
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `resave d d`: a model saved over the directory it was loaded from.
+    #[test]
+    fn a_model_saves_over_its_own_directory() {
+        let dir = std::env::temp_dir().join(format!("kapel-model-resave-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = serde_json::json!({
+            "model_type": "llama", "hidden_size": 8, "num_attention_heads": 2,
+            "num_hidden_layers": 1, "vocab_size": 10, "intermediate_size": 16,
+        });
+        std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+        let embed: Vec<f32> = (0..80).map(|i| i as f32 / 8.0).collect();
+        let norm = vec![1.0f32; 8];
+        let tensors = [
+            Tensor::from_slice(&embed, &[10, 8]).unwrap(),
+            Tensor::from_slice(&norm, &[8]).unwrap(),
+        ];
+        kapel_hub::safetensors::save(
+            dir.join("model.safetensors"),
+            &[
+                ("model.embed_tokens.weight", &tensors[0]),
+                ("model.norm.weight", &tensors[1]),
+            ],
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let model = Model::load(&Checkpoint::open(&dir).unwrap()).unwrap();
+        // A stale index of shards would hide the saved weights: it goes.
+        std::fs::write(
+            dir.join("model.safetensors.index.json"),
+            r#"{"weight_map": {}}"#,
+        )
+        .unwrap();
+        for _ in 0..2 {
+            model.save(&dir).unwrap();
+            // The weights mapped from the replaced file still read.
+            let embed_again = model.weight("model.embed_tokens.weight").unwrap();
+            assert_eq!(embed_again.to_vec::<f32>().unwrap(), embed);
+        }
+        let again = Model::load(&Checkpoint::open(&dir).unwrap()).unwrap();
+        assert_eq!(again.config(), model.config());
+        assert_eq!(again.weights.len(), 2);
+        for (name, tensor) in &model.weights {
+            assert_eq!(
+                again.weights[name].to_vec::<f32>().unwrap(),
+                tensor.to_vec::<f32>().unwrap(),
+                "{name}"
+            );
+        }
+        // Only the two files are left: no temporary.
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

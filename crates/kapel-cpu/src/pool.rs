@@ -11,6 +11,7 @@
 //! over the threads, each one does the same computation, and the result is
 //! bit-for-bit identical.
 
+use std::any::Any;
 use std::cell::Cell;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -54,7 +55,8 @@ struct Shared {
     wake: Condvar,
     sleep: Mutex<()>,
     stop: AtomicBool,
-    panicked: AtomicBool,
+    /// The payload of the first task that panicked during the current call.
+    panic: Mutex<Option<Box<dyn Any + Send>>>,
 }
 
 impl Shared {
@@ -68,8 +70,9 @@ impl Shared {
             if task >= job.tasks {
                 break;
             }
-            if catch_unwind(AssertUnwindSafe(|| work(task))).is_err() {
-                self.panicked.store(true, Ordering::Relaxed);
+            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| work(task))) {
+                let mut first = self.panic.lock().unwrap_or_else(|e| e.into_inner());
+                first.get_or_insert(payload);
             }
         }
         INSIDE.with(|inside| inside.set(false));
@@ -86,6 +89,10 @@ pub struct Pool {
 
 impl Pool {
     /// A group of `threads` threads in total, the calling thread included.
+    ///
+    /// If the system refuses to start some of them, the group works with
+    /// those it has: [`Pool::threads`] says how many. Results do not depend
+    /// on it.
     pub fn new(threads: usize) -> Self {
         let shared = Arc::new(Shared {
             job: Mutex::new(None),
@@ -96,15 +103,15 @@ impl Pool {
             wake: Condvar::new(),
             sleep: Mutex::new(()),
             stop: AtomicBool::new(false),
-            panicked: AtomicBool::new(false),
+            panic: Mutex::new(None),
         });
         let workers = (1..threads.max(1))
-            .map(|index| {
+            .map_while(|index| {
                 let shared = Arc::clone(&shared);
                 std::thread::Builder::new()
                     .name(format!("kapel-{index}"))
                     .spawn(move || worker(&shared))
-                    .expect("failed to spawn a thread")
+                    .ok()
             })
             .collect();
         Self {
@@ -154,8 +161,13 @@ impl Pool {
                 std::thread::yield_now();
             }
         }
-        if shared.panicked.swap(false, Ordering::Relaxed) {
-            resume_unwind(Box::new("a task of the thread pool panicked"));
+        let panic = shared
+            .panic
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(payload) = panic {
+            resume_unwind(payload);
         }
     }
 }
@@ -210,11 +222,14 @@ impl Drop for Pool {
 #[derive(Clone, Copy)]
 pub struct SharedMut<T>(*mut T);
 
-// SAFETY: `SharedMut` only hands out access through `unsafe` methods whose
+// SAFETY: a `SharedMut` stands for a `&mut [T]` split between threads: each
+// thread receives `&mut T` to its own elements, which needs `T: Send` (as
+// `&mut [T]: Send` does). Access only goes through `unsafe` methods whose
 // contract requires that tasks never touch overlapping parts of the buffer.
-unsafe impl<T> Send for SharedMut<T> {}
-// SAFETY: same contract as for `Send`.
-unsafe impl<T> Sync for SharedMut<T> {}
+unsafe impl<T: Send> Send for SharedMut<T> {}
+// SAFETY: sharing a `SharedMut` hands out the same disjoint `&mut T`, from
+// several threads: `T: Send` is again what is needed, and enough.
+unsafe impl<T: Send> Sync for SharedMut<T> {}
 
 impl<T> SharedMut<T> {
     /// Shares the start of `slice`. The slice must outlive every use of the
@@ -301,10 +316,24 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "a task of the thread pool panicked")]
-    fn a_panicking_task_is_reported() {
+    #[should_panic(expected = "task 7 failed")]
+    fn a_panicking_task_is_reported_with_its_message() {
         let pool = Pool::new(2);
-        pool.run(16, |task| assert_ne!(task, 7));
+        pool.run(16, |task| assert_ne!(task, 7, "task 7 failed"));
+    }
+
+    #[test]
+    fn the_pool_works_after_a_panic() {
+        let pool = Pool::new(3);
+        let caught = catch_unwind(AssertUnwindSafe(|| {
+            pool.run(16, |task| assert_ne!(task, 3));
+        }));
+        assert!(caught.is_err());
+        let total = AtomicUsize::new(0);
+        pool.run(16, |_| {
+            total.fetch_add(1, Ordering::Relaxed);
+        });
+        assert_eq!(total.load(Ordering::Relaxed), 16);
     }
 
     #[test]

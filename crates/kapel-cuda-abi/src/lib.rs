@@ -32,6 +32,10 @@ pub struct View {
 impl View {
     /// The storage position of the element at row-major position `flat` of the
     /// view's shape.
+    ///
+    /// The arithmetic is in `u32`, without overflow checks: the backend only
+    /// passes views of storages of at most `u32::MAX` elements, in which every
+    /// position, and every partial sum of one, fits.
     #[inline(always)]
     pub fn at(&self, mut flat: u32) -> u32 {
         let mut position = self.offset;

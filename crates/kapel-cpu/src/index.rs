@@ -60,7 +60,7 @@ impl Run<GatherRows> for Cpu {
         inputs: &[&Tensor],
         grad: &Tensor,
     ) -> Result<Vec<Option<Tensor>>> {
-        let signature = op.infer(inputs)?;
+        let signature = op.infer_backward(inputs, grad)?;
         let shape = inputs[0].shape();
         let rows = io::indices(GatherRows::NAME, inputs[1], shape[0])?;
         let width = shape[1..].iter().product();
@@ -89,7 +89,7 @@ impl Run<ScatterAddRows> for Cpu {
         inputs: &[&Tensor],
         grad: &Tensor,
     ) -> Result<Vec<Option<Tensor>>> {
-        let signature = op.infer(inputs)?;
+        let signature = op.infer_backward(inputs, grad)?;
         let rows = io::indices(ScatterAddRows::NAME, inputs[1], op.rows)?;
         let width = signature.shape[1..].iter().product();
         let g = io::contiguous(ScatterAddRows::NAME, grad)?;

@@ -34,7 +34,7 @@ impl Run<Softmax> for Cpu {
         inputs: &[&Tensor],
         grad: &Tensor,
     ) -> Result<Vec<Option<Tensor>>> {
-        let signature = op.infer(inputs)?;
+        let signature = op.infer_backward(inputs, grad)?;
         let x = io::contiguous(Softmax::NAME, inputs[0])?;
         let g = io::contiguous(Softmax::NAME, grad)?;
         let isa = self.isa;
@@ -75,7 +75,7 @@ impl Run<LogSoftmax> for Cpu {
         inputs: &[&Tensor],
         grad: &Tensor,
     ) -> Result<Vec<Option<Tensor>>> {
-        let signature = op.infer(inputs)?;
+        let signature = op.infer_backward(inputs, grad)?;
         let x = io::contiguous(LogSoftmax::NAME, inputs[0])?;
         let g = io::contiguous(LogSoftmax::NAME, grad)?;
         let isa = self.isa;
@@ -245,7 +245,7 @@ impl Run<LayerNorm> for Cpu {
         inputs: &[&Tensor],
         grad: &Tensor,
     ) -> Result<Vec<Option<Tensor>>> {
-        let signature = op.infer(inputs)?;
+        let signature = op.infer_backward(inputs, grad)?;
         let x = io::contiguous(LayerNorm::NAME, inputs[0])?;
         let g = io::contiguous(LayerNorm::NAME, grad)?;
         let width = *signature.shape.last().expect("checked by infer");
@@ -297,7 +297,7 @@ impl Run<RmsNorm> for Cpu {
         inputs: &[&Tensor],
         grad: &Tensor,
     ) -> Result<Vec<Option<Tensor>>> {
-        let signature = op.infer(inputs)?;
+        let signature = op.infer_backward(inputs, grad)?;
         let x = io::contiguous(RmsNorm::NAME, inputs[0])?;
         let g = io::contiguous(RmsNorm::NAME, grad)?;
         let width = *signature.shape.last().expect("checked by infer");

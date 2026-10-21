@@ -15,7 +15,7 @@ use kapel_ops::{
     Transfer, Unary, UnaryKind,
 };
 
-use crate::device::{Args, Cuda, CudaStorage, Flat, small, smalls};
+use crate::device::{Args, Cuda, CudaStorage, Flat, Table, small, smalls};
 
 fn unary_code(op: &'static str, kind: UnaryKind) -> Result<u32> {
     Ok(match kind {
@@ -88,16 +88,15 @@ fn reduction(shape: &[usize], dims: &[usize]) -> (Vec<usize>, Vec<usize>) {
     (offsets_of(shape, &kept), offsets_of(shape, dims))
 }
 
-/// The lines of `shape` along `dim`: the first element of each, the step
-/// between elements, and their length.
-fn lines(shape: &[usize], dim: usize) -> (Vec<usize>, usize, usize) {
+/// The first element of each line of `shape` along `dim`; the elements of a
+/// line are `shape[dim + 1..].product()` apart.
+fn line_starts(shape: &[usize], dim: usize) -> Vec<usize> {
     let len = shape[dim];
     let inner: usize = shape[dim + 1..].iter().product();
     let outer: usize = shape[..dim].iter().product();
-    let starts = (0..outer * inner)
+    (0..outer * inner)
         .map(|l| (l / inner) * len * inner + l % inner)
-        .collect();
-    (starts, inner, len)
+        .collect()
 }
 
 impl Cuda {
@@ -112,23 +111,44 @@ impl Cuda {
         scale: f32,
         out_shape: &[usize],
     ) -> Result<Tensor> {
-        let (bases, inner) = reduction(shape, dims);
-        let (b, i) = (
-            self.upload_u32(&smalls(op, &bases)?)?,
-            self.upload_u32(&smalls(op, &inner)?)?,
-        );
+        let (b, i) = self.reduction_tables(op, shape, dims)?;
         self.output(out_shape, false, |out, n| {
             self.launch(
                 "reduce_sum",
                 n,
                 Args::new()
                     .flat(x)
-                    .list(&b, bases.len())
-                    .list(&i, inner.len())
+                    .table(&b)
+                    .table(&i)
                     .f32(scale)
                     .slice(out, n),
             )
         })
+    }
+
+    /// The key of a table computed from `shape` and `dims`.
+    fn key(shape: &[usize], dims: &[usize]) -> Vec<usize> {
+        let mut key = shape.to_vec();
+        key.push(usize::MAX);
+        key.extend_from_slice(dims);
+        key
+    }
+
+    /// The tables of `reduction(shape, dims)`, on the device.
+    fn reduction_tables(
+        &self,
+        op: &'static str,
+        shape: &[usize],
+        dims: &[usize],
+    ) -> Result<(Arc<Table>, Arc<Table>)> {
+        let key = Self::key(shape, dims);
+        let bases = self.table("reduction bases", &key, || {
+            smalls(op, &reduction(shape, dims).0)
+        })?;
+        let inner = self.table("reduction offsets", &key, || {
+            smalls(op, &offsets_of(shape, dims))
+        })?;
+        Ok((bases, inner))
     }
 
     /// The gradient `scale · g` of each result given to every element it
@@ -142,23 +162,21 @@ impl Cuda {
         scale: f32,
     ) -> Result<Tensor> {
         let g = self.flat(op, g)?;
-        let (bases, inner) = reduction(shape, dims);
-        let mut owner = vec![0u32; shape.iter().product()];
-        for (r, &base) in bases.iter().enumerate() {
-            for &o in &inner {
-                owner[base + o] = small(op, r)?;
+        let owner = self.table("owners", &Self::key(shape, dims), || {
+            let (bases, inner) = reduction(shape, dims);
+            let mut owner = vec![0u32; shape.iter().product()];
+            for (r, &base) in bases.iter().enumerate() {
+                for &o in &inner {
+                    owner[base + o] = small(op, r)?;
+                }
             }
-        }
-        let owner = self.upload_u32(&owner)?;
+            Ok(owner)
+        })?;
         self.output(shape, false, |out, n| {
             self.launch(
                 "spread",
                 n,
-                Args::new()
-                    .flat(&g)
-                    .list(&owner, n)
-                    .f32(scale)
-                    .slice(out, n),
+                Args::new().flat(&g).table(&owner).f32(scale).slice(out, n),
             )
         })
     }
@@ -301,7 +319,7 @@ impl Run<Unary> for Cuda {
         inputs: &[&Tensor],
         grad: &Tensor,
     ) -> Result<Vec<Option<Tensor>>> {
-        let signature = op.infer(inputs)?;
+        let signature = op.infer_backward(inputs, grad)?;
         let code = unary_code(Unary::NAME, op.kind)?;
         let x = self.flat(Unary::NAME, inputs[0])?;
         let g = self.flat(Unary::NAME, grad)?;
@@ -345,7 +363,7 @@ impl Run<Affine> for Cuda {
         inputs: &[&Tensor],
         grad: &Tensor,
     ) -> Result<Vec<Option<Tensor>>> {
-        let signature = op.infer(inputs)?;
+        let signature = op.infer_backward(inputs, grad)?;
         Ok(vec![Some(self.affine(
             grad,
             op.scale,
@@ -378,7 +396,7 @@ impl Run<Binary> for Cuda {
         inputs: &[&Tensor],
         grad: &Tensor,
     ) -> Result<Vec<Option<Tensor>>> {
-        let signature = op.infer(inputs)?;
+        let signature = op.infer_backward(inputs, grad)?;
         let code = binary_code(Binary::NAME, op.kind)?;
         let shape = &signature.shape;
         let [a, b] = [inputs[0], inputs[1]]
@@ -422,15 +440,13 @@ impl Run<Cast> for Cuda {
         inputs: &[&Tensor],
         grad: &Tensor,
     ) -> Result<Vec<Option<Tensor>>> {
-        op.infer(inputs)?;
-        if !op.differentiable(0) {
+        op.infer_backward(inputs, grad)?;
+        // Between float types the gradient passes through, in the input's
+        // type; an integer input or output receives none.
+        let dtype = inputs[0].dtype();
+        if !op.differentiable(0) || !dtype.is_float() {
             return Ok(vec![None]);
         }
-        let dtype = if inputs[0].dtype().is_float() {
-            inputs[0].dtype()
-        } else {
-            grad.dtype()
-        };
         let values = self.values(grad)?;
         Ok(vec![Some(self.encoded(
             &values,
@@ -454,7 +470,7 @@ impl Run<Matmul> for Cuda {
         inputs: &[&Tensor],
         grad: &Tensor,
     ) -> Result<Vec<Option<Tensor>>> {
-        op.infer(inputs)?;
+        op.infer_backward(inputs, grad)?;
         let (a, b) = (inputs[0], inputs[1]);
         let (ra, rb) = (a.rank(), b.rank());
         let bt = b.transpose(rb - 2, rb - 1)?;
@@ -468,6 +484,11 @@ impl Run<Matmul> for Cuda {
     }
 }
 
+/// The product of all dimensions but the last.
+fn leading(shape: &[usize]) -> usize {
+    shape[..shape.len().saturating_sub(1)].iter().product()
+}
+
 impl Run<QuantizedMatmul> for Cuda {
     /// The weights are dequantized on the host, then multiplied. Kernels that
     /// read the codes directly come with the inference engine.
@@ -475,8 +496,11 @@ impl Run<QuantizedMatmul> for Cuda {
         let signature = op.infer(inputs)?;
         let (x, w) = (inputs[0], inputs[1]);
         let k = w.shape()[1];
+        // The rows from the leading dimensions: with `K = 0`, `numel / K`
+        // would lose them.
+        let rows = leading(x.shape());
         let x = self.contiguous(QuantizedMatmul::NAME, x)?;
-        let x = x.reshape(&[x.numel() / k.max(1), k])?;
+        let x = x.reshape(&[rows, k])?;
         let wt = self.dequantized(w)?.transpose(0, 1)?;
         let shape = [x.shape()[0], w.shape()[0]];
         self.matmul(&x, &wt, &shape)?.reshape(&signature.shape)
@@ -488,11 +512,12 @@ impl Run<QuantizedMatmul> for Cuda {
         inputs: &[&Tensor],
         grad: &Tensor,
     ) -> Result<Vec<Option<Tensor>>> {
-        op.infer(inputs)?;
+        op.infer_backward(inputs, grad)?;
         let (x, w) = (inputs[0], inputs[1]);
         let (n, k) = (w.shape()[0], w.shape()[1]);
+        let rows = leading(grad.shape());
         let g = self.contiguous(QuantizedMatmul::NAME, grad)?;
-        let g = g.reshape(&[g.numel() / n.max(1), n])?;
+        let g = g.reshape(&[rows, n])?;
         let w = self.dequantized(w)?;
         let shape = [g.shape()[0], k];
         Ok(vec![
@@ -517,7 +542,7 @@ impl Run<Sum> for Cuda {
     }
 
     fn backward(&self, op: &Sum, inputs: &[&Tensor], grad: &Tensor) -> Result<Vec<Option<Tensor>>> {
-        op.infer(inputs)?;
+        op.infer_backward(inputs, grad)?;
         Ok(vec![Some(self.spread(
             Sum::NAME,
             grad,
@@ -553,7 +578,7 @@ impl Run<Mean> for Cuda {
         inputs: &[&Tensor],
         grad: &Tensor,
     ) -> Result<Vec<Option<Tensor>>> {
-        op.infer(inputs)?;
+        op.infer_backward(inputs, grad)?;
         let shape = inputs[0].shape();
         Ok(vec![Some(self.spread(
             Mean::NAME,
@@ -568,26 +593,46 @@ impl Run<Mean> for Cuda {
 impl Cuda {
     /// The maximum of each line along `dim`, as a tensor of `shape`, and the
     /// position of the first maximum of each line.
-    fn line_max(&self, x: &Tensor, dim: usize, shape: &[usize]) -> Result<(Tensor, CudaStorage)> {
+    /// Also gives the number of lines.
+    fn line_max(
+        &self,
+        x: &Tensor,
+        dim: usize,
+        shape: &[usize],
+    ) -> Result<(Tensor, CudaStorage, usize)> {
         let op = Max::NAME;
-        let (starts, step, len) = lines(x.shape(), dim);
+        let (s, step, len) = self.line_table(op, x.shape(), dim)?;
         let x = self.flat(op, x)?;
-        let s = self.upload_u32(&smalls(op, &starts)?)?;
-        let at = self.alloc(starts.len().max(1) * 4, false)?;
+        let at = self.alloc(s.len.max(1) * 4, false)?;
         let value = self.output(shape, false, |out, n| {
             self.launch(
                 "line_max",
                 n,
                 Args::new()
                     .flat(&x)
-                    .list(&s, starts.len())
-                    .u32(small(op, step)?)
-                    .u32(small(op, len)?)
+                    .table(&s)
+                    .u32(step)
+                    .u32(len)
                     .slice(out, n)
-                    .list(&at, n),
+                    .list(&at, s.len),
             )
         })?;
-        Ok((value, at))
+        Ok((value, at, s.len))
+    }
+
+    /// The first element of each line of `shape` along `dim`, on the device,
+    /// the step between the elements of a line, and their number.
+    fn line_table(
+        &self,
+        op: &'static str,
+        shape: &[usize],
+        dim: usize,
+    ) -> Result<(Arc<Table>, u32, u32)> {
+        let step: usize = shape[dim + 1..].iter().product();
+        let starts = self.table("line starts", &Self::key(shape, &[dim]), || {
+            smalls(op, &line_starts(shape, dim))
+        })?;
+        Ok((starts, small(op, step)?, small(op, shape[dim])?))
     }
 }
 
@@ -598,10 +643,10 @@ impl Run<Max> for Cuda {
     }
 
     fn backward(&self, op: &Max, inputs: &[&Tensor], grad: &Tensor) -> Result<Vec<Option<Tensor>>> {
-        let signature = op.infer(inputs)?;
-        let (_, at) = self.line_max(inputs[0], op.dim, &signature.shape)?;
+        let signature = op.infer_backward(inputs, grad)?;
+        let (_, at, lines) = self.line_max(inputs[0], op.dim, &signature.shape)?;
+        // `infer_backward` checked that the gradient has one value per line.
         let g = self.flat(Max::NAME, grad)?;
-        let lines = g.len;
         let out = self.output(inputs[0].shape(), true, |out, n| {
             self.launch(
                 "place",
@@ -624,23 +669,17 @@ impl Cuda {
         dim: usize,
         grad: Option<&Tensor>,
     ) -> Result<Tensor> {
-        let (starts, step, len) = lines(x.shape(), dim);
         let shape = x.shape().to_vec();
+        let (s, step, len) = self.line_table(op, &shape, dim)?;
         let x = self.flat(op, x)?;
         let g = grad.map(|g| self.flat(op, g)).transpose()?;
-        let s = self.upload_u32(&smalls(op, &starts)?)?;
-        let (step, len) = (small(op, step)?, small(op, len)?);
         self.output(&shape, false, |out, n| {
             let args = Args::new().u32(log).flat(&x);
             let (name, args) = match &g {
                 None => ("softmax_lines", args),
                 Some(g) => ("softmax_lines_backward", args.flat(g)),
             };
-            self.launch(
-                name,
-                starts.len(),
-                args.list(&s, starts.len()).u32(step).u32(len).slice(out, n),
-            )
+            self.launch(name, s.len, args.table(&s).u32(step).u32(len).slice(out, n))
         })
     }
 }
@@ -657,7 +696,7 @@ impl Run<Softmax> for Cuda {
         inputs: &[&Tensor],
         grad: &Tensor,
     ) -> Result<Vec<Option<Tensor>>> {
-        op.infer(inputs)?;
+        op.infer_backward(inputs, grad)?;
         Ok(vec![Some(self.softmax(
             Softmax::NAME,
             0,
@@ -680,7 +719,7 @@ impl Run<LogSoftmax> for Cuda {
         inputs: &[&Tensor],
         grad: &Tensor,
     ) -> Result<Vec<Option<Tensor>>> {
-        op.infer(inputs)?;
+        op.infer_backward(inputs, grad)?;
         Ok(vec![Some(self.softmax(
             LogSoftmax::NAME,
             1,
@@ -704,7 +743,8 @@ struct Norm<'a> {
 }
 
 impl Cuda {
-    /// A vector of the normalization, or `width` copies of `default`.
+    /// A vector of the normalization, in `f32` (converted if it is in another
+    /// float type), or `width` copies of `default`.
     fn norm_vector(
         &self,
         op: &'static str,
@@ -713,8 +753,17 @@ impl Cuda {
         default: f32,
     ) -> Result<Flat> {
         match vector {
-            Some(v) => self.flat(op, v),
-            None => self.flat(op, &self.upload_f32(&vec![default; width], &[width])?),
+            Some(v) => self.flat(op, &self.converted(v, DType::F32)?),
+            None => self.flat(op, &self.filled(op, default, &[width])?),
+        }
+    }
+
+    /// `tensor` in `dtype`: itself, or a conversion (through the host).
+    fn converted(&self, tensor: &Tensor, dtype: DType) -> Result<Tensor> {
+        if tensor.dtype() == dtype {
+            Ok(tensor.clone())
+        } else {
+            self.forward(&Cast { dtype }, &[tensor])
         }
     }
 
@@ -804,10 +853,13 @@ impl Run<LayerNorm> for Cuda {
         inputs: &[&Tensor],
         grad: &Tensor,
     ) -> Result<Vec<Option<Tensor>>> {
-        op.infer(inputs)?;
+        op.infer_backward(inputs, grad)?;
         let (gx, gw, gb) = self.norm_backward(&layer_norm(op, inputs), inputs[0], grad)?;
-        let mut grads = vec![Some(gx), Some(gw), Some(gb)];
-        grads.truncate(inputs.len());
+        let mut grads = vec![Some(gx)];
+        // The vectors' gradients come in their own types.
+        for (input, g) in inputs[1..].iter().zip([gw, gb]) {
+            grads.push(Some(self.converted(&g, input.dtype())?));
+        }
         Ok(grads)
     }
 }
@@ -850,10 +902,12 @@ impl Run<RmsNorm> for Cuda {
         inputs: &[&Tensor],
         grad: &Tensor,
     ) -> Result<Vec<Option<Tensor>>> {
-        op.infer(inputs)?;
+        op.infer_backward(inputs, grad)?;
         let (gx, gw, _) = self.norm_backward(&rms_norm(op, inputs), inputs[0], grad)?;
-        let mut grads = vec![Some(gx), Some(gw)];
-        grads.truncate(inputs.len());
+        let mut grads = vec![Some(gx)];
+        if let Some(w) = inputs.get(1) {
+            grads.push(Some(self.converted(&gw, w.dtype())?));
+        }
         Ok(grads)
     }
 }
@@ -861,7 +915,7 @@ impl Run<RmsNorm> for Cuda {
 impl Run<Attention> for Cuda {
     fn forward(&self, op: &Attention, inputs: &[&Tensor]) -> Result<Tensor> {
         op.infer(inputs)?;
-        Ok(self.flash_forward(op, inputs)?.0)
+        self.flash_forward(op, inputs)
     }
 
     fn backward(
@@ -870,7 +924,7 @@ impl Run<Attention> for Cuda {
         inputs: &[&Tensor],
         grad: &Tensor,
     ) -> Result<Vec<Option<Tensor>>> {
-        op.infer(inputs)?;
+        op.infer_backward(inputs, grad)?;
         let [gq, gk, gv] = self.flash_backward(op, inputs, grad)?;
         let mut grads = vec![Some(gq), Some(gk), Some(gv)];
         if inputs.len() == 4 {
@@ -904,14 +958,21 @@ impl Cuda {
                 })
             })
             .collect();
-        let entry_of: Vec<usize> = Layout::contiguous(positions.shape())?
-            .broadcast_to(&shape[..shape.len() - 1])?
-            .offsets()
-            .collect();
+        let vectors = &shape[..shape.len() - 1];
+        let entry = self.table(
+            "rope entries",
+            &Self::key(positions.shape(), vectors),
+            || {
+                let entry_of: Vec<usize> = Layout::contiguous(positions.shape())?
+                    .broadcast_to(vectors)?
+                    .offsets()
+                    .collect();
+                smalls(name, &entry_of)
+            },
+        )?;
         let x = self.flat(name, x)?;
         let table = self.upload_f32(&table, &[table.len()])?;
         let table = self.flat(name, &table)?;
-        let entry = self.upload_u32(&smalls(name, &entry_of)?)?;
         let half_pairs = u32::from(op.layout == RopeLayout::Half);
         self.output(&shape, false, |out, n| {
             self.launch(
@@ -920,7 +981,7 @@ impl Cuda {
                 Args::new()
                     .flat(&x)
                     .flat(&table)
-                    .list(&entry, entry_of.len())
+                    .table(&entry)
                     .u32(small(name, d)?)
                     .u32(small(name, r)?)
                     .u32(half_pairs)
@@ -942,7 +1003,7 @@ impl Run<Rope> for Cuda {
         inputs: &[&Tensor],
         grad: &Tensor,
     ) -> Result<Vec<Option<Tensor>>> {
-        op.infer(inputs)?;
+        op.infer_backward(inputs, grad)?;
         Ok(vec![Some(self.rope(op, grad, inputs[1], -1.0)?), None])
     }
 }
@@ -962,7 +1023,7 @@ impl Run<GatherRows> for Cuda {
         inputs: &[&Tensor],
         grad: &Tensor,
     ) -> Result<Vec<Option<Tensor>>> {
-        op.infer(inputs)?;
+        op.infer_backward(inputs, grad)?;
         let shape = inputs[0].shape();
         let rows = self.indices(GatherRows::NAME, inputs[1], shape[0])?;
         let out = self.scatter(GatherRows::NAME, grad, &rows, shape[0], shape)?;
@@ -989,7 +1050,7 @@ impl Run<ScatterAddRows> for Cuda {
         inputs: &[&Tensor],
         grad: &Tensor,
     ) -> Result<Vec<Option<Tensor>>> {
-        let signature = op.infer(inputs)?;
+        let signature = op.infer_backward(inputs, grad)?;
         let rows = self.indices(ScatterAddRows::NAME, inputs[1], op.rows)?;
         let width = signature.shape[1..].iter().product();
         let out = self.gather(ScatterAddRows::NAME, grad, &rows, width, inputs[0].shape())?;

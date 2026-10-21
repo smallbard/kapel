@@ -21,13 +21,14 @@ mod chat;
 mod decode;
 mod text;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::Path;
 
+use aho_corasick::{AhoCorasick, Input, MatchKind};
 use serde_json::Value;
 
-pub use crate::chat::{ChatTemplate, Message};
+pub use crate::chat::{ChatTemplate, FUEL, MAX_OUTPUT, Message};
 
 use crate::bpe::Bpe;
 use crate::decode::Decoder;
@@ -59,6 +60,14 @@ impl std::error::Error for TokenizerError {}
 
 pub(crate) fn bad(message: impl Into<String>) -> TokenizerError {
     TokenizerError::Format(message.into())
+}
+
+/// A token id of `tokenizer.json`, which must fit in a `u32`.
+pub(crate) fn id_of(value: &Value, what: &str) -> Result<u32, TokenizerError> {
+    let id = value
+        .as_u64()
+        .ok_or_else(|| bad(format!("{what} is not an integer")))?;
+    u32::try_from(id).map_err(|_| bad(format!("{what} {id} does not fit in 32 bits")))
 }
 
 pub(crate) fn str_field<'a>(json: &'a Value, key: &str) -> Result<&'a str, TokenizerError> {
@@ -93,10 +102,17 @@ pub struct Tokenizer {
     /// The template of a single sequence, if the post-processor has one.
     template: Option<Vec<Item>>,
     decoder: Option<Decoder>,
-    /// Added tokens, longest first, for leftmost-longest matching.
+    /// Added tokens, longest first; among equal contents, the first listed wins.
     added: Vec<AddedToken>,
+    /// Finds the added tokens in a text, leftmost first and longest among those
+    /// that start at the same place: one pattern per distinct non-empty content.
+    matcher: Option<AhoCorasick>,
+    /// For each pattern of `matcher`, its token in `added`.
+    pattern_token: Vec<usize>,
+    /// The id of each added token's content.
+    added_ids: HashMap<String, u32>,
     id_to_token: HashMap<u32, String>,
-    special_ids: Vec<u32>,
+    special_ids: HashSet<u32>,
 }
 
 /// The template of the single-sequence case in a post-processor, if any.
@@ -126,8 +142,8 @@ fn template(json: &Value) -> Result<Option<Vec<Item>>, TokenizerError> {
                         .and_then(Value::as_array)
                         .ok_or_else(|| bad(format!("the template's token {name:?} has no ids")))?
                         .iter()
-                        .filter_map(|v| v.as_u64().map(|v| v as u32))
-                        .collect();
+                        .map(|v| id_of(v, &format!("an id of the template's token {name:?}")))
+                        .collect::<Result<_, _>>()?;
                     Ok(Item::Special(ids))
                 })
                 .collect::<Result<_, _>>()?;
@@ -179,13 +195,13 @@ impl Tokenizer {
             .flatten()
             .map(|t| {
                 let flag = |k: &str| t.get(k).and_then(Value::as_bool).unwrap_or(false);
-                let id = t
-                    .get("id")
-                    .and_then(Value::as_u64)
-                    .ok_or_else(|| bad("an added token has no id"))?;
+                let id = id_of(
+                    t.get("id").ok_or_else(|| bad("an added token has no id"))?,
+                    "the id of an added token",
+                )?;
                 Ok(AddedToken {
                     content: str_field(t, "content")?.to_string(),
-                    id: id as u32,
+                    id,
                     special: flag("special"),
                     lstrip: flag("lstrip"),
                     rstrip: flag("rstrip"),
@@ -199,6 +215,26 @@ impl Tokenizer {
             id_to_token.insert(token.id, token.content.clone());
         }
         let special_ids = added.iter().filter(|t| t.special).map(|t| t.id).collect();
+        let mut added_ids = HashMap::new();
+        let mut pattern_token = Vec::new();
+        for (i, token) in added.iter().enumerate() {
+            if !added_ids.contains_key(&token.content) {
+                added_ids.insert(token.content.clone(), token.id);
+                if !token.content.is_empty() {
+                    pattern_token.push(i);
+                }
+            }
+        }
+        let matcher = if pattern_token.is_empty() {
+            None
+        } else {
+            Some(
+                AhoCorasick::builder()
+                    .match_kind(MatchKind::LeftmostLongest)
+                    .build(pattern_token.iter().map(|&i| &added[i].content))
+                    .map_err(|e| bad(format!("the added tokens: {e}")))?,
+            )
+        };
         Ok(Self {
             normalizer: part("normalizer").map(Normalizer::from_json).transpose()?,
             pre_tokenizer: part("pre_tokenizer")
@@ -208,6 +244,9 @@ impl Tokenizer {
             decoder: part("decoder").map(Decoder::from_json).transpose()?,
             model,
             added,
+            matcher,
+            pattern_token,
+            added_ids,
             id_to_token,
             special_ids,
         })
@@ -220,11 +259,10 @@ impl Tokenizer {
 
     /// The id of a token.
     pub fn token_to_id(&self, token: &str) -> Option<u32> {
-        self.added
-            .iter()
-            .find(|t| t.content == token)
-            .map(|t| t.id)
-            .or_else(|| self.model.vocab.get(token).copied())
+        self.added_ids
+            .get(token)
+            .or_else(|| self.model.vocab.get(token))
+            .copied()
     }
 
     /// The token of an id.
@@ -237,28 +275,25 @@ impl Tokenizer {
     fn split_added<'t>(&self, text: &'t str) -> Vec<Result<(usize, &'t str), u32>> {
         let mut out = Vec::new();
         let (mut start, mut at) = (0, 0);
-        while at < text.len() {
-            let found = self
-                .added
-                .iter()
-                .find(|t| !t.content.is_empty() && text[at..].starts_with(&t.content));
-            match found {
-                Some(token) => {
-                    let mut end = at;
-                    if token.lstrip {
-                        end = start + text[start..at].trim_end().len();
-                    }
-                    if end > start {
-                        out.push(Ok((start, &text[start..end])));
-                    }
-                    out.push(Err(token.id));
-                    at += token.content.len();
-                    if token.rstrip {
-                        at += text[at..].len() - text[at..].trim_start().len();
-                    }
-                    start = at;
+        if let Some(matcher) = &self.matcher {
+            while at < text.len() {
+                let Some(found) = matcher.find(Input::new(text).span(at..text.len())) else {
+                    break;
+                };
+                let token = &self.added[self.pattern_token[found.pattern().as_usize()]];
+                let mut end = found.start();
+                if token.lstrip {
+                    end = start + text[start..end].trim_end().len();
                 }
-                None => at += text[at..].chars().next().map_or(1, char::len_utf8),
+                if end > start {
+                    out.push(Ok((start, &text[start..end])));
+                }
+                out.push(Err(token.id));
+                at = found.end();
+                if token.rstrip {
+                    at += text[at..].len() - text[at..].trim_start().len();
+                }
+                start = at;
             }
         }
         if start < text.len() {
@@ -324,11 +359,155 @@ impl Tokenizer {
     }
 }
 
+/// Reports a parity test that cannot run because its reference files (written
+/// by `tools/parity`) are missing; with `KAPEL_REQUIRE_PARITY=1`, fails instead.
+#[cfg(test)]
+pub(crate) fn parity_skipped(what: &str) {
+    use std::io::Write;
+    assert!(
+        std::env::var_os("KAPEL_REQUIRE_PARITY").is_none_or(|v| v != "1"),
+        "{what} is missing, and KAPEL_REQUIRE_PARITY=1 (see tools/parity/README.md)"
+    );
+    // Straight to stderr, past the capture of the test harness: a skip is seen.
+    let _ = writeln!(
+        std::io::stderr(),
+        "skipped: {what} missing (see tools/parity/README.md)"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
     use super::*;
+
+    /// A tokenizer whose vocabulary is the characters `a` to `e` and space
+    /// (ids 0 to 5), with `added` tokens.
+    fn with_added(added: serde_json::Value) -> Result<Tokenizer, TokenizerError> {
+        Tokenizer::from_json(&serde_json::json!({
+            "model": { "type": "BPE", "vocab": { "a": 0, "b": 1, "c": 2, "d": 3, "e": 4, " ": 5 }, "merges": [] },
+            "added_tokens": added,
+        }))
+    }
+
+    /// The added tokens are found leftmost first, longest among those that
+    /// start at the same place, as `tokenizers` does.
+    #[test]
+    fn added_tokens_match_leftmost_longest() {
+        let tokenizer = with_added(serde_json::json!([
+            { "id": 10, "content": "ab" },
+            { "id": 11, "content": "abc" },
+            { "id": 12, "content": "bcd" },
+            { "id": 13, "content": "abc" },
+            { "id": 14, "content": "" },
+            { "id": 15, "content": "é" },
+            { "id": 16, "content": "d", "lstrip": true, "rstrip": true },
+        ]))
+        .unwrap();
+        let encode = |text: &str| tokenizer.encode(text, false).unwrap();
+        // "abc" beats "ab" at 0; "bcd" starts later, after it.
+        assert_eq!(encode("abcd"), [11, 16]);
+        assert_eq!(encode("abd"), [10, 16]);
+        assert_eq!(encode("cbcda"), [2, 12, 0]);
+        assert_eq!(encode("aébé"), [0, 15, 1, 15]);
+        // `lstrip` and `rstrip` take the spaces around the token.
+        assert_eq!(encode("a  d  e"), [0, 16, 4]);
+        // The first of two equal contents wins, as in `token_to_id`.
+        assert_eq!(tokenizer.token_to_id("abc"), Some(11));
+        assert_eq!(tokenizer.token_to_id("e"), Some(4));
+        assert_eq!(encode(""), Vec::<u32>::new());
+    }
+
+    /// The search by automaton cuts texts exactly as a scan of every added
+    /// token at every character (Kapel's first implementation) does.
+    #[test]
+    fn added_tokens_are_cut_as_by_a_scan() {
+        let tokenizer = with_added(serde_json::json!([
+            { "id": 10, "content": "ab" },
+            { "id": 11, "content": "abc" },
+            { "id": 12, "content": "bcd", "rstrip": true },
+            { "id": 13, "content": "b", "lstrip": true },
+            { "id": 14, "content": "é a" },
+            { "id": 15, "content": " " , "lstrip": true },
+            { "id": 16, "content": "ddd" },
+            { "id": 17, "content": "dd" },
+        ]))
+        .unwrap();
+        fn scan<'t>(tokenizer: &Tokenizer, text: &'t str) -> Vec<Result<(usize, &'t str), u32>> {
+            let mut out = Vec::new();
+            let (mut start, mut at) = (0, 0);
+            while at < text.len() {
+                let found = tokenizer
+                    .added
+                    .iter()
+                    .find(|t| !t.content.is_empty() && text[at..].starts_with(&t.content));
+                match found {
+                    Some(token) => {
+                        let mut end = at;
+                        if token.lstrip {
+                            end = start + text[start..at].trim_end().len();
+                        }
+                        if end > start {
+                            out.push(Ok((start, &text[start..end])));
+                        }
+                        out.push(Err(token.id));
+                        at += token.content.len();
+                        if token.rstrip {
+                            at += text[at..].len() - text[at..].trim_start().len();
+                        }
+                        start = at;
+                    }
+                    None => at += text[at..].chars().next().map_or(1, char::len_utf8),
+                }
+            }
+            if start < text.len() {
+                out.push(Ok((start, &text[start..])));
+            }
+            out
+        }
+        let alphabet = ['a', 'b', 'c', 'd', ' ', 'é'];
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        for _ in 0..20_000 {
+            let mut text = String::new();
+            for _ in 0..(state % 24) {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                text.push(alphabet[(state % alphabet.len() as u64) as usize]);
+            }
+            state = state.wrapping_add(1);
+            assert_eq!(
+                tokenizer.split_added(&text),
+                scan(&tokenizer, &text),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ids_beyond_32_bits_are_errors() {
+        let error = with_added(serde_json::json!([{ "id": 1u64 << 32, "content": "x" }]))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("32 bits"), "{error}");
+        let error = Tokenizer::from_json(&serde_json::json!({
+            "model": { "type": "BPE", "vocab": { "a": 4_294_967_296u64 }, "merges": [] },
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("32 bits"), "{error}");
+        let error = Tokenizer::from_json(&serde_json::json!({
+            "model": { "type": "BPE", "vocab": { "a": 0 }, "merges": [] },
+            "post_processor": {
+                "type": "TemplateProcessing",
+                "single": [{ "SpecialToken": { "id": "<s>" } }, { "Sequence": { "id": "A" } }],
+                "special_tokens": { "<s>": { "ids": [u64::MAX] } },
+            },
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("32 bits"), "{error}");
+    }
 
     /// A long piece without spaces: BPE must stay near-linear on it.
     #[test]
@@ -357,11 +536,12 @@ mod tests {
 
     /// Every `tokenizer_cases.json` written by
     /// `tools/parity/tokenizers_reference.py`. Without them (in continuous
-    /// integration), the test checks nothing.
+    /// integration), the test is skipped, or fails with `KAPEL_REQUIRE_PARITY=1`.
     #[test]
     fn encodings_match_the_tokenizers_library() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/parity");
         let Ok(dirs) = std::fs::read_dir(&root) else {
+            parity_skipped("data/parity");
             return;
         };
         let mut failures = Vec::new();
@@ -406,6 +586,9 @@ mod tests {
                     ));
                 }
             }
+        }
+        if checked == 0 {
+            parity_skipped("data/parity/*/tokenizer_cases.json");
         }
         eprintln!("{checked} texts checked");
         assert!(

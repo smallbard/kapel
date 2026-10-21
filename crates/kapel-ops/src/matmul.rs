@@ -52,7 +52,7 @@ impl Operation for Matmul {
                 ),
             });
         }
-        let mut out = shape::broadcast(&a.shape()[..ra - 2], &b.shape()[..rb - 2])?;
+        let mut out = shape::broadcast(Self::NAME, &a.shape()[..ra - 2], &b.shape()[..rb - 2])?;
         out.extend([m, n]);
         Ok(Signature {
             shape: out,
@@ -94,6 +94,13 @@ impl Operation for QuantizedMatmul {
                     x.shape(),
                     w.shape()
                 ),
+            });
+        }
+        let k = w.shape()[1];
+        if !k.is_multiple_of(w.dtype().block_len()) {
+            return Err(Error::BlockMisaligned {
+                dtype: w.dtype(),
+                elements: k,
             });
         }
         let mut out = x.shape()[..x.rank() - 1].to_vec();

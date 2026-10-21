@@ -7,7 +7,6 @@
 //! until a backend needs it.
 
 use std::collections::BTreeMap;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -253,7 +252,9 @@ impl SafeTensors {
 
 /// Writes tensors to a safetensors file. Tensors may be views: each is written
 /// in row-major order. The header is padded to a multiple of 8 bytes, so that
-/// the data starts aligned.
+/// the data starts aligned. The file is written under a temporary name and
+/// renamed into place (see [`crate::write_atomic`]): `path` may be the file the
+/// tensors are mapped from.
 ///
 /// # Errors
 ///
@@ -311,14 +312,13 @@ pub fn save(
     while !json.len().is_multiple_of(8) {
         json.push(b' ');
     }
-    let write = || -> std::io::Result<()> {
-        let mut file = std::io::BufWriter::new(std::fs::File::create(path)?);
+    // Through a temporary file renamed into place: the file replaced may be the
+    // one the tensors are mapped from.
+    crate::write_atomic(path, |file| {
         file.write_all(&(json.len() as u64).to_le_bytes())?;
         file.write_all(&json)?;
-        file.write_all(&data)?;
-        file.flush()
-    };
-    write().map_err(|e| HubError::io(path, e))
+        file.write_all(&data)
+    })
 }
 
 #[cfg(test)]
@@ -350,6 +350,27 @@ mod tests {
             file.tensor("ids").unwrap().to_vec::<u32>().unwrap(),
             vec![7, 8]
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Saving over the file a tensor is mapped from leaves that tensor intact.
+    #[test]
+    fn a_file_can_be_saved_over_itself() {
+        let dir =
+            std::env::temp_dir().join(format!("kapel-safetensors-self-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.safetensors");
+        let values: Vec<f32> = (0..4096).map(|i| i as f32).collect();
+        let a = Tensor::from_slice(&values, &[64, 64]).unwrap();
+        save(&path, &[("a", &a)], &BTreeMap::new()).unwrap();
+        let file = SafeTensors::open(&path).unwrap();
+        let mapped = file.tensor("a").unwrap();
+        let small = Tensor::from_slice(&[1.0f32], &[1]).unwrap();
+        save(&path, &[("a", &mapped), ("b", &small)], &BTreeMap::new()).unwrap();
+        assert_eq!(mapped.to_vec::<f32>().unwrap(), values);
+        let again = SafeTensors::open(&path).unwrap();
+        assert_eq!(again.tensor("a").unwrap().to_vec::<f32>().unwrap(), values);
+        assert_eq!(again.names().count(), 2);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

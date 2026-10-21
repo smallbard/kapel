@@ -143,8 +143,15 @@ pub(crate) fn indices(op: &'static str, tensor: &Tensor, size: usize) -> Result<
         .collect()
 }
 
-/// `f32` to `bf16`, rounded to nearest even; NaN stays NaN.
-fn to_bf16(x: f32) -> u16 {
+/// `f32` to `bf16`, rounded to nearest, ties to even; infinities stay
+/// infinite, and NaN stays NaN (quiet, with its sign).
+///
+/// Rounding adds at most `0x8000` to the bits of a number: the largest,
+/// `0xff7f_ffff` (−`f32::MAX`), does not overflow, and rounds to −∞ as it
+/// should. Only NaN, whose rounding could carry into the sign or turn it into
+/// an infinity, is handled apart.
+#[inline(always)]
+pub(crate) fn to_bf16(x: f32) -> u16 {
     let bits = x.to_bits();
     if x.is_nan() {
         return ((bits >> 16) | 0x40) as u16;
@@ -216,4 +223,26 @@ pub(crate) fn output(
     let mut values = vec![0.0; layout.numel()];
     compute(&mut values);
     write(pool, &values, shape, dtype)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::to_bf16;
+
+    #[test]
+    fn bf16_rounding_keeps_special_values() {
+        let back = |x: f32| f32::from_bits(u32::from(to_bf16(x)) << 16);
+        assert!(back(f32::NAN).is_nan());
+        assert!(back(-f32::NAN).is_nan());
+        assert!(back(f32::from_bits(0xffff_ffff)).is_nan());
+        assert!(back(f32::from_bits(0x7f80_0001)).is_nan());
+        assert_eq!(back(f32::INFINITY), f32::INFINITY);
+        assert_eq!(back(f32::NEG_INFINITY), f32::NEG_INFINITY);
+        assert_eq!(back(f32::MAX), f32::INFINITY);
+        assert_eq!(back(-f32::MAX), f32::NEG_INFINITY);
+        assert_eq!(back(1.0), 1.0);
+        // Ties to even: 1 + 2⁻⁸ lies halfway between 1 and 1 + 2⁻⁷.
+        assert_eq!(back(1.0 + 1.0 / 256.0), 1.0);
+        assert_eq!(back(1.0 + 3.0 / 256.0), 1.0 + 4.0 / 256.0);
+    }
 }

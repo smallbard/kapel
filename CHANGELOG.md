@@ -45,6 +45,40 @@ changelog says how.
   RTX 3090: bf16 products reach 69 Top/s at `4096³`, attention 44 to 51 Top/s forward
   and 37 to 41 backward.
 
+### Changed
+
+- `kapel-ops`: `Operation::infer_backward` checks the gradient's shape, type and
+  device; every backward of every backend starts with it.
+- `kapel-ops`: `Error::BroadcastIncompatible` names its operation, and
+  `shape::broadcast` takes the operation's name.
+- `kapel-ops`: quantized products need `K` to be a multiple of the block size;
+  attention rejects `D = 0`; RoPE checks its frequency parameters.
+- `kapel-ops`: attention rows whose visible keys are all masked with `−∞` give
+  zeros and no gradient on every backend; finite masks such as `f32::MIN` take part
+  in the softmax. Norm weights and attention masks may be in any float type.
+- `kapel-cpu`: `Isa` can only be obtained for instructions the processor has, and
+  `Matrix` checks its extent at construction (both could cause undefined behaviour
+  from safe code).
+- `kapel-cpu`: sums and means are blocked and pairwise (16M elements: 64 ms to
+  0.8 ms, and far more accurate); attention is also split over query blocks.
+- `kapel-cuda`: one backend per device, shared process-wide; shape tables are
+  cached on the device; a failed allocation empties the pool and retries.
+- `kapel-hub`: the download cache is keyed by commit; only top-level files are
+  downloaded; saving writes a temporary file and renames it.
+- `kapel-tokenizers`: regexes built once and added tokens found with
+  Aho-Corasick (encoding 1.4 to 8 times faster); `strftime_now` uses local time.
+- Parity tests say when their data is missing, and fail if
+  `KAPEL_REQUIRE_PARITY=1`. The CUDA job rebuilds the PTX and compares it, and
+  runs on pull requests from this repository.
+
+### Fixed
+
+- Empty dimensions no longer panic in the reference products.
+- `kapel-cuda`: `Max` backward could write outside its buffer; kernels writing
+  through raw pointers check their bounds; positions beyond 32 bits are refused.
+- `kapel-cpu`: the `bf16` rounding of products kept NaN as infinity or zero.
+- The chat template test no longer depends on today's date.
+
 ### Security
 
 - Fuzz targets for every reader of untrusted files, and a weekly fuzzing and Miri job.
@@ -54,3 +88,11 @@ changelog says how.
   limit (found by fuzzing).
 - Regexes that give up now reject the text instead of silently cutting it wrongly.
 - `SECURITY.md`: what Kapel guarantees, and how to report a vulnerability.
+- GGUF: alignment and offsets are checked (a file could panic the reader); a
+  tensor of an unknown type no longer rejects the whole file.
+- Configurations: sizes are bounded and their products checked.
+- Chat templates: output is capped at 1 MiB.
+- Downloads: file names from the Hub and shard names from an index cannot leave
+  their directory; connections time out.
+- Saving a model over the files it was loaded from no longer truncates mapped
+  memory.

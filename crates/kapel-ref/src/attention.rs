@@ -77,7 +77,8 @@ impl Inputs {
         1.0 - (op.scale_for(self.d) * dot / cap).tanh().powi(2)
     }
 
-    /// The visible keys of query `i`, and their attention weights.
+    /// The visible keys of query `i` that are not masked with `−∞`, and their
+    /// attention weights.
     fn weights(&self, op: &Attention, b: usize, h: usize, i: usize) -> Vec<(usize, f64)> {
         let kv = h / (self.hq / self.hkv);
         let position = self.tk - self.tq + i;
@@ -100,6 +101,11 @@ impl Inputs {
                 };
                 (j, s + mask)
             })
+            // A key masked with −∞ has weight 0: dropping it keeps a row whose
+            // keys are all masked from computing −∞ − (−∞). Such a row, like a
+            // row that sees no key, has no weights: it gives zeros and passes
+            // no gradient.
+            .filter(|&(_, s)| s != f64::NEG_INFINITY)
             .collect();
         let max = scores.iter().map(|s| s.1).fold(f64::NEG_INFINITY, f64::max);
         let total: f64 = scores.iter().map(|s| (s.1 - max).exp()).sum();
@@ -140,7 +146,7 @@ impl Run<Attention> for Reference {
         inputs: &[&Tensor],
         grad: &Tensor,
     ) -> Result<Vec<Option<Tensor>>> {
-        op.infer(inputs)?;
+        op.infer_backward(inputs, grad)?;
         let x = Inputs::read(inputs)?;
         let g = Array::of(grad)?;
         let scale = op.scale_for(x.d);

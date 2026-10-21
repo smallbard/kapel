@@ -6,7 +6,7 @@ use std::sync::Mutex;
 
 use serde_json::Value;
 
-use crate::{TokenizerError, bad};
+use crate::{TokenizerError, bad, id_of};
 
 /// The BPE model of `tokenizer.json`.
 #[derive(Debug)]
@@ -33,11 +33,7 @@ impl Bpe {
             .and_then(Value::as_object)
             .ok_or_else(|| bad("BPE without a vocab"))?
             .iter()
-            .map(|(k, v)| {
-                v.as_u64()
-                    .map(|id| (k.clone(), id as u32))
-                    .ok_or_else(|| bad("a vocab id is not an integer"))
-            })
+            .map(|(k, v)| Ok((k.clone(), id_of(v, &format!("the id of {k:?}"))?)))
             .collect::<Result<_, _>>()?;
         let mut merges = HashMap::new();
         for (rank, merge) in json
@@ -70,7 +66,8 @@ impl Bpe {
                 vocab.get(&format!("{}{}", pair.0, pair.1)),
             );
             if let (Some(&a), Some(&b), Some(&merged)) = ids {
-                merges.entry((a, b)).or_insert((rank as u32, merged));
+                let rank = u32::try_from(rank).map_err(|_| bad("more than 2^32 merges"))?;
+                merges.entry((a, b)).or_insert((rank, merged));
             }
         }
         let flag = |key: &str| json.get(key).and_then(Value::as_bool).unwrap_or(false);

@@ -37,7 +37,7 @@ impl Run<Softmax> for Reference {
         inputs: &[&Tensor],
         grad: &Tensor,
     ) -> Result<Vec<Option<Tensor>>> {
-        op.infer(inputs)?;
+        op.infer_backward(inputs, grad)?;
         let (y, g) = (softmax(&Array::of(inputs[0])?, op.dim), Array::of(grad)?);
         let mut gx = y.clone();
         let len = y.shape[op.dim];
@@ -83,7 +83,7 @@ impl Run<LogSoftmax> for Reference {
         inputs: &[&Tensor],
         grad: &Tensor,
     ) -> Result<Vec<Option<Tensor>>> {
-        op.infer(inputs)?;
+        op.infer_backward(inputs, grad)?;
         let (p, g) = (softmax(&Array::of(inputs[0])?, op.dim), Array::of(grad)?);
         let mut gx = g.clone();
         let len = p.shape[op.dim];
@@ -173,7 +173,7 @@ impl Run<LayerNorm> for Reference {
         inputs: &[&Tensor],
         grad: &Tensor,
     ) -> Result<Vec<Option<Tensor>>> {
-        op.infer(inputs)?;
+        op.infer_backward(inputs, grad)?;
         let (x, g) = (Array::of(inputs[0])?, Array::of(grad)?);
         let n = layer_normalize(&x, op.eps);
         let width = n.width;
@@ -225,7 +225,7 @@ impl Run<RmsNorm> for Reference {
         inputs: &[&Tensor],
         grad: &Tensor,
     ) -> Result<Vec<Option<Tensor>>> {
-        op.infer(inputs)?;
+        op.infer_backward(inputs, grad)?;
         let (x, g) = (Array::of(inputs[0])?, Array::of(grad)?);
         let n = rms_normalize(&x, op.eps);
         let width = n.width;

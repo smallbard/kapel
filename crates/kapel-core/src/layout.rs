@@ -176,15 +176,21 @@ impl Layout {
     ///
     /// # Errors
     ///
-    /// [`Error::BroadcastIncompatible`].
+    /// [`Error::BroadcastIncompatible`], or [`Error::Overflow`] if the target
+    /// shape has more elements than `usize` can count.
     pub fn broadcast_to(&self, shape: &[usize]) -> Result<Self> {
         let incompatible = || Error::BroadcastIncompatible {
+            op: "broadcast_to",
             from: self.shape.clone(),
             to: shape.to_vec(),
         };
         if shape.len() < self.rank() {
             return Err(incompatible());
         }
+        shape
+            .iter()
+            .try_fold(1usize, |acc, &n| acc.checked_mul(n))
+            .ok_or(Error::Overflow { op: "broadcast_to" })?;
         let lead = shape.len() - self.rank();
         let mut strides = vec![0; shape.len()];
         for (i, (&size, &stride)) in self.shape.iter().zip(&self.strides).enumerate() {

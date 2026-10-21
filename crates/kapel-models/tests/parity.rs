@@ -1,7 +1,9 @@
 //! Kapel's logits against those of `transformers`, saved by
 //! `tools/parity/reference.py` in `data/parity/<model>/`. Without these files
-//! (in continuous integration), the test checks nothing.
+//! (in continuous integration), the test is skipped and says so on stderr; with
+//! `KAPEL_REQUIRE_PARITY=1`, it fails instead.
 
+use std::io::Write;
 use std::path::PathBuf;
 
 use kapel_hub::{Checkpoint, SafeTensors};
@@ -58,6 +60,19 @@ fn logits_match_transformers_and_survive_a_save() {
         );
         std::fs::remove_dir_all(&copy).unwrap();
         checked.push(name);
+    }
+    if checked.is_empty() {
+        assert!(
+            std::env::var_os("KAPEL_REQUIRE_PARITY").is_none_or(|v| v != "1"),
+            "no data/parity/*/reference.safetensors, and KAPEL_REQUIRE_PARITY=1 \
+             (see tools/parity/README.md)"
+        );
+        // Straight to stderr, past the capture of the test harness.
+        let _ = writeln!(
+            std::io::stderr(),
+            "skipped: data/parity/*/reference.safetensors missing (see tools/parity/README.md)"
+        );
+        return;
     }
     eprintln!("checked: {checked:?}");
 }

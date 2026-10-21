@@ -18,12 +18,16 @@ use crate::{Operation, Signature, arity, float, rank, same_device, shape};
 ///
 /// Then `s[j] = scale · q·k[j] + mask[i, j]` for the visible keys,
 /// `a = softmax(s)` over them, and `y = Σⱼ a[j] · v[j]`. A query that sees no
-/// key gives zeros. `scale` defaults to `1 / √D`.
+/// key, or whose visible keys are all masked with `−∞`, gives zeros and passes
+/// no gradient. Finite scores, however low (such as `f32::MIN`, the padding
+/// mask of `transformers`), take part in the softmax. `scale` defaults to
+/// `1 / √D`.
 ///
 /// With `softcap` (Gemma 2), the scaled scores are capped smoothly before the
 /// mask is added: `scale · q·k` becomes `softcap · tanh(scale · q·k / softcap)`.
 ///
-/// The mask receives no gradient.
+/// The mask may be in any float type, not necessarily that of `q`; it
+/// receives no gradient.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Attention {
     /// Hide the keys after each query's position.
@@ -84,6 +88,11 @@ impl Operation for Attention {
                 v.shape()
             )));
         }
+        if d == 0 {
+            return Err(invalid(
+                "the head width D must be positive: the default scale is 1 / √D".into(),
+            ));
+        }
         if hkv == 0 || hq % hkv != 0 {
             return Err(invalid(format!(
                 "the {hq} query heads must be a multiple of the {hkv} key heads"
@@ -100,8 +109,9 @@ impl Operation for Attention {
         if let Some(mask) = inputs.get(3) {
             float(op, mask)?;
             let target = [b, hq, tq, tk];
-            if shape::broadcast(mask.shape(), &target)? != target {
+            if shape::broadcast(op, mask.shape(), &target)? != target {
                 return Err(Error::BroadcastIncompatible {
+                    op,
                     from: mask.shape().to_vec(),
                     to: target.to_vec(),
                 });

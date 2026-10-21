@@ -44,15 +44,15 @@ impl Array {
         let (rows, cols) = (self.shape[rank - 2], self.shape[rank - 1]);
         let mut shape = self.shape.clone();
         shape.swap(rank - 2, rank - 1);
+        let size = rows * cols;
         let mut data = vec![0.0; self.data.len()];
-        for (matrix, out) in self
-            .data
-            .chunks(rows * cols)
-            .zip(data.chunks_mut(rows * cols))
-        {
-            for i in 0..rows {
-                for j in 0..cols {
-                    out[j * rows + i] = matrix[i * cols + j];
+        // An empty matrix has nothing to move (and `chunks(0)` would panic).
+        if size > 0 {
+            for (matrix, out) in self.data.chunks(size).zip(data.chunks_mut(size)) {
+                for i in 0..rows {
+                    for j in 0..cols {
+                        out[j * rows + i] = matrix[i * cols + j];
+                    }
                 }
             }
         }

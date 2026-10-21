@@ -58,12 +58,31 @@ jobs:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
 
-  # The CUDA tests need the self-hosted runner with the RTX 3090. They run on
-  # main and on demand, once the repository variable CUDA_RUNNER is "true".
+  # The CUDA tests need the self-hosted runner with the RTX 3090, once the
+  # repository variable CUDA_RUNNER is "true". They run on main, on demand, and
+  # on pull requests from branches of this repository only: a self-hosted
+  # runner must not run code from forks, which anyone can open.
   cuda:
-    if: vars.CUDA_RUNNER == 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    if: >-
+      vars.CUDA_RUNNER == 'true' && (
+        github.event_name == 'push' ||
+        github.event_name == 'workflow_dispatch' ||
+        (github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.full_name == github.repository)
+      )
     runs-on: [self-hosted, linux, cuda]
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      # The PTX is generated and checked in: rebuild it (cargo-oxide and the
+      # nightly of kernels/rust-toolchain.toml) and fail if it differs, so that
+      # a kernel changed without rebuilding is caught.
+      - name: The checked-in PTX matches the kernels
+        run: |
+          ./kernels/build.sh
+          git diff --exit-code -- crates/kapel-cuda/kernels.ptx
       - run: cargo clippy -p kapel-cuda --features cuda --all-targets
       - run: cargo test -p kapel-cuda --features cuda

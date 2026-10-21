@@ -16,6 +16,12 @@ use kapel_core::{DType, Layout, QuantFormat, Tensor};
 use crate::bytes::{Bytes, FileStorage};
 use crate::error::{HubError, Result};
 
+/// The alignment of the tensor data when `general.alignment` is absent.
+const DEFAULT_ALIGNMENT: usize = 32;
+/// The largest `general.alignment` accepted: 64 KiB, far above what llama.cpp
+/// writes (32), and small enough that the padding cannot overflow.
+pub const MAX_ALIGNMENT: u64 = 1 << 16;
+
 /// A metadata value.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Value {
@@ -237,10 +243,23 @@ impl Gguf {
             );
         }
         let alignment = match metadata.get("general.alignment") {
-            Some(Value::Uint(a)) if *a > 0 => *a as usize,
-            _ => 32,
+            None => DEFAULT_ALIGNMENT,
+            Some(Value::Uint(a)) if a.is_power_of_two() && *a <= MAX_ALIGNMENT => {
+                usize::try_from(*a).expect("at most 2^16")
+            }
+            Some(other) => {
+                return Err(HubError::format(
+                    path,
+                    format!(
+                        "general.alignment is {other:?}: a power of two of at most \
+                         {MAX_ALIGNMENT} is expected"
+                    ),
+                ));
+            }
         };
-        let data_start = r.at.div_ceil(alignment) * alignment;
+        let data_start =
+            r.at.checked_next_multiple_of(alignment)
+                .ok_or_else(|| HubError::format(path, "the tensor data starts beyond the file"))?;
         let gguf = Self {
             path: path.to_path_buf(),
             file: Arc::new(file),
@@ -248,8 +267,15 @@ impl Gguf {
             metadata,
             tensors,
         };
-        for name in gguf.tensors.keys() {
-            gguf.range(name)?;
+        // Every tensor Kapel reads must lie in the file. A tensor of a type Kapel
+        // does not read (its size is unknown) only has its start checked: it
+        // fails when asked for, not the whole file.
+        for (name, info) in &gguf.tensors {
+            if info.dtype.is_some() {
+                gguf.range(name)?;
+            } else {
+                gguf.start(name, info)?;
+            }
         }
         Ok(gguf)
     }
@@ -262,6 +288,19 @@ impl Gguf {
     /// The description of a tensor.
     pub fn info(&self, name: &str) -> Option<&GgufTensorInfo> {
         self.tensors.get(name)
+    }
+
+    /// Where the data of a tensor starts, checked to lie in the file.
+    fn start(&self, name: &str, info: &GgufTensorInfo) -> Result<usize> {
+        self.data_start
+            .checked_add(info.offset)
+            .filter(|&start| start <= self.file.as_slice().len())
+            .ok_or_else(|| {
+                HubError::format(
+                    &self.path,
+                    format!("tensor {name:?} starts beyond the file"),
+                )
+            })
     }
 
     /// The type and byte range of a tensor, checked against the file.
@@ -282,7 +321,7 @@ impl Gguf {
         let len = count
             .ok_or_else(|| HubError::format(&self.path, format!("tensor {name:?} is too large")))?;
         let bytes = dtype.storage_bytes(len)?;
-        let start = self.data_start + info.offset;
+        let start = self.start(name, info)?;
         if start
             .checked_add(bytes)
             .is_none_or(|end| end > self.file.as_slice().len())
@@ -322,12 +361,159 @@ mod tests {
     use super::*;
     use crate::SafeTensors;
 
+    /// A tensor of a synthetic file: name, shape (fastest dimension first, as
+    /// GGUF writes it), ggml type, offset.
+    type Entry<'a> = (&'a str, &'a [u64], u32, u64);
+
+    /// A GGUF file with `metadata` (`u32` values) and `tensors`, followed by
+    /// `data` at the 32-byte boundary.
+    fn gguf(metadata: &[(&str, u32, &[u8])], tensors: &[Entry<'_>], data: &[u8]) -> Vec<u8> {
+        let string = |out: &mut Vec<u8>, s: &str| {
+            out.extend((s.len() as u64).to_le_bytes());
+            out.extend(s.as_bytes());
+        };
+        let mut out = b"GGUF".to_vec();
+        out.extend(3u32.to_le_bytes());
+        out.extend((tensors.len() as u64).to_le_bytes());
+        out.extend((metadata.len() as u64).to_le_bytes());
+        for (key, kind, value) in metadata {
+            string(&mut out, key);
+            out.extend(kind.to_le_bytes());
+            out.extend(*value);
+        }
+        for (name, dims, ggml_type, offset) in tensors {
+            string(&mut out, name);
+            out.extend((dims.len() as u32).to_le_bytes());
+            for d in *dims {
+                out.extend(d.to_le_bytes());
+            }
+            out.extend(ggml_type.to_le_bytes());
+            out.extend(offset.to_le_bytes());
+        }
+        while !out.len().is_multiple_of(32) {
+            out.push(0);
+        }
+        out.extend(data);
+        out
+    }
+
+    /// Two `f32` tensors, `[2, 3]` and `[2]`.
+    fn valid() -> Vec<u8> {
+        let data: Vec<u8> = (0..8).flat_map(|i| (i as f32).to_le_bytes()).collect();
+        gguf(
+            &[("general.alignment", 4, &32u32.to_le_bytes())],
+            &[("a", &[3, 2], 0, 0), ("b", &[2], 0, 24)],
+            &data,
+        )
+    }
+
+    fn error_of(bytes: Vec<u8>) -> String {
+        match Gguf::from_bytes(bytes) {
+            Ok(_) => panic!("the file was accepted"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_minimal_file_is_read() {
+        let file = Gguf::from_bytes(valid()).unwrap();
+        assert_eq!(file.names().collect::<Vec<_>>(), ["a", "b"]);
+        let a = file.tensor("a").unwrap();
+        assert_eq!(a.shape(), [2, 3]);
+        assert_eq!(a.to_vec::<f32>().unwrap(), [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
+        assert_eq!(
+            file.tensor("b").unwrap().to_vec::<f32>().unwrap(),
+            [6.0, 7.0]
+        );
+    }
+
+    #[test]
+    fn a_bad_alignment_is_an_error() {
+        for alignment in [u64::MAX, 0, 3, 48, MAX_ALIGNMENT * 2] {
+            let bytes = gguf(
+                &[("general.alignment", 10, &alignment.to_le_bytes())],
+                &[("a", &[1], 0, 0)],
+                &[0; 4],
+            );
+            let error = error_of(bytes);
+            assert!(error.contains("general.alignment"), "{alignment}: {error}");
+        }
+        let error = error_of(gguf(
+            &[("general.alignment", 8, b"\x01\0\0\0\0\0\0\0x")],
+            &[],
+            &[],
+        ));
+        assert!(error.contains("general.alignment"), "{error}");
+        // The largest alignment accepted, with a header much shorter.
+        let bytes = gguf(
+            &[("general.alignment", 10, &MAX_ALIGNMENT.to_le_bytes())],
+            &[("a", &[1], 0, 0)],
+            &[],
+        );
+        let mut padded = bytes.clone();
+        padded.resize(1 << 16, 0);
+        padded.extend(1.5f32.to_le_bytes());
+        let file = Gguf::from_bytes(padded).unwrap();
+        assert_eq!(file.tensor("a").unwrap().to_vec::<f32>().unwrap(), [1.5]);
+        assert!(error_of(bytes).contains("beyond the file"));
+    }
+
+    #[test]
+    fn offsets_beyond_the_file_are_errors() {
+        let data = [0u8; 8];
+        for offset in [8, 9, 1 << 40, u64::MAX, u64::MAX - 31] {
+            let error = error_of(gguf(&[], &[("a", &[2], 0, offset)], &data));
+            assert!(
+                error.contains("beyond the file") || error.contains("does not fit"),
+                "{offset}: {error}"
+            );
+        }
+        // Sizes whose product overflows.
+        let error = error_of(gguf(&[], &[("a", &[u64::from(u32::MAX); 3], 0, 0)], &data));
+        assert!(error.contains("does not fit"), "{error}");
+    }
+
+    #[test]
+    fn every_truncation_is_an_error() {
+        let bytes = valid();
+        for len in 0..bytes.len() {
+            let error = error_of(bytes[..len].to_vec());
+            assert!(
+                ["truncated", "does not fit", "beyond the file"]
+                    .iter()
+                    .any(|m| error.contains(m)),
+                "{len}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tensor_of_an_unknown_type_fails_alone() {
+        // ggml type 16 (IQ2_XXS) is not read by Kapel; its size is not checked.
+        let data = [0u8; 8];
+        let file = Gguf::from_bytes(gguf(
+            &[],
+            &[("a", &[2], 0, 0), ("iq", &[32, 4], 16, 8)],
+            &data,
+        ))
+        .unwrap();
+        assert_eq!(file.info("iq").unwrap().dtype, None);
+        assert_eq!(file.tensor("a").unwrap().numel(), 2);
+        let error = file.tensor("iq").err().unwrap().to_string();
+        assert!(error.contains("does not read"), "{error}");
+        // Its start must still lie in the file.
+        let error = error_of(gguf(&[], &[("iq", &[32], 16, 9)], &data));
+        assert!(error.contains("starts beyond the file"), "{error}");
+    }
+
     /// The file written by `tools/parity/gguf_reference.py`; without it (in
-    /// continuous integration), the test checks nothing.
+    /// continuous integration), the test is skipped, or fails with
+    /// `KAPEL_REQUIRE_PARITY=1`.
     #[test]
     fn every_format_dequantizes_as_llama_cpp_does() {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/parity/gguf");
         let Ok(gguf) = Gguf::open(dir.join("quants.gguf")) else {
+            crate::parity_skipped("data/parity/gguf/quants.gguf");
             return;
         };
         let expected = SafeTensors::open(dir.join("expected.safetensors")).unwrap();

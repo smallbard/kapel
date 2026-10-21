@@ -40,7 +40,7 @@ impl Run<GatherRows> for Reference {
         inputs: &[&Tensor],
         grad: &Tensor,
     ) -> Result<Vec<Option<Tensor>>> {
-        op.infer(inputs)?;
+        op.infer_backward(inputs, grad)?;
         let shape = inputs[0].shape();
         let rows = indices(GatherRows::NAME, inputs[1], shape[0])?;
         let width = shape[1..].iter().product();
@@ -66,7 +66,7 @@ impl Run<ScatterAddRows> for Reference {
         inputs: &[&Tensor],
         grad: &Tensor,
     ) -> Result<Vec<Option<Tensor>>> {
-        let signature = op.infer(inputs)?;
+        let signature = op.infer_backward(inputs, grad)?;
         let rows = indices(ScatterAddRows::NAME, inputs[1], op.rows)?;
         let width = signature.shape[1..].iter().product();
         let gathered = gather(&Array::of(grad)?, &rows, width, inputs[0].shape());
