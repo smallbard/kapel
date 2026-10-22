@@ -228,6 +228,75 @@ pub fn copy_view_64(x: &[u64], view: View, mut out: DisjointSlice<u64>) {
     }
 }
 
+/// `out[to.at(i)] = x[from.at(i)]` for every position `i` of the views' shared
+/// shape: a tensor copied, bit for bit, into a part of another (elements of 1,
+/// 2, 4 or 8 bytes).
+///
+/// The backend passes a destination view whose positions are distinct (a
+/// slice of a row-major tensor), so that no two threads write the same place.
+#[kernel]
+#[launch_bounds(256)]
+pub fn copy_into_8(x: &[u8], from: View, mut out: DisjointSlice<u8>, to: View, count: u32) {
+    let idx = thread::index_1d();
+    let i = idx.get() as u32;
+    if i < count {
+        let p = to.at(i) as usize;
+        if p < out.len() {
+            // SAFETY: `p` is in bounds (checked above), and no other thread
+            // writes it: the positions of `to` are distinct (see above).
+            unsafe { *out.as_mut_ptr().add(p) = x[from.at(i) as usize] };
+        }
+    }
+}
+
+/// See `copy_into_8`.
+#[kernel]
+#[launch_bounds(256)]
+pub fn copy_into_16(x: &[u16], from: View, mut out: DisjointSlice<u16>, to: View, count: u32) {
+    let idx = thread::index_1d();
+    let i = idx.get() as u32;
+    if i < count {
+        let p = to.at(i) as usize;
+        if p < out.len() {
+            // SAFETY: `p` is in bounds (checked above), and no other thread
+            // writes it: the positions of `to` are distinct (see above).
+            unsafe { *out.as_mut_ptr().add(p) = x[from.at(i) as usize] };
+        }
+    }
+}
+
+/// See `copy_into_8`.
+#[kernel]
+#[launch_bounds(256)]
+pub fn copy_into_32(x: &[u32], from: View, mut out: DisjointSlice<u32>, to: View, count: u32) {
+    let idx = thread::index_1d();
+    let i = idx.get() as u32;
+    if i < count {
+        let p = to.at(i) as usize;
+        if p < out.len() {
+            // SAFETY: `p` is in bounds (checked above), and no other thread
+            // writes it: the positions of `to` are distinct (see above).
+            unsafe { *out.as_mut_ptr().add(p) = x[from.at(i) as usize] };
+        }
+    }
+}
+
+/// See `copy_into_8`.
+#[kernel]
+#[launch_bounds(256)]
+pub fn copy_into_64(x: &[u64], from: View, mut out: DisjointSlice<u64>, to: View, count: u32) {
+    let idx = thread::index_1d();
+    let i = idx.get() as u32;
+    if i < count {
+        let p = to.at(i) as usize;
+        if p < out.len() {
+            // SAFETY: `p` is in bounds (checked above), and no other thread
+            // writes it: the positions of `to` are distinct (see above).
+            unsafe { *out.as_mut_ptr().add(p) = x[from.at(i) as usize] };
+        }
+    }
+}
+
 /// The value of 16-bit float `bits`: `bf16` (`kind` = `half::BF16`) is the top
 /// half of an `f32`; `f16` (`half::F16`) widens exactly, subnormals included.
 fn widen(kind: u32, bits: u16) -> f32 {

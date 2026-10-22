@@ -28,6 +28,17 @@ machines.
 - Un serveur compatible avec l'API d'OpenAI.
 - Une intégration continue, avec ses tests sur carte et ses mesures de performance.
 
+## Essayer
+
+```
+cargo run --release -p kapel-cli -- run Qwen/Qwen3-0.6B
+```
+
+`kapel run` télécharge le modèle depuis le Hub de Hugging Face (ou lit un dossier
+local), puis tient une conversation : un message par ligne, une ligne vide pour finir.
+`--prompt TEXTE` répond une fois, `--device cuda` calcule sur la carte (Kapel construit
+avec `--features cuda`), `kapel --help` donne les autres options.
+
 ## Feuille de route
 
 Kapel se construit en trois temps :

@@ -52,6 +52,19 @@ changelog says how.
   device and in a given type; the small parity models run on the card.
 - `kapel-cuda`: rotary angles computed on the device in `f64`, and normalizations with
   one warp per row: no copy back to the host per layer.
+- `kapel-ops`: `Concat`, tensors joined along a dimension, bit for bit.
+- `kapel-models`: a cache of keys and values (`Cache`) and `Model::step`, which
+  computes only the new positions after it and the logits of the last.
+- `kapel-infer`: the generation engine. `Pipeline` loads a model directory onto a
+  backend; `generate` gives the tokens after a prompt one at a time, with their final
+  text, and stops on the model's end tokens, stop sequences or a length. Greedy
+  decoding and sampling as `transformers` does them (repetition penalty,
+  temperature, top-k, top-p, min-p), with a seeded generator. Chat prompts through
+  the model's template.
+- `kapel-cli`: `kapel run MODEL`, a conversation or a single answer, on the
+  processor or the card, with a model from a directory or the Hub.
+- `tools/parity/generation_reference.py` and the example `generation_parity`: greedy
+  generations against `transformers`.
 
 ### Changed
 

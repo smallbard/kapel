@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 use kapel_core::{DType, Tensor};
 use kapel_hub::Checkpoint;
 use kapel_ops::{
-    Affine, Attention, Backend, Binary, BinaryKind, Cast, Contiguous, GatherRows, LayerNorm,
-    Matmul, RmsNorm, Rope, Transfer, Unary, UnaryKind,
+    Affine, Attention, Backend, Binary, BinaryKind, Cast, Concat, Contiguous, GatherRows,
+    LayerNorm, Matmul, RmsNorm, Rope, Transfer, Unary, UnaryKind,
 };
 
 use crate::ModelError;
@@ -21,6 +21,40 @@ pub struct Model {
 }
 
 type Result<T> = std::result::Result<T, ModelError>;
+
+/// The keys and values of the positions a model has already seen, layer by
+/// layer, on the backend of the steps that filled them: what lets
+/// [`Model::step`] compute only the new positions.
+#[derive(Clone, Debug, Default)]
+pub struct Cache {
+    /// Per layer, the keys and values `[1, kv_heads, len, head_dim]`.
+    layers: Vec<Option<(Tensor, Tensor)>>,
+    len: usize,
+}
+
+impl Cache {
+    /// An empty cache.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The number of positions it holds.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether it holds no position.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+/// Which positions get logits.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Logits {
+    All,
+    Last,
+}
 
 /// The operations of the forward pass, on one backend.
 struct Ops<'a, B>(&'a B);
@@ -205,14 +239,50 @@ impl Model {
     ///
     /// If a weight is missing, or an operation fails on the backend.
     pub fn forward<B: Backend + Transfer>(&self, backend: &B, ids: &[u32]) -> Result<Tensor> {
+        self.run(backend, ids, &mut Cache::new(), Logits::All)
+    }
+
+    /// The logits `[1, vocab]` of the last of `ids`, which follow the positions
+    /// of `cache`; their keys and values are added to it. Each new position
+    /// sees the cached ones and the new ones before it: a prompt is given at
+    /// once (the prefill), then the generated tokens one at a time.
+    ///
+    /// # Errors
+    ///
+    /// If `ids` is empty, a weight is missing, or an operation fails on the
+    /// backend. On an error, the cache may hold some layers of the failed step:
+    /// start again from a new one.
+    pub fn step<B: Backend + Transfer>(
+        &self,
+        backend: &B,
+        ids: &[u32],
+        cache: &mut Cache,
+    ) -> Result<Tensor> {
+        if ids.is_empty() {
+            return Err(ModelError::Tensor(kapel_core::Error::InvalidArgument {
+                op: "step",
+                message: "no token to compute".into(),
+            }));
+        }
+        self.run(backend, ids, cache, Logits::Last)
+    }
+
+    fn run<B: Backend + Transfer>(
+        &self,
+        backend: &B,
+        ids: &[u32],
+        cache: &mut Cache,
+        logits: Logits,
+    ) -> Result<Tensor> {
         let c = &self.config;
         let ops = Ops(backend);
         let t = ids.len();
+        let past = cache.len;
         let ids_tensor = backend.upload(&Tensor::from_slice(ids, &[t])?)?;
-        let positions = backend.upload(&Tensor::from_slice(
-            &(0..t as u32).collect::<Vec<_>>(),
-            &[t],
-        )?)?;
+        let first = u32::try_from(past).map_err(|_| kapel_core::Error::Overflow { op: "step" })?;
+        let positions: Vec<u32> = (0..t as u32).map(|i| first + i).collect();
+        let positions = backend.upload(&Tensor::from_slice(&positions, &[t])?)?;
+        cache.layers.resize(c.layers, None);
 
         let (embed_name, prefix) = match c.block {
             Block::Gpt2 => ("transformer.wte.weight", "transformer.h"),
@@ -237,7 +307,8 @@ impl Model {
             x = match c.block {
                 Block::Sequential | Block::Sandwich => {
                     let h = self.norm(&ops, &x, &format!("{p}.input_layernorm"))?;
-                    let mut a = self.attention(&ops, &h, &positions, layer, &p)?;
+                    let mut a =
+                        self.attention(&ops, &h, &positions, &mut cache.layers[layer], layer, &p)?;
                     if c.block == Block::Sandwich {
                         a = self.norm(&ops, &a, &format!("{p}.post_attention_layernorm"))?;
                     }
@@ -266,7 +337,8 @@ impl Model {
                 }
                 Block::Parallel => {
                     let h = self.norm(&ops, &x, &format!("{p}.input_layernorm"))?;
-                    let a = self.attention(&ops, &h, &positions, layer, &p)?;
+                    let a =
+                        self.attention(&ops, &h, &positions, &mut cache.layers[layer], layer, &p)?;
                     let fc1 = ops.linear(
                         &h,
                         self.weight(&format!("{p}.mlp.fc1.weight"))?,
@@ -281,7 +353,8 @@ impl Model {
                 }
                 Block::Gpt2 => {
                     let h = self.norm(&ops, &x, &format!("{p}.ln_1"))?;
-                    let a = self.attention(&ops, &h, &positions, layer, &p)?;
+                    let a =
+                        self.attention(&ops, &h, &positions, &mut cache.layers[layer], layer, &p)?;
                     let x = ops.binary(BinaryKind::Add, &x, &a)?;
                     let h = self.norm(&ops, &x, &format!("{p}.ln_2"))?;
                     // GPT-2's `Conv1D` stores `[in, out]`: `y = x · w`.
@@ -312,6 +385,11 @@ impl Model {
             Block::Parallel => "model.final_layernorm",
             _ => "model.norm",
         };
+        cache.len = past + t;
+        // The norm and the head act row by row: only the rows wanted.
+        if logits == Logits::Last {
+            x = x.narrow(0, t - 1, 1)?;
+        }
         let h = self.norm(&ops, &x, final_norm)?;
         let head = match self.optional("lm_head.weight") {
             Some(w) if !c.tie_embeddings => w,
@@ -328,12 +406,14 @@ impl Model {
         Ok(logits)
     }
 
-    /// The attention of one block: `[T, hidden]` to `[T, hidden]`.
+    /// The attention of one block: `[T, hidden]` to `[T, hidden]`, after the
+    /// keys and values of `cached`, to which the new ones are added.
     fn attention<B: Backend>(
         &self,
         ops: &Ops<'_, B>,
         h: &Tensor,
         positions: &Tensor,
+        cached: &mut Option<(Tensor, Tensor)>,
         layer: usize,
         p: &str,
     ) -> Result<Tensor> {
@@ -397,6 +477,14 @@ impl Model {
             q = ops.0.forward(&rope, &[&q, positions])?;
             k = ops.0.forward(&rope, &[&k, positions])?;
         }
+        let (k, v) = match cached.take() {
+            Some((k0, v0)) => (
+                ops.0.forward(&Concat { dim: 2 }, &[&k0, &k])?,
+                ops.0.forward(&Concat { dim: 2 }, &[&v0, &v])?,
+            ),
+            None => (k, v),
+        };
+        *cached = Some((k.clone(), v.clone()));
         let attention = Attention {
             causal: true,
             window: c.windows[layer],

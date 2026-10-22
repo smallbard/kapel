@@ -4,7 +4,9 @@ use std::f32::consts::PI;
 use std::sync::Arc;
 
 use kapel_core::{Error, HostStorage, Layout, Result, Tensor};
-use kapel_ops::{Affine, Binary, BinaryKind, Cast, Contiguous, Operation, Run, Unary, UnaryKind};
+use kapel_ops::{
+    Affine, Binary, BinaryKind, Cast, Concat, Contiguous, Operation, Run, Unary, UnaryKind,
+};
 
 use crate::backend::{CHUNK, Cpu};
 use crate::io::{self, broadcast_offsets};
@@ -376,5 +378,38 @@ impl Run<Contiguous> for Cpu {
             inputs[0].shape(),
             dtype,
         )?)])
+    }
+}
+
+impl Run<Concat> for Cpu {
+    fn forward(&self, op: &Concat, inputs: &[&Tensor]) -> Result<Tensor> {
+        op.infer(inputs)?;
+        Tensor::concat(inputs, op.dim)
+    }
+
+    fn backward(
+        &self,
+        op: &Concat,
+        inputs: &[&Tensor],
+        grad: &Tensor,
+    ) -> Result<Vec<Option<Tensor>>> {
+        op.infer_backward(inputs, grad)?;
+        // Each input receives its slice of the gradient, in its own type; an
+        // integer input receives none.
+        let mut start = 0;
+        inputs
+            .iter()
+            .map(|x| {
+                let len = x.shape()[op.dim];
+                let slice = grad.narrow(op.dim, start, len)?;
+                start += len;
+                if !x.dtype().is_float() {
+                    return Ok(None);
+                }
+                let g = io::contiguous(Concat::NAME, &slice)?;
+                io::supported(Concat::NAME, x.dtype())?;
+                Ok(Some(io::write(&self.buffers, &g, x.shape(), x.dtype())?))
+            })
+            .collect()
     }
 }

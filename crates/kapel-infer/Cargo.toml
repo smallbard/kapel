@@ -10,3 +10,14 @@ publish.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+kapel-core.workspace = true
+kapel-ops.workspace = true
+kapel-hub.workspace = true
+kapel-models.workspace = true
+kapel-tokenizers.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+kapel-cpu.workspace = true

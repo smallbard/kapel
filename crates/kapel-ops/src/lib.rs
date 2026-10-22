@@ -26,7 +26,7 @@ pub mod special;
 use std::fmt;
 
 pub use attention::Attention;
-pub use copy::Contiguous;
+pub use copy::{Concat, Contiguous};
 pub use elementwise::{Affine, Binary, BinaryKind, Cast, Unary, UnaryKind};
 pub use index::{GatherRows, ScatterAddRows};
 use kapel_core::{DType, Error, Result, Tensor};
@@ -149,6 +149,7 @@ pub trait Backend:
     + Run<Affine>
     + Run<Cast>
     + Run<Contiguous>
+    + Run<Concat>
     + Run<Matmul>
     + Run<QuantizedMatmul>
     + Run<Sum>
@@ -171,6 +172,7 @@ impl<B> Backend for B where
         + Run<Affine>
         + Run<Cast>
         + Run<Contiguous>
+        + Run<Concat>
         + Run<Matmul>
         + Run<QuantizedMatmul>
         + Run<Sum>

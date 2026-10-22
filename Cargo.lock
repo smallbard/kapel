@@ -727,6 +727,17 @@ dependencies = [
 [[package]]
 name = "kapel-cli"
 version = "0.1.0"
+dependencies = [
+ "kapel-core",
+ "kapel-cpu",
+ "kapel-cuda",
+ "kapel-hub",
+ "kapel-infer",
+ "kapel-models",
+ "kapel-ops",
+ "kapel-tokenizers",
+ "serde_json",
+]
 
 [[package]]
 name = "kapel-core"
@@ -774,6 +785,15 @@ dependencies = [
 [[package]]
 name = "kapel-infer"
 version = "0.1.0"
+dependencies = [
+ "kapel-core",
+ "kapel-cpu",
+ "kapel-hub",
+ "kapel-models",
+ "kapel-ops",
+ "kapel-tokenizers",
+ "serde_json",
+]
 
 [[package]]
 name = "kapel-models"

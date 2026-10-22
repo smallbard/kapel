@@ -14,3 +14,23 @@ path = "src/main.rs"
 
 [lints]
 workspace = true
+
+[features]
+# Runs models on an NVIDIA card (`--device cuda`): needs the CUDA toolkit.
+cuda = ["dep:kapel-cuda", "kapel-cuda/cuda"]
+
+[dependencies]
+kapel-core.workspace = true
+kapel-ops.workspace = true
+kapel-cpu.workspace = true
+kapel-hub.workspace = true
+kapel-infer.workspace = true
+kapel-tokenizers.workspace = true
+kapel-cuda = { workspace = true, optional = true }
+serde_json.workspace = true
+
+[dev-dependencies]
+kapel-models.workspace = true
+
+[[example]]
+name = "generation_parity"

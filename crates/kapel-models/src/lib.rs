@@ -26,7 +26,7 @@ pub use config::{
     Block, Config, MAX_HEAD_DIM, MAX_HEADS, MAX_HIDDEN, MAX_INTERMEDIATE, MAX_LAYERS, MAX_VOCAB,
     Norm,
 };
-pub use model::Model;
+pub use model::{Cache, Model};
 
 /// What can go wrong with a model.
 #[derive(Debug)]

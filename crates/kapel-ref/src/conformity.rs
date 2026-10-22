@@ -32,9 +32,9 @@ use std::panic::{self, AssertUnwindSafe};
 
 use kapel_core::{DType, Result, Tensor};
 use kapel_ops::{
-    Affine, Attention, Backend, Binary, BinaryKind, Cast, Contiguous, GatherRows, LayerNorm,
-    LogSoftmax, Matmul, Max, Mean, Operation, QuantizedMatmul, RmsNorm, Rope, RopeLayout,
-    RopeScaling, Run, ScatterAddRows, Softmax, Sum, Transfer, Unary, UnaryKind,
+    Affine, Attention, Backend, Binary, BinaryKind, Cast, Concat, Contiguous, GatherRows,
+    LayerNorm, LogSoftmax, Matmul, Max, Mean, Operation, QuantizedMatmul, RmsNorm, Rope,
+    RopeLayout, RopeScaling, Run, ScatterAddRows, Softmax, Sum, Transfer, Unary, UnaryKind,
 };
 
 use crate::Reference;
@@ -318,6 +318,35 @@ fn cases<V: Visitor>(v: &mut V, dtype: DType) {
     ] {
         v.visit(&Contiguous, case.into(), vec![arg]);
     }
+    let mut r = |shape: &[usize]| random(rng, shape, dtype, -1.0, 1.0);
+    v.visit(
+        &Concat { dim: 0 },
+        "[2, 3] and [1, 3] along 0".into(),
+        vec![plain(r(&[2, 3])), plain(r(&[1, 3]))],
+    );
+    v.visit(
+        &Concat { dim: 1 },
+        "[2, 1, 4], [3, 2, 4]ᵀ, [2, 0, 4] along 1".into(),
+        vec![
+            plain(r(&[2, 1, 4])),
+            viewed(r(&[3, 2, 4]), View::Transpose(0, 1)),
+            plain(r(&[2, 0, 4])),
+        ],
+    );
+    // A cache of keys `[1, H, T, D]` growing by one position.
+    v.visit(
+        &Concat { dim: 2 },
+        "[1, 2, 5, 4] and [1, 2, 1, 4] along 2".into(),
+        vec![plain(r(&[1, 2, 5, 4])), plain(r(&[1, 2, 1, 4]))],
+    );
+    v.visit(
+        &Concat { dim: 1 },
+        "[3] broadcast to [2, 3], and [2, 2] along 1".into(),
+        vec![
+            viewed(r(&[3]), View::Broadcast(vec![2, 3])),
+            plain(r(&[2, 2])),
+        ],
+    );
     let wide = plain(random(rng, &[3, 4], dtype, -150.0, 150.0));
     v.visit(
         &Cast { dtype: DType::I8 },

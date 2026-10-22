@@ -10,3 +10,4 @@
 /kernels/target
 /kernels/*.ll
 /kernels/*.ptx
+/.venv

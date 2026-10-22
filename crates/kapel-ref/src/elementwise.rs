@@ -4,7 +4,9 @@ use std::f64::consts::PI;
 use std::sync::Arc;
 
 use kapel_core::{Error, HostStorage, Layout, Result, Tensor};
-use kapel_ops::{Affine, Binary, BinaryKind, Cast, Contiguous, Operation, Run, Unary, UnaryKind};
+use kapel_ops::{
+    Affine, Binary, BinaryKind, Cast, Concat, Contiguous, Operation, Run, Unary, UnaryKind,
+};
 
 use crate::Reference;
 use crate::array::{Array, broadcast_map, sum_to};
@@ -260,5 +262,36 @@ impl Run<Contiguous> for Reference {
             return Ok(vec![None]);
         }
         Ok(vec![Some(Array::of(grad)?.tensor()?)])
+    }
+}
+
+impl Run<Concat> for Reference {
+    /// The join keeps the inputs' type, bit for bit, like `Contiguous`.
+    fn forward(&self, op: &Concat, inputs: &[&Tensor]) -> Result<Tensor> {
+        op.infer(inputs)?;
+        Tensor::concat(inputs, op.dim)
+    }
+
+    fn backward(
+        &self,
+        op: &Concat,
+        inputs: &[&Tensor],
+        grad: &Tensor,
+    ) -> Result<Vec<Option<Tensor>>> {
+        op.infer_backward(inputs, grad)?;
+        let mut start = 0;
+        inputs
+            .iter()
+            .map(|x| {
+                let len = x.shape()[op.dim];
+                let slice = grad.narrow(op.dim, start, len)?;
+                start += len;
+                if x.dtype().is_float() {
+                    Ok(Some(Array::of(&slice)?.tensor()?))
+                } else {
+                    Ok(None)
+                }
+            })
+            .collect()
     }
 }

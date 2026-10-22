@@ -7,7 +7,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use kapel_hub::{Checkpoint, SafeTensors};
-use kapel_models::Model;
+use kapel_models::{Cache, Model};
 
 /// The largest difference, relative to the largest logit, over every text.
 fn worst(model: &Model, reference: &SafeTensors, cpu: &kapel_cpu::Cpu) -> f64 {
@@ -35,6 +35,56 @@ fn worst(model: &Model, reference: &SafeTensors, cpu: &kapel_cpu::Cpu) -> f64 {
         }
     }
     worst / scale
+}
+
+/// The logits of `ids` computed with a cache, a prefill of the first half and
+/// then one token at a time, against those of the whole sequence at once: the
+/// largest difference relative to the largest logit.
+fn cached_against_whole(model: &Model, ids: &[u32], cpu: &kapel_cpu::Cpu) -> f64 {
+    let whole = model.forward(cpu, ids).unwrap().to_vec::<f32>().unwrap();
+    let vocab = whole.len() / ids.len();
+    let mut cache = Cache::new();
+    let half = ids.len() / 2;
+    let (mut worst, mut scale) = (0.0f64, 0.0f64);
+    let mut compare = |row: usize, got: Vec<f32>| {
+        for (a, b) in got.iter().zip(&whole[row * vocab..(row + 1) * vocab]) {
+            worst = worst.max(f64::from((a - b).abs()));
+            scale = scale.max(f64::from(b.abs()));
+        }
+    };
+    let logits = |t: kapel_core::Tensor| t.to_vec::<f32>().unwrap();
+    compare(
+        half - 1,
+        logits(model.step(cpu, &ids[..half], &mut cache).unwrap()),
+    );
+    for (i, &id) in ids.iter().enumerate().skip(half) {
+        compare(i, logits(model.step(cpu, &[id], &mut cache).unwrap()));
+    }
+    assert_eq!(cache.len(), ids.len());
+    worst / scale
+}
+
+#[test]
+fn a_cache_gives_the_logits_of_the_whole_sequence() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/parity");
+    let cpu = kapel_cpu::Cpu::new();
+    for dir in std::fs::read_dir(&root).into_iter().flatten().flatten() {
+        let Ok(reference) = SafeTensors::open(dir.path().join("reference.safetensors")) else {
+            continue;
+        };
+        let name = dir.file_name().to_string_lossy().into_owned();
+        let model = Model::load(&Checkpoint::open(dir.path()).unwrap()).unwrap();
+        let ids: Vec<u32> = reference
+            .tensor("ids_2")
+            .unwrap()
+            .to_vec::<i32>()
+            .unwrap()
+            .into_iter()
+            .map(|v| v as u32)
+            .collect();
+        let relative = cached_against_whole(&model, &ids, &cpu);
+        assert!(relative < 1e-5, "{name}: relative difference {relative:e}");
+    }
 }
 
 #[test]

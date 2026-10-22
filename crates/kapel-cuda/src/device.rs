@@ -511,7 +511,12 @@ impl Cuda {
     /// A tensor of this backend, of any type with elements of their own (not
     /// quantized blocks), as a kernel argument read through `layout`. The
     /// storage's length counts its elements.
-    fn any_arg(&self, op: &'static str, tensor: &Tensor, layout: &Layout) -> Result<DeviceTensor> {
+    pub(crate) fn any_arg(
+        &self,
+        op: &'static str,
+        tensor: &Tensor,
+        layout: &Layout,
+    ) -> Result<DeviceTensor> {
         let dtype = tensor.dtype();
         let size = dtype
             .element_size()

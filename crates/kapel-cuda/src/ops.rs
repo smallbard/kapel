@@ -16,12 +16,12 @@ use std::sync::Arc;
 use kapel_core::{DType, Error, HostStorage, Layout, Result, Tensor};
 use kapel_cuda_abi::{binary, unary};
 use kapel_ops::{
-    Affine, Attention, Binary, BinaryKind, Cast, Contiguous, GatherRows, LayerNorm, LogSoftmax,
-    Matmul, Max, Mean, Operation, QuantizedMatmul, RmsNorm, Rope, RopeLayout, Run, ScatterAddRows,
-    Softmax, Sum, Transfer, Unary, UnaryKind,
+    Affine, Attention, Binary, BinaryKind, Cast, Concat, Contiguous, GatherRows, LayerNorm,
+    LogSoftmax, Matmul, Max, Mean, Operation, QuantizedMatmul, RmsNorm, Rope, RopeLayout, Run,
+    ScatterAddRows, Softmax, Sum, Transfer, Unary, UnaryKind,
 };
 
-use crate::device::{Args, Cuda, CudaStorage, Flat, Table, small, smalls};
+use crate::device::{Args, Cuda, CudaStorage, Flat, Table, small, smalls, view_of};
 
 fn unary_code(op: &'static str, kind: UnaryKind) -> Result<u32> {
     Ok(match kind {
@@ -553,6 +553,68 @@ impl Run<Cast> for Cuda {
             return Ok(vec![None]);
         }
         Ok(vec![Some(self.cast(grad, dtype)?)])
+    }
+}
+
+impl Run<Concat> for Cuda {
+    /// Each input is copied, through its own layout, into its slice of the
+    /// output (`copy_into_*`), bit for bit.
+    fn forward(&self, op: &Concat, inputs: &[&Tensor]) -> Result<Tensor> {
+        let name = Concat::NAME;
+        let signature = op.infer(inputs)?;
+        let dtype = signature.dtype;
+        let kernel = match dtype.element_size() {
+            Some(1) => "copy_into_8",
+            Some(2) => "copy_into_16",
+            Some(4) => "copy_into_32",
+            _ => "copy_into_64",
+        };
+        let layout = Layout::contiguous(&signature.shape)?;
+        self.output_as(&signature.shape, dtype, false, |out, n| {
+            let mut start = 0;
+            for x in inputs {
+                let len = x.shape()[op.dim];
+                let to = view_of(name, &layout.narrow(op.dim, start, len)?)?;
+                start += len;
+                let count = x.numel();
+                let from = self.any_arg(name, x, x.layout())?;
+                self.launch(
+                    kernel,
+                    count,
+                    Args::new()
+                        .strided(&from)
+                        .slice(out, n)
+                        .view(to)
+                        .u32(small(name, count)?),
+                )?;
+            }
+            Ok(())
+        })
+    }
+
+    fn backward(
+        &self,
+        op: &Concat,
+        inputs: &[&Tensor],
+        grad: &Tensor,
+    ) -> Result<Vec<Option<Tensor>>> {
+        op.infer_backward(inputs, grad)?;
+        // Each input receives its slice of the gradient, in its own type; an
+        // integer input receives none.
+        let mut start = 0;
+        inputs
+            .iter()
+            .map(|x| {
+                let len = x.shape()[op.dim];
+                let slice = grad.narrow(op.dim, start, len)?;
+                start += len;
+                if x.dtype().is_float() {
+                    Ok(Some(self.cast(&slice, x.dtype())?))
+                } else {
+                    Ok(None)
+                }
+            })
+            .collect()
     }
 }
 

@@ -301,6 +301,76 @@ impl Tensor {
             self.dtype,
         )
     }
+
+    /// `tensors` joined along `dim`, in host memory: they have the same type
+    /// (not quantized) and the same shape but along `dim`. The bytes are
+    /// copied as they are.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Arity`] without tensors, [`Error::InvalidDim`],
+    /// [`Error::DTypeMismatch`], [`Error::ShapeMismatch`] or
+    /// [`Error::UnsupportedDType`] for tensors that cannot be joined,
+    /// [`Error::WrongDevice`] for a tensor outside host memory: each backend
+    /// joins its own tensors.
+    pub fn concat(tensors: &[&Self], dim: usize) -> Result<Self> {
+        let op = "concat";
+        let first = tensors.first().ok_or(Error::Arity {
+            op,
+            expected: "at least 1",
+            got: 0,
+        })?;
+        let (dtype, rank) = (first.dtype, first.rank());
+        if dim >= rank {
+            return Err(Error::InvalidDim { op, dim, rank });
+        }
+        let size = dtype
+            .element_size()
+            .ok_or(Error::UnsupportedDType { op, dtype })?;
+        let mut shape = first.shape().to_vec();
+        shape[dim] = 0;
+        for x in tensors {
+            if x.dtype != dtype {
+                return Err(Error::DTypeMismatch {
+                    op,
+                    expected: dtype,
+                    got: x.dtype,
+                });
+            }
+            if x.rank() != rank || (0..rank).any(|d| d != dim && x.shape()[d] != first.shape()[d]) {
+                return Err(Error::ShapeMismatch {
+                    op,
+                    expected: first.shape().to_vec(),
+                    got: x.shape().to_vec(),
+                });
+            }
+            shape[dim] = shape[dim]
+                .checked_add(x.shape()[dim])
+                .ok_or(Error::Overflow { op })?;
+        }
+        let layout = Layout::contiguous(&shape)?;
+        // Each input contributes, for every index of the dimensions before
+        // `dim`, one run of `its size along dim × inner` elements.
+        let outer: usize = shape[..dim].iter().product();
+        let inner: usize = shape[dim + 1..].iter().product();
+        let parts = tensors
+            .iter()
+            .map(|x| x.contiguous())
+            .collect::<Result<Vec<_>>>()?;
+        let mut storage = HostStorage::new(layout.numel() * size);
+        let out = storage.bytes_mut();
+        let mut at = 0;
+        for o in 0..outer {
+            for part in &parts {
+                let run = part.shape()[dim] * inner * size;
+                let bytes = part.host(op)?;
+                let start = part.layout.offset() * size + o * run;
+                out[at..at + run].copy_from_slice(&bytes[start..start + run]);
+                at += run;
+            }
+        }
+        Self::from_storage(Arc::new(storage), layout, dtype)
+    }
 }
 
 impl fmt::Debug for Tensor {

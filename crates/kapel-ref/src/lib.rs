@@ -2,9 +2,9 @@
 //! written to be read.
 //!
 //! [`Reference`] reads its inputs at their exact value, whatever their type,
-//! computes in `f64`, and returns `f64` tensors, except two operations that
-//! keep a type: [`kapel_ops::Cast`] returns its target type, and
-//! [`kapel_ops::Contiguous`] its input's. It is slow on purpose: each
+//! computes in `f64`, and returns `f64` tensors, except the operations that
+//! copy: [`kapel_ops::Cast`] returns its target type, [`kapel_ops::Contiguous`]
+//! and [`kapel_ops::Concat`] their inputs'. It is slow on purpose: each
 //! operation is the direct transcription of its definition in `kapel-ops`, so
 //! that it can be checked by eye.
 //!
@@ -155,6 +155,7 @@ mod tests {
         kapel_ops::Affine,
         kapel_ops::Cast,
         kapel_ops::Contiguous,
+        kapel_ops::Concat,
         kapel_ops::Matmul,
         kapel_ops::QuantizedMatmul,
         kapel_ops::Sum,
