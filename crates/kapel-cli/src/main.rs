@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use kapel_infer::{Finish, Pipeline, Request};
+use kapel_infer::{Finish, LoadOptions, Pipeline, Request};
 use kapel_ops::{Backend, Transfer};
 use kapel_tokenizers::Message;
 
@@ -16,9 +16,9 @@ use crate::args::{Device, Run};
 const USAGE: &str = "\
 usage: kapel run MODEL [options]
 
-Generates text with MODEL, a model directory or a repository of the Hugging Face
-Hub (owner/name, downloaded once into ~/.cache/kapel/hub, or $KAPEL_CACHE; a gated
-model needs HF_TOKEN). Without --prompt, holds a conversation: one message per line
+Generates text with MODEL: a model directory, a GGUF file, or a repository of the
+Hugging Face Hub (owner/name, downloaded once into ~/.cache/kapel/hub, or
+$KAPEL_CACHE; a gated model needs HF_TOKEN). Without --prompt, holds a conversation: one message per line
 on the standard input, an empty line to end.
 
 options:
@@ -26,8 +26,8 @@ options:
   --raw                    continue the prompt as is, without the chat template
   --system TEXT            a system message first
   --device cpu|cuda[:N]    where to compute (default cpu; cuda needs the feature)
-  --dtype f32|bf16|f16     the type of the weights (default f32 on cpu, bf16 on
-                           cuda)
+  --dtype f32|bf16|f16     the type of the float weights (default f32 on cpu,
+                           bf16 on cuda); quantized weights keep their format
   --max-tokens N           the most tokens per answer (default 512)
   --greedy                 always the most likely token
   --temperature T          sampling (defaults: the model's generation_config.json)
@@ -36,6 +36,12 @@ options:
   --stop TEXT              end the answer at TEXT (repeatable)
   --revision REV           the revision of a Hub repository (default main)
   --stats                  speeds on the standard error
+  --quantize FORMAT        quantize the linear projections: int8, int4 (groups of
+                           128 and 64, or int8/G, int4/G), q8_0, q4_0
+  --quantize-output        quantize the output table too
+  --byte-activations       on cpu, quantize the activations of the products by
+                           quantized weights to bytes, as llama.cpp does: faster,
+                           and the results change a little
 ";
 
 fn main() -> ExitCode {
@@ -66,7 +72,8 @@ fn main() -> ExitCode {
 /// The model directory: `model` itself, or its snapshot from the Hub.
 fn directory(model: &str, revision: &str) -> Result<PathBuf, String> {
     let path = PathBuf::from(model);
-    if path.is_dir() {
+    // A model directory, or a GGUF file.
+    if path.is_dir() || path.is_file() {
         return Ok(path);
     }
     eprintln!("kapel: fetching {model} from the Hub…");
@@ -77,17 +84,29 @@ fn directory(model: &str, revision: &str) -> Result<PathBuf, String> {
 fn execute(run: &Run) -> Result<(), String> {
     let dir = directory(&run.model, &run.revision)?;
     match run.device {
-        Device::Cpu => serve(
-            run,
-            Pipeline::load(&dir, kapel_cpu::Cpu::new(), run.dtype).map_err(|e| e.to_string())?,
-        ),
+        Device::Cpu => {
+            let options = LoadOptions {
+                dtype: run.dtype.or(Some(kapel_core::DType::F32)),
+                quantize: run.quantize,
+                quantize_output: run.quantize_output,
+            };
+            let cpu = kapel_cpu::Cpu::new().with_byte_activations(run.byte_activations);
+            serve(
+                run,
+                Pipeline::load_with(&dir, cpu, &options).map_err(|e| e.to_string())?,
+            )
+        }
         #[cfg(feature = "cuda")]
         Device::Cuda(ordinal) => {
             let cuda = kapel_cuda::Cuda::new(ordinal).map_err(|e| e.to_string())?;
-            let dtype = run.dtype.or(Some(kapel_core::DType::BF16));
+            let options = LoadOptions {
+                dtype: run.dtype.or(Some(kapel_core::DType::BF16)),
+                quantize: run.quantize,
+                quantize_output: run.quantize_output,
+            };
             serve(
                 run,
-                Pipeline::load(&dir, cuda, dtype).map_err(|e| e.to_string())?,
+                Pipeline::load_with(&dir, cuda, &options).map_err(|e| e.to_string())?,
             )
         }
         #[cfg(not(feature = "cuda"))]

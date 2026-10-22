@@ -7,7 +7,7 @@ it, greedily, in float32 (on the card if there is one, without TF32) and, on a
 card, in bfloat16.
 
 Usage: python tools/parity/generation_reference.py [names or model ids...]
-Needs: torch, transformers, huggingface_hub. Gated models need HF_TOKEN.
+Needs: torch, transformers, huggingface_hub.
 """
 
 import json
@@ -25,9 +25,10 @@ MODELS = {
     "qwen3-1.7b": "Qwen/Qwen3-1.7B",
     "qwen3-4b": "Qwen/Qwen3-4B",
     "qwen3-8b": "Qwen/Qwen3-8B",
-    "llama3.2-1b": "meta-llama/Llama-3.2-1B-Instruct",
-    "llama3.2-3b": "meta-llama/Llama-3.2-3B-Instruct",
-    "mistral-7b": "mistralai/Mistral-7B-Instruct-v0.3",
+    # Copies of the gated repositories of Meta and Mistral, without a token.
+    "llama3.2-1b": "unsloth/Llama-3.2-1B-Instruct",
+    "llama3.2-3b": "unsloth/Llama-3.2-3B-Instruct",
+    "mistral-7b": "unsloth/mistral-7b-instruct-v0.3",
 }
 
 PROMPTS = [

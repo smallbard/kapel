@@ -34,7 +34,7 @@ A quantized type stores whole blocks: a scale (and sometimes a minimum) followed
 | `Q5_0`, `Q5_1` | 32 | 22, 24 | as Q4, with a fifth bit per element from a u32 |
 | `Q2K` to `Q6K` | 256 | 84 to 210 | super-blocks with 6-bit or 8-bit sub-block scales, as in llama.cpp |
 
-Three functions do all the conversions. `decode(bytes) -> f64` reads one element exactly. `encode(value, out)` writes one: floats round to nearest, ties to even; integers round, then saturate, and NaN becomes 0. The free function `dequantize(dtype, bytes)` expands quantized blocks to `f64`, following llama.cpp's definitions. `storage_bytes(elements)` returns `BlockMisaligned` unless the count is a whole number of blocks.
+Three functions do all the conversions. `decode(bytes) -> f64` reads one element exactly. `encode(value, out)` writes one: floats round to nearest, ties to even; integers round, then saturate, and NaN becomes 0. The free function `dequantize(dtype, bytes)` expands quantized blocks to `f64`, following llama.cpp's definitions, and `quantize(dtype, values)` goes the other way: Kapel's int8 with the scale `max |x| / 127`, int4 with the scale of least squared error among those that put the largest magnitude at either end of the 16 levels and those between, and GGUF's Q8\_0 and Q4\_0 exactly as llama.cpp's reference quantizes them. `storage_bytes(elements)` returns `BlockMisaligned` unless the count is a whole number of blocks.
 
 ## 3.2 Small floats without tables
 

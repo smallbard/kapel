@@ -1,6 +1,6 @@
 # 6. The CPU backend: kapel-cpu
 
-`kapel-cpu` runs the whole catalogue on x86 processors with AVX-512 or AVX2, and on any other target with portable code that the compiler vectorizes. It computes in `f32`; inputs may be `f32`, `bf16` or `f16`, and outputs take the input type. `f64` is left to the reference. Most of the speed comes from three pieces: a deterministic thread pool, a blocked matrix product in the style of BLIS, and vectorized row functions. Most of the safety comes from one small type, `Isa`.
+`kapel-cpu` runs the whole catalogue on x86 processors with AVX-512 or AVX2, and on any other target with portable code that the compiler vectorizes. It computes in `f32`; inputs may be `f32`, `bf16` or `f16`, and outputs take the input type. `f64` is left to the reference. Most of the speed comes from four pieces: a deterministic thread pool, a blocked matrix product in the style of BLIS, vectorized row functions, and products by quantized weights that read the codes in place. Most of the safety comes from one small type, `Isa`.
 
 ## 6.1 The backend value
 
@@ -9,10 +9,12 @@ pub struct Cpu {
     pub(crate) pool: Arc<Pool>,          // permanent worker threads
     pub(crate) isa: Isa,                 // the instructions it may use
     pub(crate) buffers: Arc<BufferPool>, // up to 1 GiB of reusable host buffers
+    pub(crate) byte_activations: bool,   // quantized products with activations in bytes
+    pub(crate) vnni: bool,               // proof that AVX-512 VNNI can run
 }
 ```
 
-`Cpu::new()` uses one thread per physical core, counted from `/proc/cpuinfo` when possible, because simultaneous multithreading brings nothing to matrix products. The environment variable `KAPEL_THREADS` overrides it, clamped to four times the number of logical cores. `with_isa(kind)` restricts the instruction set, which the tests use to check every path on one machine. Clones share threads and buffers.
+`Cpu::new()` uses one thread per physical core, counted from `/proc/cpuinfo` when possible, because simultaneous multithreading brings nothing to matrix products. The environment variable `KAPEL_THREADS` overrides it, clamped to four times the number of logical cores. `with_isa(kind)` restricts the instruction set, which the tests use to check every path on one machine. `with_byte_activations(true)` changes how quantized products compute (section 6.7). Clones share threads and buffers.
 
 ## 6.2 Instruction sets as a proof
 
@@ -36,6 +38,7 @@ Determinism comes from one discipline: **the number of tasks is chosen from the 
 The other details serve speed and robustness:
 
 - Idle workers spin for about 50 µs before sleeping on a condition variable, so back-to-back operations do not pay for a wake-up.
+- The work is published without a lock: `run` writes a pointer to the call, kept on its stack, then increments an epoch; the workers read the pointer once they see the epoch change, and `run` returns only after all of them have finished. The epoch, the task counter and the count of busy workers live on separate cache lines. A call costs 0.6 to 0.8 µs, against 2.5 µs when the call went through a mutex: a model's token makes a few hundred calls.
 - A task that panics does not stop the others; the first panic is resumed in the caller once every task has finished, and the pool remains usable.
 - A `run` called from inside a task executes serially in place, which avoids deadlocks. Attention relies on this: its tasks call the matrix product, which then runs on the task's thread.
 - `SharedMut<T>` lets tasks write disjoint parts of one output slice. It is the pool's only shared-mutation primitive, and its methods are `unsafe` with the contract that slices never overlap.
@@ -79,7 +82,9 @@ The C block stays in registers for a whole `kc` slice and is written once at the
 
 ## 6.5 Rows, reductions and the exponential
 
-`math.rs` holds the row functions: `dot`, `sum`, `max`, `scale`, `axpy`, `exp` and the activation functions. Each works in packets of 16 lanes and combines its partial sums pairwise in a fixed order, so the same row gives the same bits. The exponential is Cephes's algorithm: reduce x to n · ln 2 + r with a two-part ln 2, evaluate a degree-7 polynomial, and build 2ⁿ directly in the exponent bits. Tests hold it within two ulps over \[−87, 87\].
+`math.rs` holds the row functions: `dot`, `sum`, `max`, `scale`, `axpy`, `exp` and the activation functions. Each works in packets of 16 lanes and combines its partial sums pairwise in a fixed order, so the same row gives the same bits. The exponential is Cephes's algorithm: reduce x to n · ln 2 + r with a two-part ln 2, evaluate a degree-7 polynomial, and build 2ⁿ directly in the exponent bits. Tests hold it within two ulps over \[−87, 87\]. The bits of 2ⁿ come from adding 1.5 · 2²³ to n, which puts n in the low bits of the mantissa: a conversion `n as i32` gives the same bits, but Rust's conversion saturates, and that kept the compiler from vectorizing the loop. The trick made the exponential, and SiLU and softmax with it, 3.7 times faster.
+
+Binary operations on two inputs of the output's shape, the residual sums and gated products of a model, take a direct loop; the others compute the broadcast offsets of each input.
 
 Sums and means are cut into blocks of 1,024 elements, summed with `math::sum`, then combined pairwise, so the error grows with the logarithm of the length. Blocks of all outputs are spread over the threads, so one huge sum uses every core: 16 million elements went from 64 ms to 0.8 ms when this was introduced, and became far more accurate.
 
@@ -91,13 +96,31 @@ The CPU attention is not FlashAttention. For a block of 128 query rows, it compu
 
 The backward computes `∂v += Pᵀg`, `∂P = g·vᵀ`, `∂S = P ⊙ (∂P − rowsum(∂P ⊙ P))`, then `∂q` and `∂k` from ∂S. Query blocks write partial `∂k` and `∂v` buffers that are added in block order. A row with no visible key gives zeros, but a row with a NaN score gives NaN: a NaN must never be hidden.
 
-## 6.7 Reading data
+## 6.7 Quantized products
 
-`io.rs` is where types and alignment are handled. An aligned `f32` tensor is read in place, strides included; anything else is converted to a contiguous `f32` copy. A tensor of a memory-mapped file may start at an odd address, so the code checks alignment with `align_to` before reinterpreting bytes. Outputs are written into pooled buffers, and rounded to `bf16` (nearest, ties to even, NaN kept quiet) or `f16` when needed.
+In generation, each weight of a model is read once per token, and the product does two operations per weight: the time of a token is the time to read the weights. A quantized format is fewer bytes to read, provided the product reads the codes as they are stored, and decodes them faster than memory brings them. `quantized.rs` does this for every format Kapel reads: its own int8 and int4 by groups, and GGUF's Q4\_0 to Q8\_0 and Q2\_K to Q6\_K, the bytes of the mapped file read in place.
 
-RoPE computes its angles in `f64`, once per position and frequency, because positions in the hundreds of thousands times a frequency near 1 would lose their phase in `f32`. Quantized products dequantize the weights to `f32` first, row by row in parallel; kernels that read the codes directly are planned with the inference work.
+**In registers.** Each thread takes a run of rows of `w [N, K]`, about 128 KiB of weights, taken in order so that the threads read neighbouring memory, and computes their dot products with up to eight rows of x. A block of weights is decoded sixteen codes at a time: the nibbles or bit planes are taken from the bytes in 128-bit registers, then widened to sixteen integers and converted to floats. Zen 4 runs a 512-bit instruction as two halves, so every step done on 128 bits instead is a step at a quarter of the cost. The scales and minimums are taken out of the sums: within a group that shares a scale d and a minimum m,
 
-## 6.8 Measuring
+```math
+\sum_i (d\, q_i - m)\, x_i = d \sum_i q_i x_i - m \sum_i x_i
+```
+
+so the codes are multiplied as they are, d once per group, and the sums of x over each group are computed once per row of x, for all the rows of w. The compiler does not find these kernels by itself; they are written with AVX-512 intrinsics, and the portable code, vectorized by the compiler, covers AVX2 and the rest. On a Ryzen 7 7700, every format reads its weights at 52 to 54 GB/s, the speed of the memory, for one row of x.
+
+**Activations in bytes.** With `with_byte_activations(true)`, each row of x is quantized too, by blocks of 32: a scale `max |x| / 127` and integers between −127 and 127. A group of weights then gives d · s · Σ c · q − m · s · Σ q, where Σ c · q is a sum of products of bytes, exact in 32-bit integers, that AVX-512 VNNI's `vpdpbusd` computes 32 at a time; signed codes move their signs to the activations, since the instruction multiplies unsigned bytes by signed ones. This is what llama.cpp does, with blocks of 256. It is several times fewer instructions per weight, which leaves room when another program takes a core, but it adds the rounding of the activations to that of the weights: the mode is chosen explicitly. On Llama 3.2 1B in Q4\_K\_M, it moves the perplexity by 0.03 %, and generation reaches 57.4 tokens per second against 62.6 for llama.cpp; 56.3 with activations in f32.
+
+**Many rows.** For the prefill, decoding each block once per row would cost more than dequantizing. Tiles of 2 MiB of the weights are dequantized in parallel, then multiplied by the blocked product, so no matrix is ever expanded whole in memory: a 570-token prompt of Llama 3.2 1B runs at 313 tokens per second, against 45 when whole matrices were expanded, and 774 for llama.cpp, whose products multiply bytes.
+
+The weights of several matrices may be given to one product, their rows stacked (the `QuantizedMatmul` of several weights): the tasks then cover them all, in proportion to their bytes. And a gather from a quantized table, a `bf16` table or an `f16` one decodes only the rows it gathers.
+
+## 6.8 Reading data
+
+`io.rs` is where types and alignment are handled. An aligned `f32` tensor is read in place, strides included; anything else is converted to a contiguous `f32` copy. A tensor of a memory-mapped file may start at an odd address, so the code checks alignment with `align_to` before reinterpreting bytes. Outputs are written into pooled buffers, directly by the computation for `f32`, and rounded to `bf16` (nearest, ties to even, NaN kept quiet) or `f16` when needed.
+
+RoPE computes its angles in `f64`, once per position and frequency, because positions in the hundreds of thousands times a frequency near 1 would lose their phase in `f32`.
+
+## 6.9 Measuring
 
 Each optimization has a benchmark program in `crates/kapel-cpu/examples/`, run with `cargo run --release -p kapel-cpu --example <name>`:
 
@@ -109,5 +132,8 @@ Each optimization has a benchmark program in `crates/kapel-cpu/examples/`, run w
 | `attention` | causal attention forward and backward, and a decoding step |
 | `reduce` | sums over contiguous, strided and flat data |
 | `softmax` | softmax and exp on typical shapes |
+| `quantized` | products by quantized weights of 0.3 to 2 GB, every format, 1, 4 and 16 rows, in GB/s of weights read (`BYTES=1`: activations in bytes) |
+
+The examples `profile` and `perplexity` of kapel-cli measure a whole model (chapter 11).
 
 The tests check conformity in `f32` and `bf16` and for every available instruction set, and bit-identical results with 1, 2, 3 and 8 threads for products, attention and sums.

@@ -452,6 +452,154 @@ pub fn dequantize(dtype: DType, bytes: &[u8]) -> Result<Vec<f64>> {
     Ok(out)
 }
 
+/// Quantizes `values`, a whole number of blocks, to `dtype` by rounding to
+/// the nearest code, block by block: the reference quantization.
+///
+/// - Kapel's int8, as Smallem does: a scale `max |x| / 127` per group, codes
+///   rounded to the nearest, ties away from zero.
+/// - Kapel's int4: the scale of each group that, with codes rounded to the
+///   nearest between −8 and 7, makes the smallest squared error, among the
+///   scales that put the largest magnitude at either end and those between.
+/// - GGUF's Q8_0 and Q4_0, as llama.cpp's reference (`quantize_row_q8_0_ref`,
+///   `quantize_row_q4_0_ref`) does: Q8_0 like int8 with an `f16` scale; Q4_0
+///   with the scale `m / −8`, `m` the value of largest magnitude, and codes
+///   `x / scale + 8`, truncated after adding a half, at most 15.
+///
+/// A block of zeros has a scale of zero.
+///
+/// # Errors
+///
+/// [`Error::UnsupportedDType`] for another type, [`Error::BlockMisaligned`] if
+/// `values` is not a whole number of blocks.
+pub fn quantize(dtype: DType, values: &[f32]) -> Result<Vec<u8>> {
+    let unsupported = Err(Error::UnsupportedDType {
+        op: "quantize",
+        dtype,
+    });
+    let DType::Quantized(format) = dtype else {
+        return unsupported;
+    };
+    let len = dtype.block_len();
+    let mut out = Vec::with_capacity(dtype.storage_bytes(values.len())?);
+    let half = |x: f64| float::F16.encode(x).to_le_bytes();
+    let largest = |block: &[f32]| block.iter().fold(0.0f64, |m, &v| m.max(f64::from(v).abs()));
+    for block in values.chunks_exact(len) {
+        match format {
+            QuantFormat::Int8 { .. } => {
+                let scale = (largest(block) / 127.0) as f32;
+                let inverse = if scale > 0.0 {
+                    1.0 / f64::from(scale)
+                } else {
+                    0.0
+                };
+                out.extend(scale.to_le_bytes());
+                out.extend(
+                    block.iter().map(|&x| {
+                        (f64::from(x) * inverse).round().clamp(-127.0, 127.0) as i8 as u8
+                    }),
+                );
+            }
+            QuantFormat::Int4 { .. } => {
+                let (scale, codes) = int4_codes(block);
+                out.extend(scale.to_le_bytes());
+                for pair in codes.as_chunks::<2>().0 {
+                    out.push(pair[0] | (pair[1] << 4));
+                }
+            }
+            QuantFormat::Q8_0 => {
+                let d = largest(block) / 127.0;
+                let inverse = if d > 0.0 { 1.0 / d } else { 0.0 };
+                out.extend(half(d)[..2].iter());
+                out.extend(
+                    block.iter().map(|&x| {
+                        (f64::from(x) * inverse).round().clamp(-127.0, 127.0) as i8 as u8
+                    }),
+                );
+            }
+            QuantFormat::Q4_0 => {
+                // The value of largest magnitude, with its sign.
+                let m = block
+                    .iter()
+                    .fold(0.0f32, |m, &v| if v.abs() > m.abs() { v } else { m });
+                let d = f64::from(m) / -8.0;
+                let inverse = if d != 0.0 { 1.0 / d } else { 0.0 };
+                let code = |x: f32| ((f64::from(x) * inverse + 8.5) as i32).min(15) as u8;
+                out.extend(half(d)[..2].iter());
+                for j in 0..16 {
+                    out.push(code(block[j]) | (code(block[j + 16]) << 4));
+                }
+            }
+            _ => return unsupported,
+        }
+    }
+    if !values.len().is_multiple_of(len) {
+        return Err(Error::BlockMisaligned {
+            dtype,
+            elements: values.len(),
+        });
+    }
+    Ok(out)
+}
+
+/// The scale and the codes (0 to 15, for `scale × (code − 8)`) of a group of
+/// Kapel int4 that bring it closest to `block`, in squared error. With 16
+/// levels, `−8` to `7`, the largest magnitude `m` may take either end, and
+/// the scale that rounds best is not always `|m| / 7`: scales around it are
+/// tried, each followed by the least-squares scale of its codes.
+fn int4_codes(block: &[f32]) -> (f32, Vec<u8>) {
+    let m = block
+        .iter()
+        .fold(0.0f32, |m, &v| if v.abs() > m.abs() { v } else { m });
+    let mut best = (0.0f32, vec![8u8; block.len()], f64::INFINITY);
+    if m == 0.0 {
+        return (best.0, best.1);
+    }
+    let codes_of = |scale: f64| -> Vec<u8> {
+        block
+            .iter()
+            .map(|&x| ((f64::from(x) / scale).round().clamp(-8.0, 7.0) + 8.0) as u8)
+            .collect()
+    };
+    let error = |scale: f32, codes: &[u8]| -> f64 {
+        block
+            .iter()
+            .zip(codes)
+            .map(|(&x, &c)| {
+                let e = f64::from(x) - f64::from(scale) * (f64::from(c) - 8.0);
+                e * e
+            })
+            .sum()
+    };
+    // `m` at −8 (the end with more room), then at 7, and 18 levels between.
+    for step in 0..=20 {
+        let levels = -8.0 + 15.0 * f64::from(step) / 20.0;
+        if levels.abs() < 6.5 {
+            continue;
+        }
+        let scale = f64::from(m) / levels;
+        let codes = codes_of(scale);
+        // The best scale for these codes, then the codes of that scale.
+        let (num, den) = block
+            .iter()
+            .zip(&codes)
+            .fold((0.0, 0.0), |(n, d), (&x, &c)| {
+                let c = f64::from(c) - 8.0;
+                (n + f64::from(x) * c, d + c * c)
+            });
+        for (scale, codes) in [(scale, codes.clone()), (num / den, codes_of(num / den))] {
+            let scale = scale as f32;
+            if !(scale.is_finite() && scale != 0.0) {
+                continue;
+            }
+            let e = error(scale, &codes);
+            if e < best.2 {
+                best = (scale, codes, e);
+            }
+        }
+    }
+    (best.0, best.1)
+}
+
 /// The eight 6-bit scales and minimums of a Q4_K or Q5_K block, packed in 12
 /// bytes: the first four of each in the low 6 bits of bytes 0–3 and 4–7, the
 /// last four split between the low and high nibbles of bytes 8–11 and the top
@@ -554,6 +702,74 @@ mod tests {
         assert_eq!(values[15], 7.0);
         assert_eq!(values[16], 7.0);
         assert_eq!(values[31], -8.0);
+    }
+
+    #[test]
+    fn quantization_rounds_to_the_nearest_code() {
+        let values: Vec<f32> = (0..64).map(|i| (i as f32 - 31.5) / 10.0).collect();
+        for dtype in [
+            DType::int8(32).unwrap(),
+            DType::int4(64).unwrap(),
+            DType::Quantized(QuantFormat::Q8_0),
+            DType::Quantized(QuantFormat::Q4_0),
+        ] {
+            let bytes = quantize(dtype, &values).unwrap();
+            assert_eq!(bytes.len(), dtype.storage_bytes(64).unwrap());
+            let back = dequantize(dtype, &bytes).unwrap();
+            // Within half a step of the largest code of each block.
+            let top = match dtype {
+                DType::Quantized(QuantFormat::Q4_0) => 8.0,
+                _ => 127.0,
+            };
+            let len = dtype.block_len();
+            if let DType::Quantized(QuantFormat::Int4 { .. }) = dtype {
+                // Squared error at most that of the symmetric scale `max / 7`.
+                for (block, back) in values.chunks(len).zip(back.chunks(len)) {
+                    let step = block.iter().fold(0.0f64, |m, &x| m.max(f64::from(x).abs())) / 7.0;
+                    let plain: f64 = block
+                        .iter()
+                        .map(|&x| {
+                            let x = f64::from(x);
+                            let e = x - step * (x / step).round().clamp(-7.0, 7.0);
+                            e * e
+                        })
+                        .sum();
+                    let chosen: f64 = block
+                        .iter()
+                        .zip(back)
+                        .map(|(&x, &y)| (f64::from(x) - y).powi(2))
+                        .sum();
+                    assert!(
+                        chosen <= plain * (1.0 + 1e-9),
+                        "{dtype}: {chosen} > {plain}"
+                    );
+                }
+                continue;
+            }
+            for (block, back) in values.chunks(len).zip(back.chunks(len)) {
+                let step = block.iter().fold(0.0f64, |m, &x| m.max(f64::from(x).abs())) / top;
+                for (&x, &y) in block.iter().zip(back) {
+                    // GGUF's codes are those of the scale before its
+                    // rounding to `f16`, as in llama.cpp: up to 127 times
+                    // that rounding more.
+                    let slack = match dtype {
+                        DType::Quantized(QuantFormat::Q8_0 | QuantFormat::Q4_0) => 0.07,
+                        _ => 0.001,
+                    };
+                    let error = (f64::from(x) - y).abs();
+                    assert!(error <= (0.5 + slack) * step, "{dtype}: {x} → {y}");
+                }
+            }
+        }
+        // Zeros stay zeros.
+        let zeros = quantize(DType::int4(32).unwrap(), &[0.0; 32]).unwrap();
+        assert!(
+            dequantize(DType::int4(32).unwrap(), &zeros)
+                .unwrap()
+                .iter()
+                .all(|&v| v == 0.0)
+        );
+        assert!(quantize(DType::int8(32).unwrap(), &[1.0; 31]).is_err());
     }
 
     #[test]

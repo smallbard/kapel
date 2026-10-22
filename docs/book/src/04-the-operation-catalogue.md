@@ -51,7 +51,7 @@ The shared checks are small private functions: `arity`, `float`, `indices` (the 
 | `Contiguous` | x → same | a row-major copy, bit for bit | x |
 | `Concat` | inputs → joined along `dim` | same type and shape except `dim` | each input |
 | `Matmul` | \[…, M, K\] · \[…, K, N\] | batch dimensions broadcast; strided inputs allowed | a, b |
-| `QuantizedMatmul` | x \[…, K\] · w \[N, K\] quantized | w at its exact dequantized value; K a whole number of blocks | x only |
+| `QuantizedMatmul` | x \[…, K\] · w₁ \[N₁, K\], w₂ … quantized | the weights, of any formats, at their exact dequantized value, their rows stacked into one `[ΣNᵢ, K]`; K a whole number of blocks | x only |
 | `Sum`, `Mean` | x → reduced | over a list of dims, `keepdim` | x |
 | `Max` | x → reduced | along one dim; the gradient goes to the first maximum | x |
 | `Softmax`, `LogSoftmax` | x → same | along `dim`; log-softmax computed without forming the softmax | x |
@@ -59,7 +59,7 @@ The shared checks are small private functions: `arity`, `float`, `indices` (the 
 | `RmsNorm` | x \[…, C\], weight \[C\] | x / √(mean x² + eps) · (offset + w); offset 1 for Gemma | all |
 | `Attention` | q, k, v, optional mask | scaled dot-product, grouped heads, causal, window, softcap | q, k, v |
 | `Rope` | x \[…, D\], positions | rotary embeddings with five scalings | x |
-| `GatherRows` | src \[R, …\], idx | y\[i\] = src\[idx\[i\]\]; out-of-range index is an error | src |
+| `GatherRows` | src \[R, …\], idx | y\[i\] = src\[idx\[i\]\]; out-of-range index is an error; a quantized table gives its rows in f32 | src, unless quantized |
 | `ScatterAddRows` | src, idx → \[rows, …\] | adjoint of gather; repeated rows are summed | src |
 
 Normalization weights and the attention mask may be in any float type, not necessarily that of the main input: a model with bf16 weights can normalize f32 activations, and the weight gradients come back in the weights' own type.

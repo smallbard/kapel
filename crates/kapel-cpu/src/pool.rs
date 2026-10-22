@@ -14,7 +14,7 @@
 use std::any::Any;
 use std::cell::Cell;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
@@ -43,14 +43,29 @@ struct Job {
 // alive (and `Sync`) until every thread is done with it.
 unsafe impl Send for Job {}
 
+/// A value alone on its cache line: the counters that the threads write do
+/// not slow down the threads that read the others.
+#[repr(align(64))]
+struct Line<T>(T);
+
+impl<T> std::ops::Deref for Line<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
 struct Shared {
-    job: Mutex<Option<Job>>,
+    /// The current call, on the stack of [`Pool::run`]: written before
+    /// `epoch` is incremented, read by the threads once they see it, and
+    /// left alone after they have all decremented `pending`.
+    job: Line<AtomicPtr<Job>>,
     /// Incremented on every call: this is how a thread notices new work.
-    epoch: AtomicUsize,
+    epoch: Line<AtomicUsize>,
     /// The next task to take.
-    next: AtomicUsize,
+    next: Line<AtomicUsize>,
     /// The threads that have not yet finished the current call.
-    pending: AtomicUsize,
+    pending: Line<AtomicUsize>,
     sleepers: AtomicUsize,
     wake: Condvar,
     sleep: Mutex<()>,
@@ -95,10 +110,10 @@ impl Pool {
     /// on it.
     pub fn new(threads: usize) -> Self {
         let shared = Arc::new(Shared {
-            job: Mutex::new(None),
-            epoch: AtomicUsize::new(0),
-            next: AtomicUsize::new(0),
-            pending: AtomicUsize::new(0),
+            job: Line(AtomicPtr::new(std::ptr::null_mut())),
+            epoch: Line(AtomicUsize::new(0)),
+            next: Line(AtomicUsize::new(0)),
+            pending: Line(AtomicUsize::new(0)),
             sleepers: AtomicUsize::new(0),
             wake: Condvar::new(),
             sleep: Mutex::new(()),
@@ -142,10 +157,11 @@ impl Pool {
         // SAFETY: this erases the closure's lifetime; below, we wait until no
         // thread uses it any more.
         let work: *const (dyn Fn(usize) + Sync) = unsafe { std::mem::transmute(work) };
-        let job = Job { work, tasks };
-        *shared.job.lock().unwrap() = Some(job);
+        let mut job = Job { work, tasks };
+        // Published by the increment of `epoch` below.
+        shared.job.store(&mut job, Ordering::Relaxed);
         shared.next.store(0, Ordering::Relaxed);
-        shared.pending.store(self.workers.len(), Ordering::SeqCst);
+        shared.pending.store(self.workers.len(), Ordering::Relaxed);
         shared.epoch.fetch_add(1, Ordering::SeqCst);
         if shared.sleepers.load(Ordering::SeqCst) > 0 {
             let _guard = shared.sleep.lock().unwrap();
@@ -198,7 +214,10 @@ fn worker(shared: &Shared) {
             shared.sleepers.fetch_sub(1, Ordering::SeqCst);
         }
         seen = shared.epoch.load(Ordering::SeqCst);
-        let job = shared.job.lock().unwrap().expect("a call without a job");
+        // SAFETY: `epoch` changed, so `run` has stored its job, which it keeps
+        // on its stack until this thread decrements `pending`; this load is
+        // ordered after that store by the load of `epoch`.
+        let job = unsafe { *shared.job.load(Ordering::Relaxed) };
         shared.work(job);
         shared.pending.fetch_sub(1, Ordering::Release);
     }

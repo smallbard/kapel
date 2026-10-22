@@ -26,7 +26,7 @@ Opening a backend creates a context and one stream, loads the PTX module, and pr
 
 **Cached tables.** Reductions, softmax, max and RoPE need small index tables derived from shapes. Uploading from ordinary host memory waits for the stream, so these tables are cached on the device, up to 64 MiB, with oldest-first eviction.
 
-**What waits.** Most operations return as soon as their kernels are queued. The exceptions are `download` and `upload`, the first use of a shape by an operation that needs a table, and the operations that still go through the host: gathers and scatters (their row lists), casts to or from non-float types, quantized products (dequantized on the host for now), and attention masks that are not `f32`.
+**What waits.** Most operations return as soon as their kernels are queued. The exceptions are `download` and `upload`, the first use of a shape by an operation that needs a table, and the operations that still go through the host: gathers and scatters (their row lists), casts to or from non-float types, quantized products and gathers from quantized tables (dequantized on the host for now), and attention masks that are not `f32`.
 
 ## 7.3 Launching a thread kernel
 

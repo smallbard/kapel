@@ -26,5 +26,5 @@ website with [mdBook](https://rust-lang.github.io/mdBook/):
 mdbook serve docs/book
 ```
 
-The book describes the repository as of 21 October 2026. When the code changes
+The book describes the repository as of 22 October 2026. When the code changes
 what a chapter says, update the chapter in the same pull request.

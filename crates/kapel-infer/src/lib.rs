@@ -1,7 +1,8 @@
 //! The inference engine: a model that generates text on a backend.
 //!
 //! A [`Pipeline`] loads a model directory (weights, `tokenizer.json`, chat
-//! template, `generation_config.json`) onto a backend; [`Pipeline::generate`]
+//! template, `generation_config.json`), or a GGUF file that holds all of it,
+//! onto a backend, quantized if [`LoadOptions`] says so; [`Pipeline::generate`]
 //! gives the tokens that follow a prompt one at a time, with their text, as
 //! they come. The prompt is computed at once (the prefill), then each token
 //! after the cache of the previous ones.
@@ -23,12 +24,13 @@
 //! with its own random generator, the same on every machine.
 
 mod generate;
+mod gguf;
 mod sampling;
 mod text;
 
 use std::fmt;
 
-pub use generate::{Finish, Generation, Piece, Pipeline, Request};
+pub use generate::{Finish, Generation, LoadOptions, Piece, Pipeline, Request};
 pub use sampling::Sampling;
 
 /// What can go wrong when generating.
@@ -47,6 +49,8 @@ pub enum InferError {
     NoChatTemplate,
     /// There is nothing to continue.
     EmptyPrompt,
+    /// The model's files use something Kapel does not read.
+    Unsupported(String),
 }
 
 impl fmt::Display for InferError {
@@ -58,6 +62,7 @@ impl fmt::Display for InferError {
             Self::Tensor(e) => e.fmt(f),
             Self::NoChatTemplate => write!(f, "the model has no chat template"),
             Self::EmptyPrompt => write!(f, "the prompt has no token"),
+            Self::Unsupported(message) => f.write_str(message),
         }
     }
 }

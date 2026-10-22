@@ -35,9 +35,23 @@ cargo run --release -p kapel-cli -- run Qwen/Qwen3-0.6B
 ```
 
 `kapel run` télécharge le modèle depuis le Hub de Hugging Face (ou lit un dossier
-local), puis tient une conversation : un message par ligne, une ligne vide pour finir.
-`--prompt TEXTE` répond une fois, `--device cuda` calcule sur la carte (Kapel construit
-avec `--features cuda`), `kapel --help` donne les autres options.
+local, ou un fichier GGUF de llama.cpp), puis tient une conversation : un message par
+ligne, une ligne vide pour finir. `--prompt TEXTE` répond une fois, `--device cuda`
+calcule sur la carte (Kapel construit avec `--features cuda`), `kapel --help` donne les
+autres options.
+
+Sur le processeur, un modèle quantifié génère plusieurs fois plus vite, la génération
+étant limitée par la lecture des poids :
+
+```
+cargo run --release -p kapel-cli -- run Llama-3.2-1B-Instruct-Q4_K_M.gguf
+cargo run --release -p kapel-cli -- run Qwen/Qwen3-0.6B --quantize int8
+```
+
+Un fichier GGUF est lu tel quel (Q4_0 à Q8_0, Q2_K à Q6_K) ; `--quantize int8|int4`
+quantifie un modèle du Hub au chargement, `--quantize-output` sa table de sortie
+aussi. `--byte-activations` quantifie aussi les activations en octets, comme
+llama.cpp : plus rapide, et les résultats changent un peu.
 
 ## Feuille de route
 

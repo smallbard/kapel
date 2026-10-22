@@ -132,7 +132,12 @@ pub fn exp_lane<const FMA: bool>(x: f32) -> f32 {
     // 5.000 000 1 × 10⁻¹ in Cephes, which is 0.5 in `f32`.
     p = fma::<FMA>(p, r, 0.5);
     let y = fma::<FMA>(p, r * r, r) + 1.0;
-    let scale = f32::from_bits(((n as i32 + 127) as u32) << 23);
+    // 2ⁿ, for the integer n between −127 and 128 that the clamp leaves:
+    // adding 1.5 · 2²³ puts n in the low bits of the mantissa. A conversion
+    // `n as i32` would give the same bits, but saturates, which keeps the
+    // compiler from vectorizing the loop.
+    let shifted = (n + 12_582_912.0).to_bits();
+    let scale = f32::from_bits(shifted.wrapping_sub(0x4B40_0000).wrapping_add(127) << 23);
     let value = y * scale;
     if x < EXP_LOW {
         0.0

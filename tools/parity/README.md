@@ -17,7 +17,8 @@ The parity tests are `gguf::tests::every_format_dequantizes_as_llama_cpp_does`
 `logits_match_transformers_and_survive_a_save` (kapel-models), and, on an NVIDIA card,
 `models_on_the_card_match_transformers` (kapel-cuda, feature `cuda`: `f32` against
 `transformers`, `bf16` against the processor's `bf16`). The generation tests of
-kapel-infer (`tests/generation.rs`) compare greedy generations of SmolLM2-135M.
+kapel-infer (`tests/generation.rs`) compare greedy generations of SmolLM2-135M, and
+those of `tests/gguf.rs` models read from GGUF with the models they come from.
 
 ## Generations
 
@@ -40,14 +41,44 @@ rendered at a fixed time on both sides: `FIXED_NOW` in `chat_reference.py` and
 `PARITY_TIME` in `crates/kapel-tokenizers/src/chat.rs` must stay equal. Regenerate
 `chat_cases.json` after changing them.
 
+## GGUF models
+
+`gguf_models_reference.py` downloads GGUF files in Q8_0 and the models of
+`transformers` they were converted from, and writes their paths in
+`data/parity/gguf-models/<name>.json`. The tests of `crates/kapel-infer/tests/gguf.rs`
+check that each GGUF file gives the tokens, end tokens and chat prompts of its
+original tokenizer, and that the model read from it predicts the same tokens as the
+original (Q8_0 rounds the weights: 95 % of the predictions at least).
+
+## Perplexity
+
+The example `perplexity` of kapel-cli scores a text as llama.cpp's `llama-perplexity`
+does: chunks of 512 tokens, the first replaced by the beginning of sequence, each
+scored on its second half. The text is wikitext-2's test set, as llama.cpp uses it
+(`scripts/get-wikitext-2.sh` in llama.cpp, or the zip below). The chunks are computed
+by pieces of 16 tokens after the cache, with the kernels of generation, and the
+options of `kapel run` choose them (`--byte-activations`, `--quantize`).
+
+```
+curl -LO https://huggingface.co/datasets/ggml-org/ci/resolve/main/wikitext-2-raw-v1.zip
+unzip wikitext-2-raw-v1.zip
+cargo run --release -p kapel-cli --example perplexity -- \
+    Llama-3.2-1B-Instruct-Q4_K_M.gguf wikitext-2-raw/wiki.test.raw --chunks 20
+llama-perplexity -m Llama-3.2-1B-Instruct-Q4_K_M.gguf \
+    -f wikitext-2-raw/wiki.test.raw -c 512 --chunks 20
+```
+
+## Commands
+
 ```
 python -m venv .venv
 .venv/bin/pip install --index-url https://download.pytorch.org/whl/cpu torch
-.venv/bin/pip install transformers tokenizers safetensors gguf numpy jinja2
+.venv/bin/pip install transformers tokenizers safetensors gguf numpy jinja2 huggingface_hub
 .venv/bin/python tools/parity/reference.py             # small models and their logits
 .venv/bin/python tools/parity/tokenizers_reference.py  # tokenizer corpus
 .venv/bin/python tools/parity/chat_reference.py        # chat templates
 .venv/bin/python tools/parity/gguf_reference.py        # GGUF quantization formats
+.venv/bin/python tools/parity/gguf_models_reference.py # GGUF models and their originals
 cargo test --release --workspace
 cargo run --release -p kapel-models --example parity   # a table of logit differences
 

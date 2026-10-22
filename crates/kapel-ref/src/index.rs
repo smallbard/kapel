@@ -31,7 +31,13 @@ impl Run<GatherRows> for Reference {
         let src = Array::of(inputs[0])?;
         let rows = indices(GatherRows::NAME, inputs[1], src.shape[0])?;
         let width = src.shape[1..].iter().product();
-        gather(&src, &rows, width, &signature.shape).tensor()
+        let out = gather(&src, &rows, width, &signature.shape);
+        if inputs[0].dtype().is_quantized() {
+            // A quantized table gives `f32` rows: its values, rounded.
+            let values: Vec<f32> = out.data.iter().map(|&v| v as f32).collect();
+            return Tensor::from_slice(&values, &signature.shape);
+        }
+        out.tensor()
     }
 
     fn backward(
@@ -41,6 +47,9 @@ impl Run<GatherRows> for Reference {
         grad: &Tensor,
     ) -> Result<Vec<Option<Tensor>>> {
         op.infer_backward(inputs, grad)?;
+        if inputs[0].dtype().is_quantized() {
+            return Ok(vec![None, None]);
+        }
         let shape = inputs[0].shape();
         let rows = indices(GatherRows::NAME, inputs[1], shape[0])?;
         let width = shape[1..].iter().product();

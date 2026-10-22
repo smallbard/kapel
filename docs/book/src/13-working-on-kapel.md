@@ -70,11 +70,11 @@ The rules of chapter 1 are also the review checklist:
 
 ## 13.6 The road ahead
 
-The foundation plan is complete, and the first inference step, correct generation, landed on 21 October 2026. The rest of the inference plan and the whole training plan are ahead:
+The foundation plan is complete. The first inference step, correct generation, landed on 21 October 2026, and the second, the CPU, on 22 October, but for its ARM kernels and its key and value cache in f16 or int8. The rest of the inference plan and the whole training plan are ahead:
 
 | Step | Goal | Main pieces |
 | --- | --- | --- |
-| I1 | The best single-sequence generation on CPU, x86 and ARM | quantized formats read in place (int8/int4, Q4\_0, Q4\_K, Q5\_K, Q6\_K, Q8\_0), memory-bandwidth-bound decoding, NEON kernels |
+| I1 | The best single-sequence generation on CPU, x86 and ARM | done on x86 (chapter 6); left: NEON kernels and `sdot`, a cache of keys and values in f16 or int8 |
 | I2 | Batched generation on a GPU | a paged cache of 16-position pages, Flash-Decoding, kernels for few and many rows |
 | I3 | A production server | continuous batching, shared prefixes, an OpenAI-compatible API, constrained output |
 | I4 | Faster without changing the distribution | speculative decoding, tensor parallelism over two to four GPUs |

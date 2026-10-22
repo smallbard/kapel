@@ -24,6 +24,35 @@ pub struct Pipeline<B> {
     sampling: Sampling,
 }
 
+/// How [`Pipeline::load_with`] prepares the weights.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LoadOptions {
+    /// The type of the float weights, if they are to be converted.
+    pub dtype: Option<DType>,
+    /// The format to quantize the linear projections to, before anything
+    /// else ([`Model::quantize`]).
+    pub quantize: Option<DType>,
+    /// Whether the output table is quantized too.
+    pub quantize_output: bool,
+}
+
+/// `model` quantized, moved to `backend` and converted as `options` say.
+fn prepare<B: Backend + Transfer>(
+    model: Model,
+    backend: &B,
+    options: &LoadOptions,
+) -> Result<Model> {
+    let model = match options.quantize {
+        Some(format) => model.quantize(format, options.quantize_output)?,
+        None => model,
+    };
+    let mut model = model.upload(backend)?;
+    if let Some(dtype) = options.dtype {
+        model = model.cast(backend, dtype)?;
+    }
+    Ok(model)
+}
+
 /// What to generate.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Request {
@@ -86,7 +115,8 @@ fn token_ids(value: Option<&Value>) -> Vec<u32> {
 
 impl<B: Backend + Transfer> Pipeline<B> {
     /// Loads the model directory `dir` onto `backend`, its float weights in
-    /// `dtype` if given (as stored otherwise).
+    /// `dtype` if given (as stored otherwise). A file is read as GGUF
+    /// ([`Pipeline::load_gguf`]).
     ///
     /// The tokens that end an answer come from `generation_config.json`, else
     /// `config.json`, else the tokenizer's `eos_token`; the default sampling
@@ -97,11 +127,25 @@ impl<B: Backend + Transfer> Pipeline<B> {
     /// If the model, its tokenizer or its configurations cannot be read, or
     /// the weights cannot be moved to the backend.
     pub fn load(dir: impl AsRef<Path>, backend: B, dtype: Option<DType>) -> Result<Self> {
+        let options = LoadOptions {
+            dtype,
+            ..LoadOptions::default()
+        };
+        Self::load_with(dir, backend, &options)
+    }
+
+    /// [`Pipeline::load`], with the weights prepared as `options` say:
+    /// quantized first, then moved to the backend, then converted.
+    ///
+    /// # Errors
+    ///
+    /// As [`Pipeline::load`], and if the weights cannot be quantized.
+    pub fn load_with(dir: impl AsRef<Path>, backend: B, options: &LoadOptions) -> Result<Self> {
         let dir = dir.as_ref();
-        let mut model = Model::load(&Checkpoint::open(dir)?)?.upload(&backend)?;
-        if let Some(dtype) = dtype {
-            model = model.cast(&backend, dtype)?;
+        if dir.is_file() {
+            return Self::load_gguf_with(dir, backend, options);
         }
+        let model = prepare(Model::load(&Checkpoint::open(dir)?)?, &backend, options)?;
         let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))?;
         let template = ChatTemplate::from_dir(dir)?;
         let generation = match dir.join("generation_config.json") {
@@ -128,6 +172,38 @@ impl<B: Backend + Transfer> Pipeline<B> {
             template,
             eos,
             sampling: Sampling::from_generation_config(&generation),
+        })
+    }
+
+    /// Loads a GGUF file onto `backend`: the model, its tokenizer, its chat
+    /// template and its end tokens, all from the file. The weights stay in
+    /// their types (quantized ones included), except those that `dtype`
+    /// converts, as in [`Pipeline::load`]. A GGUF file has no
+    /// `generation_config.json`: the default sampling is greedy.
+    ///
+    /// # Errors
+    ///
+    /// If the file cannot be read, or holds an architecture or a tokenizer
+    /// that Kapel does not read.
+    pub fn load_gguf(path: impl AsRef<Path>, backend: B, dtype: Option<DType>) -> Result<Self> {
+        let options = LoadOptions {
+            dtype,
+            ..LoadOptions::default()
+        };
+        Self::load_gguf_with(path, backend, &options)
+    }
+
+    fn load_gguf_with(path: impl AsRef<Path>, backend: B, options: &LoadOptions) -> Result<Self> {
+        let gguf = kapel_hub::Gguf::open(path)?;
+        let model = prepare(Model::from_gguf(&gguf)?, &backend, options)?;
+        let vocabulary = crate::gguf::vocabulary(&gguf)?;
+        Ok(Self {
+            backend,
+            model,
+            tokenizer: vocabulary.tokenizer,
+            template: vocabulary.template,
+            eos: vocabulary.eos,
+            sampling: Sampling::default(),
         })
     }
 

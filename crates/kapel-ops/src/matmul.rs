@@ -69,6 +69,12 @@ impl Operation for Matmul {
 /// `[N, K]` in a quantized type, its blocks along `K`, and the output is `[…, N]`
 /// with `y[…, n] = Σₖ x[…, k] · w[n, k]`, `w` taken at its exact dequantized
 /// value. The weights are frozen: only `x` receives a gradient.
+///
+/// Several weights `w₁ [N₁, K], w₂ [N₂, K], …`, of any quantized types, may
+/// follow `x`: they act as one matrix, their rows stacked, and the output is
+/// `[…, N₁ + N₂ + …]`. The projections of a layer that read the same input
+/// (queries, keys and values) are then one product: a backend reads their
+/// weights in one pass.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct QuantizedMatmul;
 
@@ -76,35 +82,47 @@ impl Operation for QuantizedMatmul {
     const NAME: &'static str = "quantized_matmul";
 
     fn infer(&self, inputs: &[&Tensor]) -> Result<Signature> {
-        arity(Self::NAME, inputs, &[2], "2")?;
+        if inputs.len() < 2 {
+            return Err(Error::Arity {
+                op: Self::NAME,
+                expected: "2 or more",
+                got: inputs.len(),
+            });
+        }
         same_device(Self::NAME, inputs)?;
-        let (x, w) = (inputs[0], inputs[1]);
+        let x = inputs[0];
         float(Self::NAME, x)?;
-        if !w.dtype().is_quantized() {
-            return Err(Error::UnsupportedDType {
-                op: Self::NAME,
-                dtype: w.dtype(),
-            });
-        }
-        if x.rank() < 1 || w.rank() != 2 || x.shape()[x.rank() - 1] != w.shape()[1] {
-            return Err(Error::InvalidArgument {
-                op: Self::NAME,
-                message: format!(
-                    "expected x [..., K] and w [N, K], got {:?} and {:?}",
-                    x.shape(),
-                    w.shape()
-                ),
-            });
-        }
-        let k = w.shape()[1];
-        if !k.is_multiple_of(w.dtype().block_len()) {
-            return Err(Error::BlockMisaligned {
-                dtype: w.dtype(),
-                elements: k,
-            });
+        let k = x.shape().last().copied();
+        let mut n = 0usize;
+        for w in &inputs[1..] {
+            if !w.dtype().is_quantized() {
+                return Err(Error::UnsupportedDType {
+                    op: Self::NAME,
+                    dtype: w.dtype(),
+                });
+            }
+            if w.rank() != 2 || k != Some(w.shape()[1]) {
+                return Err(Error::InvalidArgument {
+                    op: Self::NAME,
+                    message: format!(
+                        "expected x [..., K] and w [N, K], got {:?} and {:?}",
+                        x.shape(),
+                        w.shape()
+                    ),
+                });
+            }
+            if !w.shape()[1].is_multiple_of(w.dtype().block_len()) {
+                return Err(Error::BlockMisaligned {
+                    dtype: w.dtype(),
+                    elements: w.shape()[1],
+                });
+            }
+            n = n
+                .checked_add(w.shape()[0])
+                .ok_or(Error::Overflow { op: Self::NAME })?;
         }
         let mut out = x.shape()[..x.rank() - 1].to_vec();
-        out.push(w.shape()[0]);
+        out.push(n);
         Ok(Signature {
             shape: out,
             dtype: x.dtype(),

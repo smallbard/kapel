@@ -239,8 +239,18 @@ impl Cuda {
 
     /// The weights of a quantized product, dequantized and uploaded as `f32`.
     fn dequantized(&self, w: &Tensor) -> Result<Tensor> {
-        let values: Vec<f32> = self.values(w)?.into_iter().map(|v| v as f32).collect();
-        self.upload_f32(&values, w.shape())
+        self.stacked(&[w])
+    }
+
+    /// Weights `[Nᵢ, K]`, dequantized, their rows stacked, and uploaded as
+    /// `f32`.
+    fn stacked(&self, weights: &[&Tensor]) -> Result<Tensor> {
+        let k = weights[0].shape()[1];
+        let mut values = Vec::new();
+        for w in weights {
+            values.extend(self.values(w)?.into_iter().map(|v| v as f32));
+        }
+        self.upload_f32(&values, &[values.len() / k.max(1), k])
     }
 
     /// The rows of a scatter, grouped by target: `offsets[r]..offsets[r + 1]`
@@ -698,15 +708,16 @@ impl InF32<QuantizedMatmul> for Cuda {
     /// read the codes directly come with the inference engine.
     fn forward_f32(&self, op: &QuantizedMatmul, inputs: &[&Tensor]) -> Result<Tensor> {
         let signature = op.infer(inputs)?;
-        let (x, w) = (inputs[0], inputs[1]);
-        let k = w.shape()[1];
+        let x = inputs[0];
+        let k = inputs[1].shape()[1];
+        let n = *signature.shape.last().expect("an output dimension");
         // The rows from the leading dimensions: with `K = 0`, `numel / K`
         // would lose them.
         let rows = leading(x.shape());
         let x = self.contiguous(QuantizedMatmul::NAME, x)?;
         let x = x.reshape(&[rows, k])?;
-        let wt = self.dequantized(w)?.transpose(0, 1)?;
-        let shape = [x.shape()[0], w.shape()[0]];
+        let wt = self.stacked(&inputs[1..])?.transpose(0, 1)?;
+        let shape = [x.shape()[0], n];
         self.matmul(&x, &wt, &shape)?.reshape(&signature.shape)
     }
 
@@ -716,18 +727,18 @@ impl InF32<QuantizedMatmul> for Cuda {
         inputs: &[&Tensor],
         grad: &Tensor,
     ) -> Result<Vec<Option<Tensor>>> {
-        op.infer_backward(inputs, grad)?;
-        let (x, w) = (inputs[0], inputs[1]);
-        let (n, k) = (w.shape()[0], w.shape()[1]);
+        let signature = op.infer_backward(inputs, grad)?;
+        let x = inputs[0];
+        let k = inputs[1].shape()[1];
+        let n = *signature.shape.last().expect("an output dimension");
         let rows = leading(grad.shape());
         let g = self.contiguous(QuantizedMatmul::NAME, grad)?;
         let g = g.reshape(&[rows, n])?;
-        let w = self.dequantized(w)?;
+        let w = self.stacked(&inputs[1..])?;
         let shape = [g.shape()[0], k];
-        Ok(vec![
-            Some(self.matmul(&g, &w, &shape)?.reshape(x.shape())?),
-            None,
-        ])
+        let mut grads = vec![Some(self.matmul(&g, &w, &shape)?.reshape(x.shape())?)];
+        grads.resize(inputs.len(), None);
+        Ok(grads)
     }
 }
 
@@ -1253,6 +1264,12 @@ impl Run<GatherRows> for Cuda {
         let width = shape[1..].iter().product();
         match inputs[0].dtype() {
             DType::BF16 | DType::F16 => self.gather_16(inputs[0], &rows, width, &signature),
+            // A quantized table is dequantized on the host, whole: kernels
+            // that read the codes come with the products by quantized weights.
+            dtype if dtype.is_quantized() => {
+                let table = self.dequantized(inputs[0])?;
+                self.gather(name, &table, &rows, width, &signature.shape)
+            }
             _ => self.gather(name, inputs[0], &rows, width, &signature.shape),
         }
     }
@@ -1265,6 +1282,9 @@ impl Run<GatherRows> for Cuda {
     ) -> Result<Vec<Option<Tensor>>> {
         let name = GatherRows::NAME;
         op.infer_backward(inputs, grad)?;
+        if inputs[0].dtype().is_quantized() {
+            return Ok(vec![None, None]);
+        }
         let shape = inputs[0].shape();
         let rows = self.indices(name, inputs[1], shape[0])?;
         let g = self.widened(name, grad)?;

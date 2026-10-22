@@ -1,6 +1,6 @@
 //! Gathering and scattering rows: embeddings and their gradients.
 
-use kapel_core::{Error, Result, Tensor};
+use kapel_core::{DType, Error, Result, Tensor};
 
 use crate::{Operation, Signature, arity, float, indices, same_device};
 
@@ -8,8 +8,13 @@ use crate::{Operation, Signature, arity, float, indices, same_device};
 /// `y [idx.shape..., ...]` with `y[i, ...] = src[idx[i], ...]`. An embedding
 /// lookup is a gather of the embedding table by token ids.
 ///
+/// The table may be quantized, its rows a whole number of blocks: the rows are
+/// then given at their exact dequantized values, in `f32`. This is how a model
+/// read from GGUF looks up its quantized embeddings.
+///
 /// The gradient of `src` adds each row of the output gradient to the row it came
-/// from; `idx` receives none. An index outside `0..R` is an error.
+/// from; a quantized table, frozen, and `idx` receive none. An index outside
+/// `0..R` is an error.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct GatherRows;
 
@@ -20,7 +25,9 @@ impl Operation for GatherRows {
         arity(Self::NAME, inputs, &[2], "2")?;
         same_device(Self::NAME, inputs)?;
         let (src, idx) = (inputs[0], inputs[1]);
-        float(Self::NAME, src)?;
+        if !src.dtype().is_quantized() {
+            float(Self::NAME, src)?;
+        }
         indices(Self::NAME, idx)?;
         if src.rank() == 0 {
             return Err(Error::InvalidArgument {
@@ -28,11 +35,22 @@ impl Operation for GatherRows {
                 message: "the table needs at least one dimension".into(),
             });
         }
+        let width: usize = src.shape()[1..].iter().product();
+        if !width.is_multiple_of(src.dtype().block_len()) {
+            return Err(Error::BlockMisaligned {
+                dtype: src.dtype(),
+                elements: width,
+            });
+        }
         let mut shape = idx.shape().to_vec();
         shape.extend_from_slice(&src.shape()[1..]);
         Ok(Signature {
             shape,
-            dtype: src.dtype(),
+            dtype: if src.dtype().is_quantized() {
+                DType::F32
+            } else {
+                src.dtype()
+            },
         })
     }
 

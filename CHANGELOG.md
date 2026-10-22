@@ -65,6 +65,28 @@ changelog says how.
   processor or the card, with a model from a directory or the Hub.
 - `tools/parity/generation_reference.py` and the example `generation_parity`: greedy
   generations against `transformers`.
+- `kapel-cpu`: products by quantized weights that read the codes in place, for Kapel's
+  int8 and int4 and GGUF's Q4_0 to Q8_0 and Q2_K to Q6_K: AVX-512 kernels decode each
+  block in registers, with scales and minimums taken out of the sums, and read the
+  weights at 52 to 54 GB/s in generation on a Ryzen 7 7700. For many rows (the
+  prefill), tiles of the weights are dequantized, then multiplied by blocks.
+- `kapel-cpu`: activations in bytes (`Cpu::with_byte_activations`): the rows of `x`
+  quantized by blocks of 32, the products summed in integers with AVX-512 VNNI.
+- `kapel-ops`: `QuantizedMatmul` takes several weights, their rows stacked;
+  `GatherRows` takes quantized tables and gives their rows in `f32`.
+- `kapel-core`: `quantize`, the reference quantization to Kapel's int8 and int4 (with
+  the scale of least squared error) and GGUF's Q8_0 and Q4_0.
+- `kapel-models`: `Model::from_gguf` (Llama and Mistral, Qwen 2 and 3), the RoPE
+  scaling of Llama 3 recovered from its factors; `Model::quantize`, with the output
+  table optionally; `Model::extend`, the logits of every new position after a cache.
+- `kapel-infer`: GGUF files, with their tokenizer, chat template and end tokens
+  (`Pipeline::load_gguf`); `LoadOptions` and `Pipeline::load_with`, to quantize at
+  loading.
+- `kapel-cli`: `kapel run` reads GGUF files, and takes `--quantize`,
+  `--quantize-output` and `--byte-activations`; the examples `profile` (where the time
+  of a token goes) and `perplexity` (as `llama-perplexity`).
+- `tools/parity/gguf_models_reference.py` and `kapel-infer/tests/gguf.rs`: models read
+  from GGUF against the models they come from.
 
 ### Changed
 
@@ -86,6 +108,16 @@ changelog says how.
   cached on the device; a failed allocation empties the pool and retries.
 - `kapel-hub`: the download cache is keyed by commit; only top-level files are
   downloaded; saving writes a temporary file and renames it.
+- `kapel-cpu`: the pool publishes its work without a lock, on separate cache lines
+  (2.5 µs to 0.7 µs per call); the exponential vectorizes (3.7 times faster); binary
+  operations on inputs of one shape skip the offsets; `bf16`, `f16` and quantized
+  tables are gathered row by row; outputs are computed in pooled buffers.
+- `kapel-core`: `Tensor::to_f64_vec` decodes contiguous floats without a call per
+  element (the logits of a large vocabulary, at every token).
+- The conformity suite compares an output narrower than the type under test at its
+  own tolerance.
+- `tools/parity/generation_reference.py` reads Llama 3.2 and Mistral from copies of
+  their gated repositories: no token needed.
 - `kapel-tokenizers`: regexes built once and added tokens found with
   Aho-Corasick (encoding 1.4 to 8 times faster); `strftime_now` uses local time.
 - Parity tests say when their data is missing, and fail if
@@ -94,6 +126,8 @@ changelog says how.
 
 ### Fixed
 
+- `kapel-cli`: on the processor, `kapel run` converts the weights to `f32` by default,
+  as its help says; it kept `bf16`, forty times slower.
 - `kapel-cpu`: rotary embeddings accept negative `i32` positions, as the contract and
   the reference do.
 - Empty dimensions no longer panic in the reference products.

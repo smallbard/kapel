@@ -268,6 +268,33 @@ impl Tensor {
             return dequantize(self.dtype, &bytes[start..start + len]);
         }
         let size = self.dtype.block_bytes();
+        // The float types in order, decoded without a call per element: the
+        // logits of a large vocabulary are read at every generated token.
+        if self.layout.is_contiguous() {
+            let start = self.layout.offset() * size;
+            let bytes = &bytes[start..start + self.numel() * size];
+            match self.dtype {
+                DType::F32 => {
+                    let (values, _) = bytes.as_chunks::<4>();
+                    return Ok(values
+                        .iter()
+                        .map(|b| f64::from(f32::from_le_bytes(*b)))
+                        .collect());
+                }
+                DType::F64 => {
+                    let (values, _) = bytes.as_chunks::<8>();
+                    return Ok(values.iter().map(|b| f64::from_le_bytes(*b)).collect());
+                }
+                DType::BF16 => {
+                    let (values, _) = bytes.as_chunks::<2>();
+                    return Ok(values
+                        .iter()
+                        .map(|b| f64::from(f32::from_bits(u32::from(u16::from_le_bytes(*b)) << 16)))
+                        .collect());
+                }
+                _ => {}
+            }
+        }
         self.layout
             .offsets()
             .map(|at| self.dtype.decode(&bytes[at * size..(at + 1) * size]))

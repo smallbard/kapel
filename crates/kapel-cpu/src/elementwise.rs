@@ -124,24 +124,24 @@ impl Run<Unary> for Cpu {
         let signature = op.infer(inputs)?;
         check_unary(op.kind)?;
         let x = io::contiguous(Unary::NAME, inputs[0])?;
-        let mut out = vec![0.0; x.len()];
         let isa = self.isa;
-        self.fill(&mut out, CHUNK, |start, part| {
-            let x = &x[start..start + part.len()];
-            match op.kind {
-                UnaryKind::Exp => {
-                    part.copy_from_slice(x);
-                    math::exp_in_place(isa, part);
+        io::output(&self.buffers, &signature.shape, signature.dtype, |out| {
+            self.fill(out, CHUNK, |start, part| {
+                let x = &x[start..start + part.len()];
+                match op.kind {
+                    UnaryKind::Exp => {
+                        part.copy_from_slice(x);
+                        math::exp_in_place(isa, part);
+                    }
+                    UnaryKind::Silu => math::silu(isa, x, part),
+                    UnaryKind::GeluTanh => math::gelu(isa, x, part),
+                    kind => part
+                        .iter_mut()
+                        .zip(x)
+                        .for_each(|(y, &x)| *y = unary_value(kind, x)),
                 }
-                UnaryKind::Silu => math::silu(isa, x, part),
-                UnaryKind::GeluTanh => math::gelu(isa, x, part),
-                kind => part
-                    .iter_mut()
-                    .zip(x)
-                    .for_each(|(y, &x)| *y = unary_value(kind, x)),
-            }
-        });
-        io::write(&self.buffers, &out, &signature.shape, signature.dtype)
+            });
+        })
     }
 
     fn backward(
@@ -192,6 +192,14 @@ fn binary(kind: BinaryKind, a: f32, b: f32) -> (f32, f32, f32) {
     }
 }
 
+/// `y[i] = f(a[i], b[i])`.
+#[inline(always)]
+fn same_shape(y: &mut [f32], a: &[f32], b: &[f32], f: impl Fn(f32, f32) -> f32) {
+    for ((y, &a), &b) in y.iter_mut().zip(a).zip(b) {
+        *y = f(a, b);
+    }
+}
+
 /// Sums a full-size gradient back to the shape of a broadcast input, in a fixed
 /// order: the same bits whatever the number of threads.
 fn reduce_to(full: &[f32], offsets: &[usize], len: usize) -> Vec<f32> {
@@ -206,6 +214,27 @@ impl Run<Binary> for Cpu {
     fn forward(&self, op: &Binary, inputs: &[&Tensor]) -> Result<Tensor> {
         let signature = op.infer(inputs)?;
         check_binary(op.kind)?;
+        // Two inputs of the output's shape, in order: the common case of the
+        // residual sums and gated products, without the offsets.
+        if inputs
+            .iter()
+            .all(|t| t.shape() == signature.shape.as_slice())
+        {
+            let a = io::contiguous(Binary::NAME, inputs[0])?;
+            let b = io::contiguous(Binary::NAME, inputs[1])?;
+            return io::output(&self.buffers, &signature.shape, signature.dtype, |out| {
+                self.fill(out, CHUNK, |start, part| {
+                    let (a, b) = (&a[start..][..part.len()], &b[start..][..part.len()]);
+                    match op.kind {
+                        BinaryKind::Add => same_shape(part, a, b, |a, b| a + b),
+                        BinaryKind::Sub => same_shape(part, a, b, |a, b| a - b),
+                        BinaryKind::Mul => same_shape(part, a, b, |a, b| a * b),
+                        BinaryKind::Div => same_shape(part, a, b, |a, b| a / b),
+                        kind => same_shape(part, a, b, |a, b| binary(kind, a, b).0),
+                    }
+                });
+            });
+        }
         let (a, b) = (
             io::strided(Binary::NAME, inputs[0])?,
             io::strided(Binary::NAME, inputs[1])?,

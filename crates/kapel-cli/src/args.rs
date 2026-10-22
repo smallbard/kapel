@@ -63,6 +63,26 @@ pub(crate) struct Run {
     pub(crate) stop: Vec<String>,
     pub(crate) revision: String,
     pub(crate) stats: bool,
+    pub(crate) byte_activations: bool,
+    pub(crate) quantize: Option<DType>,
+    pub(crate) quantize_output: bool,
+}
+
+/// A quantized format: `int8` and `int4` (groups of 128 and 64, or `/G`),
+/// `q8_0`, `q4_0`.
+fn format(value: &str) -> Result<DType, String> {
+    let bad = || format!("--quantize: {value:?} is not int8[/G], int4[/G], q8_0 or q4_0");
+    let (name, group) = match value.split_once('/') {
+        Some((name, group)) => (name, Some(group.parse::<u16>().map_err(|_| bad())?)),
+        None => (value, None),
+    };
+    match name {
+        "int8" => DType::int8(group.unwrap_or(128)).map_err(|e| e.to_string()),
+        "int4" => DType::int4(group.unwrap_or(64)).map_err(|e| e.to_string()),
+        "q8_0" if group.is_none() => Ok(DType::Quantized(kapel_core::QuantFormat::Q8_0)),
+        "q4_0" if group.is_none() => Ok(DType::Quantized(kapel_core::QuantFormat::Q4_0)),
+        _ => Err(bad()),
+    }
 }
 
 fn number<T: std::str::FromStr>(option: &str, value: &str) -> Result<T, String> {
@@ -85,6 +105,9 @@ pub(crate) fn parse(args: &[String]) -> Result<Run, String> {
         stop: Vec::new(),
         revision: "main".into(),
         stats: false,
+        byte_activations: false,
+        quantize: None,
+        quantize_output: false,
     };
     let mut model = None;
     let mut i = 0;
@@ -133,6 +156,9 @@ pub(crate) fn parse(args: &[String]) -> Result<Run, String> {
             "--stop" => run.stop.push(value()?),
             "--revision" => run.revision = value()?,
             "--stats" => run.stats = true,
+            "--byte-activations" => run.byte_activations = true,
+            "--quantize" => run.quantize = Some(format(&value()?)?),
+            "--quantize-output" => run.quantize_output = true,
             other if other.starts_with("--") => return Err(format!("unknown option {other}")),
             other if model.is_none() => model = Some(other.to_string()),
             other => return Err(format!("unexpected argument {other:?}")),
@@ -174,6 +200,15 @@ mod tests {
     #[test]
     fn mistakes_are_explained() {
         assert!(parse_all("--greedy").unwrap_err().contains("which model"));
+        let run = parse_all("m --quantize int4/32 --quantize-output").unwrap();
+        assert_eq!(run.quantize, Some(DType::int4(32).unwrap()));
+        assert!(run.quantize_output);
+        assert_eq!(
+            parse_all("m --quantize int8").unwrap().quantize,
+            Some(DType::int8(128).unwrap())
+        );
+        assert!(parse_all("m --quantize int3").is_err());
+        assert!(parse_all("m --quantize q8_0/16").is_err());
         assert!(parse_all("m --top-p x").unwrap_err().contains("--top-p"));
         assert!(
             parse_all("m --device tpu")

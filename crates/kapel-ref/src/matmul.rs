@@ -62,11 +62,23 @@ impl Run<Matmul> for Reference {
     }
 }
 
+/// The weights of a quantized product, dequantized and their rows stacked.
+fn stacked(weights: &[&Tensor]) -> Result<Array> {
+    let k = weights[0].shape()[1];
+    let mut data = Vec::new();
+    for w in weights {
+        data.extend(Array::of(w)?.data);
+    }
+    Ok(Array::new(&[data.len() / k.max(1), k], data))
+}
+
 impl Run<QuantizedMatmul> for Reference {
     fn forward(&self, op: &QuantizedMatmul, inputs: &[&Tensor]) -> Result<Tensor> {
         let signature = op.infer(inputs)?;
-        let (x, w) = (Array::of(inputs[0])?, Array::of(inputs[1])?);
-        let (n, k) = (w.shape[0], w.shape[1]);
+        let x = Array::of(inputs[0])?;
+        let k = inputs[1].shape()[1];
+        let n = *signature.shape.last().expect("an output dimension");
+        let w = stacked(&inputs[1..])?;
         let mut out = Array::zeros(&signature.shape);
         // Indexed rather than chunked: any of the sizes may be 0.
         let rows: usize = x.shape[..x.shape.len() - 1].iter().product();
@@ -90,13 +102,14 @@ impl Run<QuantizedMatmul> for Reference {
         inputs: &[&Tensor],
         grad: &Tensor,
     ) -> Result<Vec<Option<Tensor>>> {
-        op.infer_backward(inputs, grad)?;
+        let signature = op.infer_backward(inputs, grad)?;
         let (x, w, g) = (
             Array::of(inputs[0])?,
-            Array::of(inputs[1])?,
+            stacked(&inputs[1..])?,
             Array::of(grad)?,
         );
-        let (n, k) = (w.shape[0], w.shape[1]);
+        let k = inputs[1].shape()[1];
+        let n = *signature.shape.last().expect("an output dimension");
         let mut gx = Array::zeros(&x.shape);
         // Indexed rather than chunked: any of the sizes may be 0.
         let rows: usize = x.shape[..x.shape.len() - 1].iter().product();
@@ -109,6 +122,8 @@ impl Run<QuantizedMatmul> for Reference {
                 }
             }
         }
-        Ok(vec![Some(gx.tensor()?), None])
+        let mut grads = vec![Some(gx.tensor()?)];
+        grads.resize(inputs.len(), None);
+        Ok(grads)
     }
 }

@@ -21,6 +21,12 @@ pub struct Cpu {
     pub(crate) pool: Arc<Pool>,
     pub(crate) isa: Isa,
     pub(crate) buffers: Arc<BufferPool>,
+    /// Whether products by quantized weights quantize their activations to
+    /// bytes ([`Cpu::with_byte_activations`]).
+    pub(crate) byte_activations: bool,
+    /// Whether the processor has AVX-512 VNNI and `isa` allows it: the
+    /// proof that the kernels of `bytes::vnni` can run.
+    pub(crate) vnni: bool,
 }
 
 impl Cpu {
@@ -32,10 +38,13 @@ impl Cpu {
 
     /// A backend with `threads` threads, the calling thread included.
     pub fn with_threads(threads: usize) -> Self {
+        let isa = Isa::detect();
         Self {
             pool: Arc::new(Pool::new(threads)),
-            isa: Isa::detect(),
+            isa,
             buffers: BufferPool::new(1 << 30),
+            byte_activations: false,
+            vnni: isa.kind() == IsaKind::Avx512 && crate::bytes::vnni_available(),
         }
     }
 
@@ -49,7 +58,26 @@ impl Cpu {
             op: "Cpu::with_isa",
             message: format!("this processor does not support {kind:?}"),
         })?;
+        self.vnni = kind == IsaKind::Avx512 && crate::bytes::vnni_available();
         Ok(self)
+    }
+
+    /// The same backend, with the activations of the products by quantized
+    /// weights quantized to bytes (by blocks of 32, as llama.cpp does) when
+    /// `on`. The products are then sums of products of bytes, several times
+    /// cheaper (`vpdpbusd` on a processor with AVX-512 VNNI), but they add
+    /// the rounding of the activations to that of the weights: the results
+    /// change a little. Off by default.
+    #[must_use]
+    pub fn with_byte_activations(mut self, on: bool) -> Self {
+        self.byte_activations = on;
+        self
+    }
+
+    /// Whether the activations of the products by quantized weights are
+    /// quantized to bytes.
+    pub fn byte_activations(&self) -> bool {
+        self.byte_activations
     }
 
     /// The number of threads, the calling thread included.

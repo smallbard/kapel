@@ -61,7 +61,7 @@ A value passes when its error is small relative to the largest reference value o
 | `bf16` | 5e-2 | 8-bit significand |
 | other | 0.25, or exact for integer outputs |  |
 
-NaN matches NaN. Scaling by the largest reference value means a backend is judged on the magnitude of what it computes, not on cancellations it cannot avoid.
+NaN matches NaN. Scaling by the largest reference value means a backend is judged on the magnitude of what it computes, not on cancellations it cannot avoid. An output narrower than the type under test, such as the f32 rows that `GatherRows` gives from a quantized table in the f64 suite, is compared at the tolerance of its own type.
 
 ## 5.4 Who checks the reference?
 

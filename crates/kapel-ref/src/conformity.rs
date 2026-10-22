@@ -15,7 +15,8 @@
 //! measures the backend's own computation, not the rounding of its inputs. The
 //! forward outputs are compared, then the gradients of the backward pass for a
 //! random output gradient. A value passes if it is within
-//! [`tolerance`]`(dtype) × max(1, max |reference|)` of the reference. The
+//! [`tolerance`]`(dtype) × max(1, max |reference|)` of the reference (of the
+//! output's type, when it is narrower than `dtype`). The
 //! forward output must also have the type of the operation's signature, and a
 //! backward call with an output gradient of the wrong shape must return an
 //! error.
@@ -190,17 +191,29 @@ fn random_quantized(rng: &mut Rng, shape: &[usize], dtype: DType) -> Tensor {
     let count: usize = shape.iter().product();
     let (block, block_bytes) = (dtype.block_len(), dtype.block_bytes());
     let mut bytes = Vec::with_capacity(count / block * block_bytes);
+    use kapel_core::QuantFormat as Q;
+    // Where each format keeps its `f16` scales and minimums; Kapel's formats
+    // start with an `f32` scale.
+    let halves: &[usize] = match dtype {
+        DType::Quantized(Q::Q8_0 | Q::Q4_0 | Q::Q5_0) => &[0],
+        DType::Quantized(Q::Q4_1 | Q::Q5_1 | Q::Q4K | Q::Q5K) => &[0, 2],
+        DType::Quantized(Q::Q2K) => &[80, 82],
+        DType::Quantized(Q::Q3K) => &[108],
+        DType::Quantized(Q::Q6K) => &[208],
+        _ => &[],
+    };
     for _ in 0..count / block {
-        let scale = rng.uniform(0.005, 0.02);
         let start = bytes.len();
-        match dtype {
-            DType::Quantized(kapel_core::QuantFormat::Q8_0 | kapel_core::QuantFormat::Q4_0) => {
-                bytes.extend(kapel_core::F16::from_f64(scale).0.to_le_bytes());
-            }
-            _ => bytes.extend((scale as f32).to_le_bytes()),
-        }
         while bytes.len() < start + block_bytes {
             bytes.push(rng.next_u64() as u8);
+        }
+        let block = &mut bytes[start..];
+        if halves.is_empty() {
+            block[..4].copy_from_slice(&(rng.uniform(0.005, 0.02) as f32).to_le_bytes());
+        }
+        for &at in halves {
+            let scale = kapel_core::F16::from_f64(rng.uniform(0.005, 0.02));
+            block[at..at + 2].copy_from_slice(&scale.0.to_le_bytes());
         }
     }
     Tensor::from_bytes(dtype, shape, &bytes).expect("whole blocks")
@@ -383,6 +396,60 @@ fn cases<V: Visitor>(v: &mut V, dtype: DType) {
             format!("[2, 3, 64] · {format} [5, 64]ᵀ"),
             vec![x(rng, &[2, 3, 64]), w],
         );
+    }
+    // Every format, on one row (generation), a few, and more than a backend
+    // may take in place.
+    {
+        use kapel_core::QuantFormat as Q;
+        let formats = [
+            DType::int8(64).expect("valid"),
+            DType::int8(40).expect("valid"),
+            DType::int4(128).expect("valid"),
+            DType::int4(40).expect("valid"),
+        ]
+        .into_iter()
+        .chain(
+            [
+                Q::Q8_0,
+                Q::Q4_0,
+                Q::Q4_1,
+                Q::Q5_0,
+                Q::Q5_1,
+                Q::Q2K,
+                Q::Q3K,
+                Q::Q4K,
+                Q::Q5K,
+                Q::Q6K,
+            ]
+            .map(DType::Quantized),
+        );
+        for format in formats {
+            let w = random_quantized(rng, &[7, 1280], format);
+            for rows in [1, 3, 17] {
+                v.visit(
+                    &QuantizedMatmul,
+                    format!("[{rows}, 1280] · {format} [7, 1280]ᵀ"),
+                    vec![x(rng, &[rows, 1280]), plain(w.clone())],
+                );
+            }
+            v.visit(
+                &GatherRows,
+                format!("{format} [7, 1280] by [2, 2]"),
+                vec![plain(w), plain(indices(rng, &[2, 2], 7))],
+            );
+        }
+        // Weights of several formats, their rows stacked.
+        let stack = [(Q::Q4K, 5), (Q::Q6K, 3), (Q::Q8_0, 2)]
+            .map(|(f, n)| random_quantized(rng, &[n, 512], DType::Quantized(f)));
+        for rows in [1, 3, 17] {
+            let mut args = vec![x(rng, &[rows, 512])];
+            args.extend(stack.iter().cloned().map(plain));
+            v.visit(
+                &QuantizedMatmul,
+                format!("[{rows}, 512] · [q4_k [5, 512]; q6_k [3, 512]; q8_0 [2, 512]]ᵀ"),
+                args,
+            );
+        }
     }
 
     v.visit(
@@ -961,8 +1028,10 @@ impl<B: Backend + Transfer> Conformity<'_, B> {
         let got = self
             .backend
             .download(&Run::<O>::forward(self.backend, op, &device_refs)?)?;
+        // An output narrower than the type under test (the `f32` rows of a
+        // quantized table) is compared at its own tolerance.
         let tol = if signature.dtype.is_float() {
-            tolerance(self.dtype)
+            tolerance(self.dtype).max(tolerance(signature.dtype))
         } else {
             0.0
         };

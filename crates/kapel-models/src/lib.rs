@@ -15,9 +15,14 @@
 //! let logits = cuda.download(&model.forward(&cuda, &ids)?)?;
 //! ```
 //!
+//! A model also reads from a GGUF file of llama.cpp ([`Model::from_gguf`]),
+//! its weights quantized or not, and [`Model::quantize`] quantizes the linear
+//! projections of a model of the Hub: the products then read the codes.
+//!
 //! The parity tool (`tools/parity`) checks the logits against `transformers`.
 
 mod config;
+mod gguf;
 mod model;
 
 use std::fmt;

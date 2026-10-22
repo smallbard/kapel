@@ -6,7 +6,7 @@ use kapel_core::{DType, Tensor};
 use kapel_hub::Checkpoint;
 use kapel_ops::{
     Affine, Attention, Backend, Binary, BinaryKind, Cast, Concat, Contiguous, GatherRows,
-    LayerNorm, Matmul, RmsNorm, Rope, Transfer, Unary, UnaryKind,
+    LayerNorm, Matmul, QuantizedMatmul, RmsNorm, Rope, Transfer, Unary, UnaryKind,
 };
 
 use crate::ModelError;
@@ -61,8 +61,13 @@ struct Ops<'a, B>(&'a B);
 
 impl<B: Backend> Ops<'_, B> {
     fn linear(&self, x: &Tensor, w: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
-        // `transformers` stores `[out, in]`: `y = x · wᵀ`, a view.
-        let y = self.0.forward(&Matmul, &[x, &w.transpose(0, 1)?])?;
+        // `transformers` stores `[out, in]`: `y = x · wᵀ`, a view. Quantized
+        // weights keep that layout, their blocks along `in`.
+        let y = if w.dtype().is_quantized() {
+            self.0.forward(&QuantizedMatmul, &[x, w])?
+        } else {
+            self.0.forward(&Matmul, &[x, &w.transpose(0, 1)?])?
+        };
         self.bias(y, bias)
     }
 
@@ -122,6 +127,19 @@ impl Model {
         })
     }
 
+    /// A model of its parsed and raw configurations and its weights.
+    pub(crate) fn from_parts(
+        config: Config,
+        raw_config: serde_json::Value,
+        weights: BTreeMap<String, Tensor>,
+    ) -> Self {
+        Self {
+            config,
+            raw_config,
+            weights,
+        }
+    }
+
     /// The configuration.
     pub fn config(&self) -> &Config {
         &self.config
@@ -156,14 +174,67 @@ impl Model {
 
     /// The model with `f` applied to each weight.
     fn map(&self, f: impl Fn(&Tensor) -> Result<Tensor>) -> Result<Self> {
+        self.map_named(|_, w| f(w))
+    }
+
+    fn map_named(&self, f: impl Fn(&str, &Tensor) -> Result<Tensor>) -> Result<Self> {
         Ok(Self {
             config: self.config.clone(),
             raw_config: self.raw_config.clone(),
             weights: self
                 .weights
                 .iter()
-                .map(|(name, w)| Ok((name.clone(), f(w)?)))
+                .map(|(name, w)| Ok((name.clone(), f(name, w)?)))
                 .collect::<Result<_>>()?,
+        })
+    }
+
+    /// The model with the weights of its linear projections (attention and
+    /// MLP) quantized to `dtype` by rounding to the nearest
+    /// ([`kapel_core::quantize`]: Kapel's int8 and int4 by groups, GGUF's
+    /// Q8_0 and Q4_0), and with `output` its output table too (the
+    /// embeddings, when the model ties them to it). The products then read
+    /// the codes in place: a fraction of the bytes of the float weights.
+    ///
+    /// Weights whose rows are not a whole number of blocks, the norms and
+    /// biases, and GPT-2's projections (stored transposed) keep their type.
+    /// The weights must be in host memory: a model as loaded.
+    ///
+    /// # Errors
+    ///
+    /// If `dtype` is not one of those formats, or a weight is not in host
+    /// memory.
+    pub fn quantize(&self, dtype: DType, output: bool) -> Result<Self> {
+        const PROJECTIONS: [&str; 10] = [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+            "dense",
+            "fc1",
+            "fc2",
+        ];
+        let head = if self.config.tie_embeddings || !self.weights.contains_key("lm_head.weight") {
+            "model.embed_tokens.weight"
+        } else {
+            "lm_head.weight"
+        };
+        let chosen = |name: &str| {
+            let module = name
+                .strip_suffix(".weight")
+                .and_then(|n| n.rsplit('.').next());
+            module.is_some_and(|m| PROJECTIONS.contains(&m)) || (output && name == head)
+        };
+        self.map_named(|name, w| {
+            let fits = w.rank() == 2 && w.shape()[1].is_multiple_of(dtype.block_len());
+            if chosen(name) && fits && w.dtype().is_float() {
+                Ok(quantized(w, dtype)?)
+            } else {
+                Ok(w.clone())
+            }
         })
     }
 
@@ -265,6 +336,27 @@ impl Model {
             }));
         }
         self.run(backend, ids, cache, Logits::Last)
+    }
+
+    /// Like [`Model::step`], with the logits `[T, vocab]` of every one of
+    /// `ids`: to score a text by pieces, or to check proposed tokens.
+    ///
+    /// # Errors
+    ///
+    /// As [`Model::step`].
+    pub fn extend<B: Backend + Transfer>(
+        &self,
+        backend: &B,
+        ids: &[u32],
+        cache: &mut Cache,
+    ) -> Result<Tensor> {
+        if ids.is_empty() {
+            return Err(ModelError::Tensor(kapel_core::Error::InvalidArgument {
+                op: "extend",
+                message: "no token to compute".into(),
+            }));
+        }
+        self.run(backend, ids, cache, Logits::All)
     }
 
     fn run<B: Backend + Transfer>(
@@ -440,14 +532,17 @@ impl Model {
                 qkv.narrow(1, 2 * width, width)?,
             )
         } else {
-            let proj = |name: &str| {
-                ops.linear(
-                    h,
+            let proj = |name: &str| -> Result<(&Tensor, Option<&Tensor>)> {
+                Ok((
                     self.weight(&format!("{p}.self_attn.{name}.weight"))?,
                     bias(&format!("{p}.self_attn.{name}.bias")),
-                )
+                ))
             };
-            (proj("q_proj")?, proj("k_proj")?, proj("v_proj")?)
+            let linear = |name: &str| -> Result<Tensor> {
+                let (w, b) = proj(name)?;
+                ops.linear(h, w, b)
+            };
+            (linear("q_proj")?, linear("k_proj")?, linear("v_proj")?)
         };
         // [T, H·D] → [T, H, D] → [1, H, T, D], as views.
         let heads = |x: Tensor, n: usize, norm: Option<&str>| -> Result<Tensor> {
@@ -523,6 +618,42 @@ impl Model {
 }
 
 /// `value` rounded to `dtype`, as a float of that type holds it.
+/// A weight `[N, K]` quantized to `dtype`, by pieces of rows on every core.
+fn quantized(w: &Tensor, dtype: DType) -> kapel_core::Result<Tensor> {
+    let (n, k) = (w.shape()[0], w.shape()[1]);
+    let threads = std::thread::available_parallelism().map_or(1, |t| t.get());
+    // Pieces of about a million values: a few megabytes at a time.
+    let rows = (1 << 20) / k.max(1) + 1;
+    let pieces: Vec<usize> = (0..n).step_by(rows).collect();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let mut parts: Vec<kapel_core::Result<Vec<u8>>> = Vec::new();
+    parts.resize_with(pieces.len(), || Ok(Vec::new()));
+    let results = std::sync::Mutex::new(parts);
+    std::thread::scope(|scope| {
+        for _ in 0..threads.min(pieces.len()) {
+            scope.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(&first) = pieces.get(i) else { break };
+                    let part = w
+                        .narrow(0, first, rows.min(n - first))
+                        .and_then(|part| part.to_f64_vec())
+                        .and_then(|values| {
+                            let values: Vec<f32> = values.into_iter().map(|v| v as f32).collect();
+                            kapel_core::quantize(dtype, &values)
+                        });
+                    results.lock().unwrap_or_else(|e| e.into_inner())[i] = part;
+                }
+            });
+        }
+    });
+    let mut bytes = Vec::with_capacity(dtype.storage_bytes(n * k)?);
+    for part in results.into_inner().unwrap_or_else(|e| e.into_inner()) {
+        bytes.extend(part?);
+    }
+    Tensor::from_bytes(dtype, &[n, k], &bytes)
+}
+
 fn rounded(dtype: DType, value: f64) -> Result<f64> {
     let mut bytes = vec![0; dtype.block_bytes()];
     dtype.encode(value, &mut bytes)?;

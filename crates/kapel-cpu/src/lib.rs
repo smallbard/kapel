@@ -6,7 +6,12 @@
 //! - operations are shared between a permanent group of threads ([`pool`]);
 //! - matrix products are cut into blocks that fit in the caches, around an
 //!   AVX-512 or AVX2 micro-kernel ([`gemm`], [`kernels`]);
-//! - row computations, the exponential included, are vectorized ([`math`]).
+//! - row computations, the exponential included, are vectorized ([`math`]);
+//! - products by quantized weights (Kapel's int8 and int4, GGUF's formats)
+//!   read the codes in place and decode them in registers: in generation,
+//!   they read the weights at the speed of memory. With
+//!   [`Cpu::with_byte_activations`], their activations are quantized to
+//!   bytes too, and the products are sums of bytes (AVX-512 VNNI).
 //!
 //! The instructions are detected at run time: the same build runs on a
 //! processor without AVX-512, with the AVX2 kernels, or without either.
@@ -24,10 +29,10 @@
 macro_rules! multiversion {
     (
         $(#[$attr:meta])*
-        pub fn $name:ident($($arg:ident: $ty:ty),* $(,)?) -> $ret:ty = $body:ident;
+        $vis:vis fn $name:ident($($arg:ident: $ty:ty),* $(,)?) -> $ret:ty = $body:ident;
     ) => {
         $(#[$attr])*
-        pub fn $name(isa: $crate::Isa, $($arg: $ty),*) -> $ret {
+        $vis fn $name(isa: $crate::Isa, $($arg: $ty),*) -> $ret {
             #[cfg(target_arch = "x86_64")]
             #[target_feature(enable = "avx512f,avx512bw,avx512dq,avx512vl,avx2,fma")]
             unsafe fn wide($($arg: $ty),*) -> $ret {
@@ -57,6 +62,7 @@ macro_rules! multiversion {
 
 mod attention;
 mod backend;
+mod bytes;
 mod elementwise;
 pub mod gemm;
 mod index;
@@ -68,6 +74,7 @@ pub mod math;
 mod matmul;
 mod norm;
 pub mod pool;
+mod quantized;
 mod reduce;
 mod rope;
 
