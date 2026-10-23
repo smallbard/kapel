@@ -304,13 +304,22 @@ impl Model {
     ///
     /// If the backend cannot stack the weights.
     pub fn fused<B: Backend>(&self, backend: &B) -> Result<Self> {
-        let mut model = self.map(|w| Ok(w.clone()))?;
+        self.map(|w| Ok(w.clone()))?.into_fused(backend)
+    }
+
+    /// [`Model::fused`], taking the model: each projection's weights are
+    /// let go once stacked, so that the model never takes twice its memory.
+    ///
+    /// # Errors
+    ///
+    /// As [`Model::fused`].
+    pub fn into_fused<B: Backend>(mut self, backend: &B) -> Result<Self> {
         if !matches!(self.config.block, Block::Sequential | Block::Sandwich) {
-            return Ok(model);
+            return Ok(self);
         }
         // Whether the weights `names` exist, float, of one type and width.
-        let stackable = |names: &[String]| {
-            let parts: Option<Vec<&Tensor>> = names.iter().map(|n| self.weights.get(n)).collect();
+        let stackable = |weights: &BTreeMap<String, Tensor>, names: &[String]| {
+            let parts: Option<Vec<&Tensor>> = names.iter().map(|n| weights.get(n)).collect();
             parts.is_some_and(|parts| {
                 let (dtype, width) = (parts[0].dtype(), parts[0].shape().get(1));
                 dtype.is_float()
@@ -319,17 +328,22 @@ impl Model {
                         .all(|w| w.dtype() == dtype && w.shape().get(1) == width)
             })
         };
-        let mut stack = |names: &[String], into: String| -> Result<()> {
-            let parts: Vec<&Tensor> = names.iter().map(|n| &self.weights[n]).collect();
-            let stacked = backend.forward(&Concat { dim: 0 }, &parts)?;
-            for name in names {
-                model.weights.remove(name);
-            }
-            model.weights.insert(into, stacked);
+        let stack = |weights: &mut BTreeMap<String, Tensor>,
+                     names: &[String],
+                     into: String|
+         -> Result<()> {
+            let parts: Vec<Tensor> = names.iter().filter_map(|n| weights.remove(n)).collect();
+            let refs: Vec<&Tensor> = parts.iter().collect();
+            let stacked = backend.forward(&Concat { dim: 0 }, &refs)?;
+            weights.insert(into, stacked);
             Ok(())
         };
-        for layer in 0..self.config.layers {
-            let p = format!("model.layers.{layer}");
+        let blocks: Vec<String> = (0..self.config.layers)
+            .map(|layer| format!("model.layers.{layer}"))
+            .chain((0..self.config.multi_token_layers).map(|i| format!("model.mtp_layers.{i}")))
+            .collect();
+        let with_biases = self.config.qkv_bias;
+        for p in blocks {
             let attn = |m: &str| format!("{p}.self_attn.{m}");
             let names: Vec<String> = ["q_proj", "k_proj", "v_proj"]
                 .iter()
@@ -340,22 +354,22 @@ impl Model {
                 .map(|m| attn(&format!("{m}.bias")))
                 .collect();
             // With biases, the weights and the biases are stacked together.
-            let with_biases = self.config.qkv_bias;
-            if stackable(&names) && (!with_biases || stackable(&biases)) {
-                stack(&names, attn("qkv_proj.weight"))?;
+            let w = &mut self.weights;
+            if stackable(w, &names) && (!with_biases || stackable(w, &biases)) {
+                stack(w, &names, attn("qkv_proj.weight"))?;
                 if with_biases {
-                    stack(&biases, attn("qkv_proj.bias"))?;
+                    stack(w, &biases, attn("qkv_proj.bias"))?;
                 }
             }
             let mlp: Vec<String> = ["gate_proj", "up_proj"]
                 .iter()
                 .map(|m| format!("{p}.mlp.{m}.weight"))
                 .collect();
-            if stackable(&mlp) {
-                stack(&mlp, format!("{p}.mlp.gate_up_proj.weight"))?;
+            if stackable(w, &mlp) {
+                stack(w, &mlp, format!("{p}.mlp.gate_up_proj.weight"))?;
             }
         }
-        Ok(model)
+        Ok(self)
     }
 
     /// The model with `f` applied to each weight.
@@ -537,6 +551,145 @@ impl Model {
         self.extend_batch(backend, &mut cache.inner, &[(cache.id, ids)])
     }
 
+    /// Like [`Model::extend`], with the logits `[last, vocab]` of the last
+    /// `last` of `ids` only: to check proposed tokens after a prompt, without
+    /// the logits of the prompt.
+    ///
+    /// # Errors
+    ///
+    /// As [`Model::step`], and if `last` is 0 or more than `ids` has.
+    pub fn extend_last<B: Backend + Transfer>(
+        &self,
+        backend: &B,
+        ids: &[u32],
+        cache: &mut Cache,
+        last: usize,
+    ) -> Result<Tensor> {
+        if last == 0 || last > ids.len() {
+            return Err(ModelError::Tensor(kapel_core::Error::InvalidArgument {
+                op: "extend_last",
+                message: format!("the last {last} of {} tokens", ids.len()),
+            }));
+        }
+        let rows = (ids.len() - last..ids.len()).collect();
+        self.run_batch(
+            backend,
+            &mut cache.inner,
+            &[(cache.id, ids)],
+            Logits::Rows(rows),
+        )
+    }
+
+    /// Like [`Model::extend_last`], with the final hidden states `[T,
+    /// hidden]` of every one of `ids` too, before the final norm: what the
+    /// model's multi-token layer reads ([`Model::multi_token`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`Model::extend_last`].
+    pub fn extend_hidden<B: Backend + Transfer>(
+        &self,
+        backend: &B,
+        ids: &[u32],
+        cache: &mut Cache,
+        last: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        if last == 0 || last > ids.len() {
+            return Err(ModelError::Tensor(kapel_core::Error::InvalidArgument {
+                op: "extend_hidden",
+                message: format!("the last {last} of {} tokens", ids.len()),
+            }));
+        }
+        let rows = (ids.len() - last..ids.len()).collect();
+        let (logits, hidden) = self.run_batch_with(
+            backend,
+            &mut cache.inner,
+            &[(cache.id, ids)],
+            Logits::Rows(rows),
+            true,
+        )?;
+        Ok((logits, hidden.expect("asked for")))
+    }
+
+    /// The multi-token prediction layer (MiMo, after DeepSeek-V3), over the
+    /// positions that follow those of `cache`, its own: at position `i`, the
+    /// layer reads the model's final hidden state `hidden[i]` (from
+    /// [`Model::extend_hidden`]) and the token `tokens[i]` that follows the
+    /// position, and predicts the token after that. The logits `[1, vocab]`
+    /// of the last position: a proposal for the token after `tokens`.
+    ///
+    /// # Errors
+    ///
+    /// If the model has no multi-token layer, `hidden` and `tokens` differ
+    /// in length, or an operation fails.
+    pub fn multi_token<B: Backend + Transfer>(
+        &self,
+        backend: &B,
+        cache: &mut Cache,
+        hidden: &Tensor,
+        tokens: &[u32],
+    ) -> Result<Tensor> {
+        let c = &self.config;
+        let ops = Ops(backend);
+        let n = tokens.len();
+        if c.multi_token_layers == 0 || n == 0 || hidden.shape()[0] != n {
+            return Err(ModelError::Tensor(kapel_core::Error::InvalidArgument {
+                op: "multi_token",
+                message: format!(
+                    "{} multi-token layers, {n} tokens, {} hidden states",
+                    c.multi_token_layers,
+                    hidden.shape()[0]
+                ),
+            }));
+        }
+        let p = "model.mtp_layers.0";
+        let first = cache.len();
+        let step = cache.inner.begin(backend, &[(cache.id, tokens)])?;
+        let ids = backend.upload(&Tensor::from_slice(tokens, &[n])?)?;
+        let mut e = backend.forward(
+            &GatherRows,
+            &[self.weight("model.embed_tokens.weight")?, &ids],
+        )?;
+        if e.dtype() != hidden.dtype() {
+            e = backend.forward(
+                &Cast {
+                    dtype: hidden.dtype(),
+                },
+                &[&e],
+            )?;
+        }
+        if first == 0 {
+            // The first position has no token before it to predict from:
+            // its embedding is left out, as vLLM leaves it.
+            let zero = backend.zeros(&[1, c.hidden], e.dtype())?;
+            e = if n == 1 {
+                zero
+            } else {
+                backend.forward(&Concat { dim: 0 }, &[&zero, &e.narrow(0, 1, n - 1)?])?
+            };
+        }
+        let e = self.norm(&ops, &e, &format!("{p}.token_layernorm"))?;
+        let h = self.norm(&ops, hidden, &format!("{p}.hidden_layernorm"))?;
+        let joined = backend.forward(&Concat { dim: 1 }, &[&h, &e])?;
+        let x = ops.linear(
+            &joined,
+            self.weight(&format!("{p}.input_proj.weight"))?,
+            None,
+        )?;
+        let mut paged = Some((&mut cache.inner, &step));
+        let x = self.sequential(&ops, &x, &step.positions, &mut paged, 0, p, None)?;
+        let x = self.norm(
+            &ops,
+            &x.narrow(0, n - 1, 1)?,
+            &format!("{p}.final_layernorm"),
+        )?;
+        let head = match self.optional("lm_head.weight") {
+            Some(w) if !c.tie_embeddings => w,
+            _ => self.weight("model.embed_tokens.weight")?,
+        };
+        ops.linear(&x, head, None)
+    }
+
     /// One pass over several sequences of `cache` at once: each entry of
     /// `batch` gives a sequence and its new tokens, which follow its cached
     /// positions and whose keys and values are added to it. The logits `[S,
@@ -583,6 +736,17 @@ impl Model {
         batch: &[(SequenceId, &[u32])],
         logits: Logits,
     ) -> Result<Tensor> {
+        Ok(self.run_batch_with(backend, cache, batch, logits, false)?.0)
+    }
+
+    fn run_batch_with<B: Backend + Transfer>(
+        &self,
+        backend: &B,
+        cache: &mut KvCache,
+        batch: &[(SequenceId, &[u32])],
+        logits: Logits,
+        hidden: bool,
+    ) -> Result<(Tensor, Option<Tensor>)> {
         if batch.is_empty() || batch.iter().any(|(_, ids)| ids.is_empty()) {
             return Err(ModelError::Tensor(kapel_core::Error::InvalidArgument {
                 op: "step",
@@ -596,6 +760,7 @@ impl Model {
             .collect();
         let logits = match logits {
             Logits::All => Logits::All,
+            Logits::Rows(rows) => Logits::Rows(rows),
             // One token each: every row is a last one.
             _ if batch.iter().all(|(_, ids)| ids.len() == 1) => Logits::All,
             _ => {
@@ -613,7 +778,14 @@ impl Model {
         };
         let positions = step.positions.clone();
         let ids = backend.upload(&Tensor::from_slice(&ids, &[ids.len()])?)?;
-        self.run(backend, &ids, &positions, Some((cache, &step)), logits)
+        self.run_with(
+            backend,
+            &ids,
+            &positions,
+            Some((cache, &step)),
+            logits,
+            hidden,
+        )
     }
 
     /// One token of each sequence of `batch`, computed as
@@ -830,9 +1002,25 @@ impl Model {
         backend: &B,
         ids_tensor: &Tensor,
         positions: &Tensor,
-        mut paged: Option<(&mut KvCache, &Step)>,
+        paged: Option<(&mut KvCache, &Step)>,
         logits: Logits,
     ) -> Result<Tensor> {
+        Ok(self
+            .run_with(backend, ids_tensor, positions, paged, logits, false)?
+            .0)
+    }
+
+    /// [`Model::run`], and with `hidden`, the final hidden states of every
+    /// position, before the final norm: what a multi-token layer reads.
+    fn run_with<B: Backend + Transfer>(
+        &self,
+        backend: &B,
+        ids_tensor: &Tensor,
+        positions: &Tensor,
+        mut paged: Option<(&mut KvCache, &Step)>,
+        logits: Logits,
+        hidden: bool,
+    ) -> Result<(Tensor, Option<Tensor>)> {
         let c = &self.config;
         let ops = Ops(backend);
 
@@ -877,53 +1065,19 @@ impl Model {
             let p = format!("{prefix}.{layer}");
             x = match c.block {
                 Block::Sequential | Block::Sandwich => {
-                    let h = self.norm(&ops, &x, &format!("{p}.input_layernorm"))?;
-                    let mut a = self.attention(&ops, &h, positions, &mut paged, layer, &p)?;
-                    if c.block == Block::Sandwich {
-                        a = self.norm(&ops, &a, &format!("{p}.post_attention_layernorm"))?;
-                    }
-                    let x = ops.binary(BinaryKind::Add, &x, &a)?;
-                    let before = if c.block == Block::Sandwich {
-                        "pre_feedforward_layernorm"
-                    } else {
-                        "post_attention_layernorm"
-                    };
-                    let h = self.norm(&ops, &x, &format!("{p}.{before}"))?;
-                    let inner = match self.optional(&format!("{p}.mlp.gate_up_proj.weight")) {
-                        // Stacked by `Model::fused`: one product, one gated unit.
-                        Some(w) => backend.forward(
-                            &Glu {
-                                activation: c.activation,
-                            },
-                            &[&ops.linear(&h, w, None)?],
-                        )?,
-                        None => {
-                            let gate = ops.linear(
-                                &h,
-                                self.weight(&format!("{p}.mlp.gate_proj.weight"))?,
-                                None,
-                            )?;
-                            let up = ops.linear(
-                                &h,
-                                self.weight(&format!("{p}.mlp.up_proj.weight"))?,
-                                None,
-                            )?;
-                            ops.binary(BinaryKind::Mul, &ops.unary(c.activation, &gate)?, &up)?
-                        }
-                    };
-                    let mut m = ops.linear(
-                        &inner,
-                        self.weight(&format!("{p}.mlp.down_proj.weight"))?,
-                        None,
-                    )?;
-                    if c.block == Block::Sandwich {
-                        m = self.norm(&ops, &m, &format!("{p}.post_feedforward_layernorm"))?;
-                    }
-                    ops.binary(BinaryKind::Add, &x, &m)?
+                    self.sequential(&ops, &x, positions, &mut paged, layer, &p, c.windows[layer])?
                 }
                 Block::Parallel => {
                     let h = self.norm(&ops, &x, &format!("{p}.input_layernorm"))?;
-                    let a = self.attention(&ops, &h, positions, &mut paged, layer, &p)?;
+                    let a = self.attention(
+                        &ops,
+                        &h,
+                        positions,
+                        &mut paged,
+                        layer,
+                        &p,
+                        c.windows[layer],
+                    )?;
                     let fc1 = ops.linear(
                         &h,
                         self.weight(&format!("{p}.mlp.fc1.weight"))?,
@@ -938,7 +1092,15 @@ impl Model {
                 }
                 Block::Gpt2 => {
                     let h = self.norm(&ops, &x, &format!("{p}.ln_1"))?;
-                    let a = self.attention(&ops, &h, positions, &mut paged, layer, &p)?;
+                    let a = self.attention(
+                        &ops,
+                        &h,
+                        positions,
+                        &mut paged,
+                        layer,
+                        &p,
+                        c.windows[layer],
+                    )?;
                     let x = ops.binary(BinaryKind::Add, &x, &a)?;
                     let h = self.norm(&ops, &x, &format!("{p}.ln_2"))?;
                     // GPT-2's `Conv1D` stores `[in, out]`: `y = x · w`.
@@ -969,10 +1131,15 @@ impl Model {
             Block::Parallel => "model.final_layernorm",
             _ => "model.norm",
         };
+        // The hidden states of every position, before the final norm.
+        let all = hidden.then(|| x.clone());
         // The norm and the head act row by row: only the rows wanted.
         match logits {
             Logits::All => {}
-            Logits::Rows(rows) if rows.len() == 1 => x = x.narrow(0, rows[0], 1)?,
+            // Consecutive rows: a view.
+            Logits::Rows(rows) if rows.windows(2).all(|w| w[1] == w[0] + 1) => {
+                x = x.narrow(0, rows[0], rows.len())?;
+            }
             Logits::Rows(rows) => {
                 let rows: Vec<u32> = rows.iter().map(|&r| r as u32).collect();
                 let index = backend.upload(&Tensor::from_slice(&rows, &[rows.len()])?)?;
@@ -993,11 +1160,66 @@ impl Model {
         if let Some(cap) = c.final_softcap {
             logits = ops.softcap(&logits, cap)?;
         }
-        Ok(logits)
+        Ok((logits, all))
+    }
+
+    /// A block of Llama's kind (and Gemma 2's, its norms around each part):
+    /// attention, then the gated MLP, each added to `x`. `layer` names its
+    /// tables in the cache.
+    #[allow(clippy::too_many_arguments)]
+    fn sequential<B: Backend + Transfer>(
+        &self,
+        ops: &Ops<'_, B>,
+        x: &Tensor,
+        positions: &Tensor,
+        paged: &mut Option<(&mut KvCache, &Step)>,
+        layer: usize,
+        p: &str,
+        window: Option<usize>,
+    ) -> Result<Tensor> {
+        let c = &self.config;
+        let backend = ops.0;
+        let h = self.norm(ops, x, &format!("{p}.input_layernorm"))?;
+        let mut a = self.attention(ops, &h, positions, paged, layer, p, window)?;
+        if c.block == Block::Sandwich {
+            a = self.norm(ops, &a, &format!("{p}.post_attention_layernorm"))?;
+        }
+        let x = ops.binary(BinaryKind::Add, x, &a)?;
+        let before = if c.block == Block::Sandwich {
+            "pre_feedforward_layernorm"
+        } else {
+            "post_attention_layernorm"
+        };
+        let h = self.norm(ops, &x, &format!("{p}.{before}"))?;
+        let inner = match self.optional(&format!("{p}.mlp.gate_up_proj.weight")) {
+            // Stacked by `Model::fused`: one product, one gated unit.
+            Some(w) => backend.forward(
+                &Glu {
+                    activation: c.activation,
+                },
+                &[&ops.linear(&h, w, None)?],
+            )?,
+            None => {
+                let gate =
+                    ops.linear(&h, self.weight(&format!("{p}.mlp.gate_proj.weight"))?, None)?;
+                let up = ops.linear(&h, self.weight(&format!("{p}.mlp.up_proj.weight"))?, None)?;
+                ops.binary(BinaryKind::Mul, &ops.unary(c.activation, &gate)?, &up)?
+            }
+        };
+        let mut m = ops.linear(
+            &inner,
+            self.weight(&format!("{p}.mlp.down_proj.weight"))?,
+            None,
+        )?;
+        if c.block == Block::Sandwich {
+            m = self.norm(ops, &m, &format!("{p}.post_feedforward_layernorm"))?;
+        }
+        ops.binary(BinaryKind::Add, &x, &m)
     }
 
     /// The attention of one block: `[T, hidden]` to `[T, hidden]`, after the
     /// keys and values of `cached`, to which the new ones are added.
+    #[allow(clippy::too_many_arguments)]
     fn attention<B: Backend + Transfer>(
         &self,
         ops: &Ops<'_, B>,
@@ -1006,6 +1228,7 @@ impl Model {
         paged: &mut Option<(&mut KvCache, &Step)>,
         layer: usize,
         p: &str,
+        window: Option<usize>,
     ) -> Result<Tensor> {
         let c = &self.config;
         let t = h.shape()[0];
@@ -1096,7 +1319,7 @@ impl Model {
                 ops.0.write_rows(&mut tables.1, &step.lines, &v)?;
                 let attention = PagedAttention {
                     page: PAGE,
-                    window: c.windows[layer],
+                    window,
                     scale: c.query_scale,
                     softcap: c.attn_softcap,
                 };
@@ -1111,7 +1334,7 @@ impl Model {
                 let batch = |x: &Tensor, n: usize| x.reshape(&[1, t, n, d])?.transpose(1, 2);
                 let attention = Attention {
                     causal: true,
-                    window: c.windows[layer],
+                    window,
                     scale: c.query_scale,
                     softcap: c.attn_softcap,
                 };

@@ -147,6 +147,19 @@ impl Sampler {
     /// The next token, from the logits of the last position and the tokens
     /// of the sequence so far, the generated ones from `generated` on.
     pub(crate) fn choose(&mut self, logits: &mut [f64], sequence: &[u32], generated: usize) -> u32 {
+        let choice = self.distribution(logits, sequence, generated);
+        self.draw(&choice)
+    }
+
+    /// What the next token is drawn from: the logits of the last position
+    /// with the penalties, the temperature and the filters applied, as
+    /// [`Sampler::choose`] draws it. The logits are changed.
+    pub(crate) fn distribution(
+        &self,
+        logits: &mut [f64],
+        sequence: &[u32],
+        generated: usize,
+    ) -> Choice {
         let s = &self.settings;
         if s.frequency_penalty != 0.0 || s.presence_penalty != 0.0 {
             let mut counts: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
@@ -175,7 +188,7 @@ impl Sampler {
             }
         }
         if s.is_greedy() {
-            return argmax(logits);
+            return Choice::Token(argmax(logits));
         }
         for l in logits.iter_mut() {
             *l /= s.temperature;
@@ -216,21 +229,60 @@ impl Sampler {
                 }
             }
         }
-        let probs = softmax(logits);
-        let u = self.rng.uniform();
-        let mut total = 0.0;
-        let mut last = argmax(logits);
-        for (i, &p) in probs.iter().enumerate() {
-            if p > 0.0 {
-                total += p;
-                last = i as u32;
-                if u < total {
-                    return i as u32;
+        let probabilities = softmax(logits);
+        if probabilities.iter().all(|&p| p == 0.0) {
+            // Nothing left (every logit −∞ or NaN): the first largest.
+            return Choice::Token(argmax(logits));
+        }
+        Choice::Probabilities(probabilities)
+    }
+
+    /// A token drawn from `choice`, with this sampler's generator.
+    pub(crate) fn draw(&mut self, choice: &Choice) -> u32 {
+        match choice {
+            Choice::Token(token) => *token,
+            Choice::Probabilities(probs) => {
+                let u = self.rng.uniform();
+                let mut total = 0.0;
+                let mut last = 0;
+                for (i, &p) in probs.iter().enumerate() {
+                    if p > 0.0 {
+                        total += p;
+                        last = i as u32;
+                        if u < total {
+                            return i as u32;
+                        }
+                    }
                 }
+                // Rounding left `u` above the total: the last possible token.
+                last
             }
         }
-        // Rounding left `u` above the total: the last possible token.
-        last
+    }
+
+    /// A number in `[0, 1)` from this sampler's generator.
+    pub(crate) fn uniform(&mut self) -> f64 {
+        self.rng.uniform()
+    }
+}
+
+/// What a token is drawn from.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum Choice {
+    /// One token, certainly: greedy decoding, or a proposal without
+    /// probabilities.
+    Token(u32),
+    /// The probability of every token, adding up to 1.
+    Probabilities(Vec<f64>),
+}
+
+impl Choice {
+    /// The probability of `token`.
+    pub(crate) fn probability(&self, token: u32) -> f64 {
+        match self {
+            Self::Token(t) => f64::from(u8::from(*t == token)),
+            Self::Probabilities(p) => p.get(token as usize).copied().unwrap_or(0.0),
+        }
     }
 }
 

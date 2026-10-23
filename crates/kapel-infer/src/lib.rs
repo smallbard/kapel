@@ -30,6 +30,13 @@
 //! of batch, and greedy choices are made on the device. [`Pipeline::batch`]
 //! is an engine whose requests all come at once ([`Batch`]).
 //!
+//! [`Pipeline::speculate`] generates as [`Pipeline::generate`] does, several
+//! tokens per pass of the model when a proposer ([`Draft`]) guesses them: a
+//! smaller model of the same tokenizer, the tokens of the sequence itself
+//! (prompt lookup), or the model's multi-token prediction layer (MiMo). The
+//! proposals are checked by the exact rule of speculative sampling: greedy
+//! answers do not change, and sampled ones keep their distribution.
+//!
 //! An answer may be held to a form ([`Constraint`]: a JSON schema, any JSON
 //! object, a regular expression, a Lark grammar, a list of texts): the
 //! tokens that cannot continue it get no chance, by llguidance's parser.
@@ -44,7 +51,9 @@ mod constraint;
 mod engine;
 mod generate;
 mod gguf;
+mod multi_token;
 mod sampling;
+mod speculative;
 mod text;
 
 use std::fmt;
@@ -54,6 +63,7 @@ pub use constraint::Constraint;
 pub use engine::{Engine, EngineOptions, EngineStats, Event, Prepared, RequestId, StepError};
 pub use generate::{Finish, Generation, LoadOptions, Piece, Pipeline, Request};
 pub use sampling::Sampling;
+pub use speculative::{Draft, SpeculationStats, Speculative};
 
 /// What can go wrong when generating.
 #[derive(Debug)]

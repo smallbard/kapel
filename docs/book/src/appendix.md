@@ -4,6 +4,7 @@
 
 | Term | Meaning in Kapel |
 | --- | --- |
+| Acceptance rate | The share of the proposals of speculative decoding that the model accepts (`SpeculationStats::acceptance`) |
 | Activations in bytes | Quantizing the input of a quantized product too, by blocks of 32, so that the product is a sum of products of bytes; chosen explicitly, as it changes the result a little |
 | Backend | A type implementing `Run` for every operation of the catalogue: `Reference`, `Cpu` or `Cuda` |
 | Batch | Several sequences computed in the same pass, one row per new token of each, so the weights are read once for all of them (`Model::step_batch`, `kapel_infer::Batch`) |
@@ -26,6 +27,7 @@
 | `Isa` | A proof that the processor has the instructions a code path uses |
 | llguidance | The library of structured outputs that compiles constraints into a parser over the bytes of the tokens, and gives the set of tokens allowed next |
 | Micro-kernel | The innermost routine of the matrix product, holding a block of C in registers |
+| Multi-token prediction | A layer trained with the model to predict the token after the next from the model's hidden state and the next token (MiMo, DeepSeek-V3); a proposer that costs one block (`Model::multi_token`) |
 | Packing | Copying a block of an operand into the contiguous order the micro-kernel reads |
 | Padding rows | Rows added to a smaller batch so that it fits a recorded pass of more rows; each writes a scratch line of its own and is read by no one |
 | Paged attention | Attention of new rows over a cache by pages, each row knowing its sequence and how many positions it sees (`PagedAttention`) |
@@ -33,11 +35,14 @@
 | Perplexity | The exponential of the mean negative log-likelihood of a text: how a quantization is judged |
 | Prefill | Computing the whole prompt at once, before decoding |
 | Prefix sharing | Sequences that begin with the same tokens sharing the cache pages of that beginning, indexed by the tokens they hold and counted by references (`KvCache::with_prefix_sharing`) |
+| Prompt lookup | Proposing the tokens that followed the last ones where they last appeared in the sequence: speculative decoding without a second model (`Draft::Ngram`) |
+| Proposer (draft) | What guesses the next tokens in speculative decoding: a smaller model, prompt lookup, or a multi-token layer (`Draft`) |
 | PTX | NVIDIA's intermediate assembly; the thread kernels are checked in as PTX |
 | Reference | The `f64` backend that defines correct results |
 | RoPE | Rotary position embeddings: pairs of components rotated by an angle proportional to the position |
 | Server-sent events | The streaming format of OpenAI's API over HTTP: one `data:` line per chunk of the answer, then `data: [DONE]` |
 | Softcap | A smooth bound on scores or logits, `cap · tanh(x / cap)`, used by Gemma 2 |
+| Speculative decoding | A proposer guesses several tokens, the model checks them in one pass, accepting each by the rule that keeps its distribution exactly (`Pipeline::speculate`) |
 | Stride | The distance in the buffer between two consecutive elements of a dimension |
 | Suspension (preemption) | Taking the pages of the request admitted last when the cache runs out, to compute its tokens again later |
 | Thread kernel / tile kernel | A CUDA kernel with one thread per element, written for cuda-oxide / a kernel over tiles of a matrix, written for cutile-rs |
@@ -71,6 +76,8 @@
 | Generation and the command | `crates/kapel-infer/src/`, `crates/kapel-cli/src/` |
 | Batches and the engine of many requests | `crates/kapel-infer/src/{engine,batch}.rs`, `crates/kapel-infer/tests/engine.rs` |
 | Constraints | `crates/kapel-infer/src/constraint.rs` |
+| Speculative decoding | `crates/kapel-infer/src/{speculative,multi_token}.rs`, `crates/kapel-infer/tests/speculative.rs`, `crates/kapel-cli/examples/speculative.rs` |
+| MiMo's multi-token layer, its reference | `crates/kapel-models/src/model.rs` (`multi_token`), `tools/parity/multi_token_reference.py` |
 | The server | `crates/kapel-serve/src/{lib,api,server,worker,metrics,log}.rs`, `crates/kapel-serve/tests/server.rs` |
 | Load on a server, OpenAI's client | `crates/kapel-serve/examples/load.rs`, `tools/serve/openai_client.py` |
 | Container image | `Dockerfile`, `.dockerignore` |

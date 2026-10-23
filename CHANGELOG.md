@@ -151,6 +151,24 @@ changelog says how.
   fewer (`record_step` takes its rows and pages; padding rows write lines of
   their own); `Recorded`, what `record_step` did, the step computed even when
   the backend fails to record it. `Config::max_positions`.
+- `kapel-infer`: speculative decoding, `Pipeline::speculate` and `Draft`: a
+  smaller model of the same tokenizer, prompt lookup (the tokens that followed
+  the last ones where they last appeared), or the model's multi-token prediction
+  layer proposes; the exact rule of speculative sampling checks the proposals in
+  one pass of the model (checked by a chi-square test), so greedy answers do not
+  change and sampled ones keep their distribution. `SpeculationStats`. Qwen3 8B
+  with Qwen3 0.6B proposing: 1.72 times faster on an RTX 3090, the same answers.
+- `kapel-models`: MiMo (`model_type` `mimo`), Qwen 2 with a multi-token
+  prediction layer, and `Model::multi_token`, the layer as vLLM runs it (1.53
+  times faster for MiMo-7B-RL, 76 % of its proposals accepted).
+  `Model::extend_last`, `Model::extend_hidden`, `Model::into_fused` (stacks the
+  projections of a model without holding two copies of its weights);
+  `Config::multi_token_layers`.
+- `kapel-cli`: `kapel run --draft MODEL`, `--prompt-lookup`, `--multi-token` and
+  `--speculate K`; the example `speculative`, decoding alone against each
+  proposer.
+- `tools/parity/multi_token_reference.py`: a small MiMo and the outputs of its
+  multi-token layer.
 - `kapel-tokenizers`: `Tokenizer::token_bytes`, the bytes of a token in the
   middle of a text, and `Tokenizer::is_special`.
 - `kapel-cuda`: `Cuda::memory`, the free and total memory of the device.
@@ -173,6 +191,10 @@ changelog says how.
   from safe code).
 - `kapel-cpu`: sums and means are blocked and pairwise (16M elements: 64 ms to
   0.8 ms, and far more accurate); attention is also split over query blocks.
+- `kapel-cuda`: paged attention cuts the positions into chunks sized by the
+  sequences and heads of a pass, no longer by its queries: the positions of one
+  sequence give the same bits computed together (the proposals of speculative
+  decoding) as one at a time.
 - `kapel-cuda`: decoding Llama 3.2 3B in `bf16` on an RTX 3090 went from 16 to 105
   tokens per second, and 64 sequences together reach 3330 tokens per second (90% of
   vLLM); a prompt of 4096 tokens takes 0.76 s.

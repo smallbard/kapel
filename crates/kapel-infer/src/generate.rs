@@ -63,7 +63,7 @@ fn prepare<B: Backend + Transfer>(
         model = model.cast(backend, dtype)?;
     }
     if options.fuse {
-        model = model.fused(backend)?;
+        model = model.into_fused(backend)?;
     }
     Ok(model)
 }

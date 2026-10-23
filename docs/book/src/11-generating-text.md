@@ -78,13 +78,48 @@ llguidance works on the bytes of the tokens, kept in a tree. A `Grammars` is mad
 
 A constraint that does not compile is refused when the request is made (`Pipeline::check_constraint` checks one). A parser that fails during an answer, out of its limits say, ends that request only, with `Finish::Error`; the others go on. Constrained requests choose on the host, since the mask is computed there.
 
-## 11.5 Text that is never taken back
+## 11.5 Speculative decoding
+
+A pass of decoding reads every weight for one token, and costs about as much for a few: the device waits for memory. `Pipeline::speculate(prompt, request, draft)` (`crates/kapel-infer/src/speculative.rs`) lets a cheap proposer guess the next tokens, and checks them all in one pass of the model, as training does, where each position predicts the next. It gives the same items as `generate`, and `stats()` counts the passes, the tokens proposed and those accepted.
+
+Three proposers, the variants of `Draft`:
+
+- `Draft::Model { pipeline, tokens }`: a smaller model of the same tokenizer (checked token by token, through `token_bytes`), on the same backend, proposing `tokens` tokens one at a time with its own cache. Its single-token steps go through recorded passes, so each costs one launch.
+- `Draft::Ngram { tokens, longest, shortest }`: prompt lookup, no second model. `lookup` finds the latest earlier place where the last `n` tokens of the sequence appeared, `n` from `longest` down to `shortest`, and proposes what followed. It guesses well when the answer copies its prompt (code edits, summaries, quotes), little on open questions.
+- `Draft::MultiToken`: the model's own multi-token prediction layer, for MiMo (`crates/kapel-infer/src/multi_token.rs`). At position `i`, the layer reads the model's final hidden state there (before the final norm) and token `i + 1`, and predicts token `i + 2` (`Model::multi_token`, chapter 10). Each pass gives the hidden states of the positions it read; after the check, the layer reads those now final and proposes one token for the next pass.
+
+**The rule.** Keeping the guesses the model would have drawn would be another draw. To keep the model's distribution exactly (Leviathan, Kalman and Matias, 2023; Chen et al., 2023), `verify` accepts each proposal `x`, drawn from the proposer's distribution `q`, with probability `min(1, p(x)/q(x))`, `p` being the model's. At the first refusal it draws from `max(0, p − q)`, renormalized, and stops; when every proposal is accepted, the pass gives one token more, drawn from `p` at the last position. For this, the sampler is split into `distribution` (penalties, temperature and filters, as section 11.4) and `draw`. A distribution is a `Choice`: `Token(t)` when certain (greedy, or a proposal without probabilities, such as a prompt lookup's) or `Probabilities`. A certain choice needs no draw: in greedy decoding, the rule keeps the proposals as long as they are the model's choice, then gives the model's choice. Greedy answers are thus the same as without a proposer, and sampled ones follow the same distribution, though not the same draws for a given seed.
+
+**A round.** The proposer gives up to `k` proposals, fewer near `max_tokens`. The model reads, in one pass, the tokens it has not seen (the last token, or the prompt at first) and the proposals, with `Model::extend_last`, which gives the logits of the last `k + 1` positions only. In greedy decoding, the choices are made on the device by `ArgMax`, one number per position coming back; otherwise the rows are read and each position's distribution computed with the proposals before it. After the check, the model's cache and the proposer's are cut back to the accepted tokens (`Cache::truncate`); the token drawn by the check is in no cache yet, and starts the next round. The finishing rules of `generate` apply token by token, and end the round early.
+
+For the greedy answers to be the same bits, the positions of one sequence must give the same logits computed together as one at a time. The products do (each row is computed alone), and paged attention cuts the positions into chunks sized by the sequences and heads of a pass, not by its queries (chapter 7); `proposals_checked_together_give_the_logits_of_steps` in `crates/kapel-cuda/tests/recorded.rs` checks it bit for bit.
+
+**Tests.** `verify` is checked by a chi-square test: over 200,000 checks of two positions of five tokens, where the model's second distribution depends on the first token, the pairs produced follow the model's distribution and not the proposer's, for a proposer that draws and one that proposes fixed tokens. `crates/kapel-infer/tests/speculative.rs` checks that greedy speculation gives the greedy tokens of SmolLM2-135M saved from `transformers`, with three proposers: the model quantized to int4 (sometimes wrong), the model itself (always right), and prompt lookup; and that the multi-token layer of the small MiMo of `data/parity/mimo` proposes without changing the tokens.
+
+**Measures.** The example `speculative` of `kapel-cli` answers six chat questions, 256 greedy tokens each, alone and with each proposer, and checks the answers are the same. On an RTX 3090 in bf16:
+
+| Model | Proposer | Tokens/s | Speed-up | Same answers | Accepted | Tokens per pass |
+| --- | --- | --- | --- | --- | --- | --- |
+| Qwen3 8B | alone | 49.9 | — | — | — | 1 |
+| Qwen3 8B | Qwen3 0.6B, k = 3 | 85.2 | 1.71× | 6/6 | 53 % | 2.56 |
+| Qwen3 8B | Qwen3 0.6B, k = 4 | 85.6 | 1.72× | 6/6 | 47 % | 2.84 |
+| Qwen3 8B | Qwen3 0.6B, k = 6 | 80.2 | 1.61× | 6/6 | 36 % | 3.13 |
+| Qwen3 8B | Qwen3 0.6B, k = 8 | 72.6 | 1.46× | 6/6 | 29 % | 3.28 |
+| Qwen3 8B | prompt lookup, k = 4 | 53.4 | 1.07× | 6/6 | 17 % | 1.10 |
+| MiMo-7B-RL | alone | 54.7 | — | — | — | 1 |
+| MiMo-7B-RL | its multi-token layer | 83.8 | 1.53× | 6/6 | 76 % | 1.75 |
+
+Beyond four proposals, the proposer's passes cost more than the extra tokens accepted bring.
+
+**Limits.** A request held to a constraint is refused (the parser would have to be taken back with the refused proposals). Speculation runs one sequence at a time: the engine and the server do not use it.
+
+## 11.6 Text that is never taken back
 
 A token does not always map to finished text. A character may be split over two tokens, and the start of a stop sequence may appear before it is complete. A `Piece` therefore carries a token and the text it makes *final*: the concatenation of all pieces' texts is the answer, and no later token changes what was already given out.
 
 Spaces and multi-byte characters depend on their neighbours, so the text of the tokens is not the sum of their texts. The text stream decodes the last few tokens twice, as Hugging Face's `DecodeStream` does: the tokens from `prefix` to `read`, and the same with the new ones. What the second adds to the first is new text, after the text of the tokens before `read`, already final. When the new text ends with a whole character, the window moves: `prefix` to `read`, `read` to the end. The cost of a token thus stays the same however long the answer, and the text is the whole sequence's, decoded at once: the test `streamed_text_is_the_whole_text` checks it for every tokenizer of `data/parity`. Of that text, the stream gives out only the new suffix. It holds back a trailing U+FFFD, the mark of an unfinished character, and the longest ending that could be the start of a stop sequence. When a stop sequence appears, possibly straddling text already held back, the answer is cut just before it.
 
-## 11.6 The kapel command
+## 11.7 The kapel command
 
 `kapel serve`, the server, is the subject of chapter 12; this section is about `kapel run`.
 
@@ -105,7 +140,9 @@ cargo run --release -p kapel-cli -- run Qwen/Qwen3-0.6B --prompt "Why is the sky
 | `--max-tokens N`, `--stop TEXT` | limits of each answer |
 | `--greedy`, `--temperature`, `--top-k`, `--top-p`, `--min-p`, `--repetition-penalty`, `--seed` | override the model's sampling settings |
 | `--revision REV` | a branch, tag or commit of a Hub repository |
-| `--stats` | prompt and generation speeds on standard error |
+| `--stats` | prompt and generation speeds on standard error, and the proposals accepted |
+| `--draft MODEL`, `--prompt-lookup`, `--multi-token` | speculative decoding (section 11.5): a smaller model of the same tokenizer proposes, or the tokens of the conversation, or the model's multi-token layer; one of them |
+| `--speculate K` | the proposals per pass (default 4) |
 
 The example `generation_parity` compares Kapel's greedy generations with those of `transformers` and, at the first difference, reports the gap between the two candidates' logits: a gap near zero is a tie that rounding decides, not a bug.
 

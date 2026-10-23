@@ -251,3 +251,58 @@ fn logits_match_transformers_and_survive_a_save() {
     }
     eprintln!("checked: {checked:?}");
 }
+
+/// MiMo's multi-token prediction layer, position by position after a cache of
+/// its own, against the layer run as vLLM runs it
+/// (`tools/parity/multi_token_reference.py`): at position `i`, the model's
+/// hidden state and token `i + 1` give the logits of token `i + 2`.
+#[test]
+fn the_multi_token_layer_predicts_as_the_reference() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/parity/mimo");
+    let Ok(reference) = SafeTensors::open(dir.join("reference.safetensors")) else {
+        assert!(
+            std::env::var_os("KAPEL_REQUIRE_PARITY").is_none_or(|v| v != "1"),
+            "data/parity/mimo is missing, and KAPEL_REQUIRE_PARITY=1"
+        );
+        eprintln!("skipped: data/parity/mimo missing (see tools/parity/README.md)");
+        return;
+    };
+    let cpu = kapel_cpu::Cpu::new();
+    let model = Model::load(&Checkpoint::open(&dir).unwrap()).unwrap();
+    assert_eq!(model.config().multi_token_layers, 1);
+    for (fused, model) in [(false, &model), (true, &model.fused(&cpu).unwrap())] {
+        for (i, ids) in texts(&reference).into_iter().enumerate() {
+            let want = reference
+                .tensor(&format!("mtp_logits_{i}"))
+                .unwrap()
+                .to_vec::<f32>()
+                .unwrap();
+            let vocab = want.len() / (ids.len() - 1);
+            let mut cache = Cache::new();
+            let (_, hidden) = model.extend_hidden(&cpu, &ids, &mut cache, 1).unwrap();
+            let mut layer = Cache::new();
+            let (mut worst, mut scale) = (0.0f64, 0.0f64);
+            for p in 0..ids.len() - 1 {
+                let got = model
+                    .multi_token(
+                        &cpu,
+                        &mut layer,
+                        &hidden.narrow(0, p, 1).unwrap(),
+                        &ids[p + 1..p + 2],
+                    )
+                    .unwrap()
+                    .to_vec::<f32>()
+                    .unwrap();
+                for (a, b) in got.iter().zip(&want[p * vocab..(p + 1) * vocab]) {
+                    worst = worst.max(f64::from((a - b).abs()));
+                    scale = scale.max(f64::from(b.abs()));
+                }
+            }
+            let relative = worst / scale;
+            assert!(
+                relative < 1e-4,
+                "text {i} (fused: {fused}): relative difference {relative:e}"
+            );
+        }
+    }
+}

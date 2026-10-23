@@ -1,5 +1,5 @@
 //! Model architectures described by configuration: Llama, Mistral, Qwen 2 and 3,
-//! Gemma 2, Phi, GPT-2.
+//! MiMo, Gemma 2, Phi, GPT-2.
 //!
 //! A [`Model`] reads `config.json` into a [`Config`] and maps the weights of a
 //! model directory; [`Model::forward`] computes logits on any backend of the
@@ -30,6 +30,11 @@
 //! as many sequences or fewer, the rest padding.
 //! [`Model::fused`] stacks the projections that read the same input into one
 //! product. [`Cache`] is the cache of a single sequence.
+//!
+//! For speculative decoding, [`Model::extend_last`] gives the logits of the
+//! last positions of a pass only (the proposals to check), and
+//! [`Model::extend_hidden`] the final hidden states of every position too,
+//! which MiMo's multi-token prediction layer reads ([`Model::multi_token`]).
 //!
 //! The parity tool (`tools/parity`) checks the logits against `transformers`.
 

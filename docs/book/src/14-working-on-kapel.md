@@ -43,7 +43,7 @@ The rule "every optimization comes with a measurement" is applied with example p
 | `kapel-cpu` | `gemm`, `gemm_few_rows`, `gemm_bf16`, `attention`, `reduce`, `softmax` |
 | `kapel-cuda` | `gemm`, `attention`, `reductions`, `prefill`, `decode`, `quantized` |
 | `kapel-tokenizers` | `encode` |
-| `kapel-cli` | `throughput`, `perplexity`, `profile` |
+| `kapel-cli` | `throughput`, `perplexity`, `profile`, `speculative` (decoding alone against each proposer) |
 | `kapel-serve` | `load`: a Poisson load on a server, the latencies of the first token and between tokens |
 
 Run them with `cargo run --release -p <crate> --example <name>`, on an idle machine. They report the best of several runs after a warm-up, in Gop/s, GB/s or tokens per second. The CUDA examples count operations conventionally, for instance two operations per multiply-add, and only the visible half of causal attention scores.
@@ -74,14 +74,14 @@ The rules of chapter 1 are also the review checklist:
 
 ## 14.6 The road ahead
 
-The foundation plan is complete. The first inference step, correct generation, landed on 21 October 2026; the second, the CPU, on 22 October, but for its ARM kernels and a cache of keys and values in int8; and the third, the card, the same day. Its targets were 70 % of vLLM's throughput for batches, met at 90 %, and 90 % of the card's bandwidth for one sequence, missed at 81 %: the products alone reach 92 %, and the rest of a token goes to the small kernels between them. The fourth, the server, landed on 23 October 2026. Its targets were a first token within 500 ms for 99 % of the requests up to 80 % of the maximal throughput, met up to 90 % (83 ms there, 63 ms at 80 %), and OpenAI's official clients working unchanged, met. The validation needs no other server: the load is drawn as Smallem's simulator drew it, and the maximal throughput is the server's own. The rest of the inference plan and the whole training plan are ahead:
+The foundation plan is complete. The first inference step, correct generation, landed on 21 October 2026; the second, the CPU, on 22 October, but for its ARM kernels and a cache of keys and values in int8; and the third, the card, the same day. Its targets were 70 % of vLLM's throughput for batches, met at 90 %, and 90 % of the card's bandwidth for one sequence, missed at 81 %: the products alone reach 92 %, and the rest of a token goes to the small kernels between them. The fourth, the server, landed on 23 October 2026. Its targets were a first token within 500 ms for 99 % of the requests up to 80 % of the maximal throughput, met up to 90 % (83 ms there, 63 ms at 80 %), and OpenAI's official clients working unchanged, met. The validation needs no other server: the load is drawn as Smallem's simulator drew it, and the maximal throughput is the server's own. The fifth, speculative decoding, landed the same day, without its two other parts: tensor parallelism over several GPUs was left out, and the tables kept off the card waits for a model with a memory of n-grams that Kapel can read (the published ones are a mixture of experts far too large for one card, or architectures of their own). Its target, greedy Qwen3 8B 1.5 times faster with Qwen3 0.6B proposing and the same answers, was met at 1.72 times. The rest of the inference plan and the whole training plan are ahead:
 
 | Step | Goal | Main pieces |
 | --- | --- | --- |
 | I1 | The best single-sequence generation on CPU, x86 and ARM | done on x86 (chapter 6); left: NEON kernels and `sdot`, a cache of keys and values in int8 |
 | I2 | Batched generation on a GPU | done (chapters 7, 10 and 11): a cache by pages of 16 positions, paged attention, CUDA graphs, products by quantized weights on the card, batches |
 | I3 | A production server | done (chapters 10, 11 and 12): continuous batching, shared prefixes, an OpenAI-compatible API with streaming and cancellation, constrained output, metrics, logs, a container image |
-| I4 | Faster without changing the distribution | speculative decoding, tensor parallelism over two to four GPUs |
+| I4 | Faster without changing the distribution | done (chapters 7, 10 and 11): speculative decoding with a smaller model, prompt lookup or a multi-token layer (MiMo); left: tensor parallelism over two to four GPUs, tables kept off the card |
 | I5 | Quantizing one's own models | GPTQ and AWQ, quantized writing, perplexity and task evaluation |
 | I6 | Being used | a C API, a Python module, guides, published benchmarks |
 | T0–T6 | Bit-reproducible training | a gradient tape, a single-GPU loop with AdamW and Muon, data pipelines, multi-GPU and multi-node, SFT, LoRA, DPO and GRPO, experiment tools for scaling laws |

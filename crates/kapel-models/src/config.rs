@@ -95,6 +95,8 @@ pub struct Config {
     /// The positions the model was trained for (`max_position_embeddings`),
     /// if the configuration says.
     pub max_positions: Option<usize>,
+    /// The multi-token prediction layers (`num_nextn_predict_layers`: MiMo).
+    pub multi_token_layers: usize,
 }
 
 // Bounds far above any model, so that a hostile file cannot make Kapel allocate
@@ -198,7 +200,8 @@ impl Config {
             .ok_or_else(|| ModelError::Config("no model_type".into()))?
             .to_string();
         let (block, norm) = match model_type.as_str() {
-            "llama" | "mistral" | "qwen2" | "qwen3" => {
+            // MiMo is Qwen 2 with a multi-token prediction layer.
+            "llama" | "mistral" | "qwen2" | "qwen3" | "mimo" => {
                 (Block::Sequential, Norm::Rms { offset: 0.0 })
             }
             "gemma2" => (Block::Sandwich, Norm::Rms { offset: 1.0 }),
@@ -321,7 +324,7 @@ impl Config {
             intermediate,
             activation: activation(act_name)?,
             qkv_bias: match model_type.as_str() {
-                "qwen2" | "phi" | "gpt2" => true,
+                "qwen2" | "mimo" | "phi" | "gpt2" => true,
                 _ => is("attention_bias").unwrap_or(false),
             },
             out_bias: matches!(model_type.as_str(), "phi" | "gpt2"),
@@ -336,6 +339,7 @@ impl Config {
             tie_embeddings: is("tie_word_embeddings").unwrap_or(model_type == "gpt2"),
             lm_head_bias: model_type == "phi",
             max_positions: usize_field(json, &["max_position_embeddings", "n_positions"]).ok(),
+            multi_token_layers: usize_field(json, &["num_nextn_predict_layers"]).unwrap_or(0),
             model_type,
         })
     }

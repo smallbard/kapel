@@ -67,6 +67,12 @@ cargo run --release -p kapel-cli --features cuda --example throughput -- \
 Sur une RTX 3090, Llama 3.2 3B en bf16 génère 105 tokens/s pour une seule séquence,
 et 3330 tokens/s pour 64 séquences ensemble, 90 % du débit de vLLM.
 
+`kapel run --draft PETIT_MODÈLE` décode de façon spéculative : le petit modèle
+propose quelques tokens, le grand les vérifie d'une seule passe, et la réponse ne
+change pas. Sur une RTX 3090, Qwen3 8B génère 1,7 fois plus vite avec Qwen3 0.6B
+comme proposeur ; `--multi-token` se sert de la couche de prédiction multi-token de
+MiMo, `--prompt-lookup` des tokens déjà écrits.
+
 `kapel serve` sert un modèle derrière une API compatible avec celle d'OpenAI
 (`/v1/chat/completions`, `/v1/completions`, `/v1/models`, en flux ou non, avec les
 sorties contraintes : schéma JSON, expression régulière, grammaire, choix), les

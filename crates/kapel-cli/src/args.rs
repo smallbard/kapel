@@ -88,6 +88,14 @@ pub(crate) struct Run {
     pub(crate) sampling: SamplingOptions,
     pub(crate) stop: Vec<String>,
     pub(crate) stats: bool,
+    /// Speculative decoding: a smaller model proposes.
+    pub(crate) draft: Option<String>,
+    /// Or the tokens of the sequence (prompt lookup).
+    pub(crate) prompt_lookup: bool,
+    /// Or the model's multi-token layer.
+    pub(crate) multi_token: bool,
+    /// The proposals per pass.
+    pub(crate) speculate: usize,
 }
 
 /// `kapel serve`.
@@ -229,6 +237,10 @@ pub(crate) fn parse(args: &[String]) -> Result<Run, String> {
         sampling: SamplingOptions::default(),
         stop: Vec::new(),
         stats: false,
+        draft: None,
+        prompt_lookup: false,
+        multi_token: false,
+        speculate: 4,
     };
     let mut load = Load::default();
     walk("run", args, &mut load, |option, value| {
@@ -248,11 +260,22 @@ pub(crate) fn parse(args: &[String]) -> Result<Run, String> {
             "--seed" => run.sampling.seed = Some(number(option, &value()?)?),
             "--stop" => run.stop.push(value()?),
             "--stats" => run.stats = true,
+            "--draft" => run.draft = Some(value()?),
+            "--prompt-lookup" => run.prompt_lookup = true,
+            "--multi-token" => run.multi_token = true,
+            "--speculate" => run.speculate = number(option, &value()?)?,
             _ => return Ok(false),
         }
         Ok(true)
     })?;
     run.load = load;
+    if usize::from(run.draft.is_some())
+        + usize::from(run.prompt_lookup)
+        + usize::from(run.multi_token)
+        > 1
+    {
+        return Err("one of --draft, --prompt-lookup and --multi-token".into());
+    }
     Ok(run)
 }
 
@@ -351,6 +374,15 @@ mod tests {
                 .contains("needs a value")
         );
         assert!(parse_all("m n").unwrap_err().contains("unexpected"));
+    }
+
+    #[test]
+    fn speculation_is_read() {
+        let run = parse_all("m --draft small --speculate 6").unwrap();
+        assert_eq!(run.draft.as_deref(), Some("small"));
+        assert_eq!(run.speculate, 6);
+        assert!(parse_all("m --draft small --multi-token").is_err());
+        assert!(parse_all("m --prompt-lookup").unwrap().prompt_lookup);
     }
 
     #[test]

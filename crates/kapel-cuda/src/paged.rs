@@ -13,7 +13,7 @@ use kapel_ops::{
 use crate::device::{Args, Cuda, CudaStorage, float_code, small};
 
 /// Tile blocks wanted per 256 positions of a launch of `paged_attention`:
-/// two per multiprocessor of an RTX 3090. With fewer queries and heads than
+/// two per multiprocessor of an RTX 3090. With fewer sequences and heads than
 /// that, the positions are cut into shorter chunks, down to 32.
 const BLOCKS: usize = 164;
 
@@ -250,17 +250,20 @@ impl Run<PagedAttention> for Cuda {
             PAGED_HEADS as usize
         };
         let subs = group.div_ceil(heads_per_block);
-        // Chunks of a size set by the number of blocks without them, so that
-        // a few queries still spread over the device: the positions of a
-        // query fall into the same chunks whatever the width of the table of
-        // pages, and give the same bits. The chunks cover every position the
-        // table can hold: they depend on its shape, not on the counts, which a
-        // recorded pass (`kapel_ops::Record`) reads anew at each replay;
-        // chunks past a query's count compute nothing.
+        // Chunks of a size set by the sequences and the heads, so that a few
+        // queries still spread over the device. Not by the queries: the
+        // queries of one sequence give the same bits however many come in one
+        // pass (a token decoded alone, or with the proposals of speculative
+        // decoding to check). The positions of a query fall into the same
+        // chunks whatever the width of the table of pages. The chunks cover
+        // every position the table can hold: they depend on its shape, not on
+        // the counts, which a recorded pass (`kapel_ops::Record`) reads anew
+        // at each replay; chunks past a query's count compute nothing.
         let base = w * hkv * subs;
+        let spread = sequences * hkv * subs;
         let chunk = [256, 128, 64]
             .into_iter()
-            .find(|&c| base * (PAGED_CHUNK as usize / c) >= BLOCKS)
+            .find(|&c| spread * (PAGED_CHUNK as usize / c) >= BLOCKS)
             .unwrap_or(32);
         let longest = per_sequence * op.page;
         let chunks = longest.div_ceil(chunk).max(1);

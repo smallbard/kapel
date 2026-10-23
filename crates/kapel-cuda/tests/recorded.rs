@@ -323,3 +323,34 @@ fn a_recording_keeps_the_tables_it_reads() {
     }
     drop(junk);
 }
+
+/// The positions of one sequence give the same bits computed together (the
+/// proposals of speculative decoding, checked in one pass) as one at a time:
+/// greedy speculative decoding then gives the tokens of decoding alone.
+#[test]
+fn proposals_checked_together_give_the_logits_of_steps() {
+    let _alone = alone();
+    let cuda = Cuda::new(0).unwrap();
+    for name in ["smollm2", "llama", "qwen3"] {
+        let Some(model) = model(name, &cuda) else {
+            continue;
+        };
+        let prompt: Vec<u32> = (0..50).map(|i| 100 + 37 * i).collect();
+        // Enough of them for a pass sized by its rows to cut the positions
+        // otherwise.
+        let next: Vec<u32> = (0..16).map(|i| 300 + 11 * i).collect();
+        let mut one = Cache::new();
+        model.step(&cuda, &prompt, &mut one).unwrap();
+        let want: Vec<Vec<f64>> = next
+            .iter()
+            .map(|&t| values(&cuda, &model.step(&cuda, &[t], &mut one).unwrap()))
+            .collect();
+        let mut together = Cache::new();
+        model.step(&cuda, &prompt, &mut together).unwrap();
+        let got = values(&cuda, &model.extend(&cuda, &next, &mut together).unwrap());
+        let vocab = got.len() / next.len();
+        for (i, row) in got.chunks_exact(vocab).enumerate() {
+            assert_eq!(row, &want[i][..], "{name}: position {i}");
+        }
+    }
+}

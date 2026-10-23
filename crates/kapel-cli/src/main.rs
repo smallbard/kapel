@@ -8,7 +8,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use kapel_core::DType;
-use kapel_infer::{EngineOptions, Finish, LoadOptions, Pipeline, Request};
+use kapel_infer::{Draft, EngineOptions, Finish, LoadOptions, Piece, Pipeline, Request};
 use kapel_ops::{Backend, Transfer};
 use kapel_tokenizers::Message;
 
@@ -47,6 +47,12 @@ options:
   --byte-activations       on cpu, quantize the activations of the products by
                            quantized weights to bytes, as llama.cpp does: faster,
                            and the results change a little
+  --draft MODEL            speculative decoding: MODEL, smaller, of the same
+                           tokenizer, proposes tokens that MODEL checks several at
+                           a time; the answers do not change
+  --prompt-lookup          the same, the tokens of the conversation proposing
+  --multi-token            the same, the model's multi-token layer proposing (MiMo)
+  --speculate K            the proposals per pass (default 4)
 
 kapel serve serves MODEL behind an HTTP API compatible with OpenAI's
 (/v1/chat/completions, /v1/completions, /v1/models, /health, /metrics), the
@@ -128,22 +134,29 @@ fn load_options(load: &Load) -> LoadOptions {
 
 fn execute(run: &Run) -> Result<(), String> {
     let dir = directory(&run.load.model, &run.load.revision)?;
+    let draft = run
+        .draft
+        .as_ref()
+        .map(|d| directory(d, &run.load.revision))
+        .transpose()?;
     let options = load_options(&run.load);
     match run.load.device {
         Device::Cpu => {
-            let cpu = kapel_cpu::Cpu::new().with_byte_activations(run.load.byte_activations);
-            converse(
-                run,
-                Pipeline::load_with(&dir, cpu, &options).map_err(|e| e.to_string())?,
-            )
+            let cpu = || kapel_cpu::Cpu::new().with_byte_activations(run.load.byte_activations);
+            let load = |dir: &PathBuf| {
+                Pipeline::load_with(dir, cpu(), &options).map_err(|e| e.to_string())
+            };
+            let draft = draft.as_ref().map(load).transpose()?;
+            converse(run, load(&dir)?, draft.as_ref())
         }
         #[cfg(feature = "cuda")]
         Device::Cuda(ordinal) => {
             let cuda = kapel_cuda::Cuda::new(ordinal).map_err(|e| e.to_string())?;
-            converse(
-                run,
-                Pipeline::load_with(&dir, cuda, &options).map_err(|e| e.to_string())?,
-            )
+            let load = |dir: &PathBuf| {
+                Pipeline::load_with(dir, cuda.clone(), &options).map_err(|e| e.to_string())
+            };
+            let draft = draft.as_ref().map(load).transpose()?;
+            converse(run, load(&dir)?, draft.as_ref())
         }
         #[cfg(not(feature = "cuda"))]
         Device::Cuda(_) => Err("this kapel was built without the feature `cuda`".into()),
@@ -278,7 +291,11 @@ where
 }
 
 /// Answers the prompt, or holds the conversation.
-fn converse<B: Backend + Transfer>(run: &Run, pipeline: Pipeline<B>) -> Result<(), String> {
+fn converse<B: Backend + Transfer>(
+    run: &Run,
+    pipeline: Pipeline<B>,
+    draft: Option<&Pipeline<B>>,
+) -> Result<(), String> {
     let mut request = Request {
         sampling: pipeline.default_sampling().clone(),
         max_tokens: run.max_tokens,
@@ -292,7 +309,7 @@ fn converse<B: Backend + Transfer>(run: &Run, pipeline: Pipeline<B>) -> Result<(
         messages.push(Message::new("system", system.clone()));
     }
     if let Some(prompt) = &run.prompt {
-        answer(run, &pipeline, &request, chat, &mut messages, prompt)?;
+        answer(run, &pipeline, draft, &request, chat, &mut messages, prompt)?;
         return Ok(());
     }
     let stdin = std::io::stdin();
@@ -304,15 +321,36 @@ fn converse<B: Backend + Transfer>(run: &Run, pipeline: Pipeline<B>) -> Result<(
         if line.trim().is_empty() {
             break;
         }
-        answer(run, &pipeline, &request, chat, &mut messages, &line)?;
+        answer(run, &pipeline, draft, &request, chat, &mut messages, &line)?;
     }
     Ok(())
 }
 
+/// Prints the pieces as they come; the answer, and when its first token came.
+fn print_pieces(
+    pieces: &mut dyn Iterator<Item = kapel_infer::Result<Piece>>,
+) -> Result<(String, Option<Instant>), String> {
+    let mut first = None;
+    let mut reply = String::new();
+    let mut out = std::io::stdout().lock();
+    for piece in pieces {
+        let piece = piece.map_err(|e| e.to_string())?;
+        first.get_or_insert_with(Instant::now);
+        reply.push_str(&piece.text);
+        out.write_all(piece.text.as_bytes())
+            .map_err(|e| e.to_string())?;
+        out.flush().map_err(|e| e.to_string())?;
+    }
+    writeln!(out).map_err(|e| e.to_string())?;
+    Ok((reply, first))
+}
+
 /// Generates the answer to `text`, printing it as it comes.
+#[allow(clippy::too_many_arguments)]
 fn answer<B: Backend + Transfer>(
     run: &Run,
     pipeline: &Pipeline<B>,
+    draft: Option<&Pipeline<B>>,
     request: &Request,
     chat: bool,
     messages: &mut Vec<Message>,
@@ -326,34 +364,62 @@ fn answer<B: Backend + Transfer>(
         pipeline.prompt(text).map_err(error)?
     };
     let start = Instant::now();
-    let mut first = None;
-    let mut generation = pipeline.generate(&prompt, request).map_err(error)?;
-    let mut reply = String::new();
-    let mut out = std::io::stdout().lock();
-    for piece in generation.by_ref() {
-        let piece = piece.map_err(error)?;
-        first.get_or_insert_with(Instant::now);
-        reply.push_str(&piece.text);
-        out.write_all(piece.text.as_bytes())
-            .map_err(|e| e.to_string())?;
-        out.flush().map_err(|e| e.to_string())?;
-    }
-    writeln!(out).map_err(|e| e.to_string())?;
+    let proposer = match draft {
+        Some(pipeline) => Some(Draft::Model {
+            pipeline,
+            tokens: run.speculate,
+        }),
+        None if run.prompt_lookup => Some(Draft::Ngram {
+            tokens: run.speculate,
+            longest: 4,
+            shortest: 2,
+        }),
+        None if run.multi_token => Some(Draft::MultiToken),
+        None => None,
+    };
+    let (reply, first, n, finish, speculation) = match proposer {
+        Some(proposer) => {
+            let mut s = pipeline
+                .speculate(&prompt, request, proposer)
+                .map_err(error)?;
+            let (reply, first) = print_pieces(&mut s)?;
+            (
+                reply,
+                first,
+                s.tokens().len(),
+                s.finish().cloned(),
+                Some(s.stats()),
+            )
+        }
+        None => {
+            let mut g = pipeline.generate(&prompt, request).map_err(error)?;
+            let (reply, first) = print_pieces(&mut g)?;
+            (reply, first, g.tokens().len(), g.finish().cloned(), None)
+        }
+    };
     if chat {
         messages.push(Message::new("assistant", reply));
     }
     if run.stats {
-        let n = generation.tokens().len();
         let prefill = first.map_or(0.0, |f| (f - start).as_secs_f64());
         let decode = first.map_or(0.0, |f| f.elapsed().as_secs_f64());
-        let finish = match generation.finish() {
+        let finish = match finish {
             Some(Finish::Eos) => "end of sequence".to_string(),
             Some(Finish::Stop(s)) => format!("stop {s:?}"),
             Some(Finish::Length) | None => "length".to_string(),
             Some(Finish::Error(e)) => format!("error: {e}"),
         };
+        let speculation = speculation.map_or(String::new(), |s| {
+            format!(
+                "; {:.0} % of {} proposals accepted, {:.2} tokens per pass",
+                100.0 * s.acceptance(),
+                s.proposed,
+                n as f64 / s.passes.max(1) as f64
+            )
+        });
         eprintln!(
-            "[{} prompt tokens in {:.2} s ({:.0}/s); {n} tokens in {:.2} s ({:.1}/s); {finish}]",
+            "[{} prompt tokens in {:.2} s ({:.0}/s); {n} tokens in {:.2} s ({:.1}/s); \
+             {finish}{speculation}]",
             prompt.len(),
             prefill,
             prompt.len() as f64 / prefill.max(1e-9),

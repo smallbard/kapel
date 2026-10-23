@@ -50,6 +50,16 @@ check that each GGUF file gives the tokens, end tokens and chat prompts of its
 original tokenizer, and that the model read from it predicts the same tokens as the
 original (Q8_0 rounds the weights: 95 % of the predictions at least).
 
+## MiMo's multi-token layer
+
+`multi_token_reference.py` builds a small MiMo with random weights (Qwen 2 with a
+multi-token prediction layer, which `transformers` loads but does not run) and runs
+its layer as vLLM's `mimo_mtp.py` does: at position `i`, the model's hidden state
+before the final norm and the embedding of token `i + 1` (zero at position 0)
+predict token `i + 2`. It writes `data/parity/mimo`; the logits of the model are
+checked with the others, those of the layer by
+`the_multi_token_layer_predicts_as_the_reference` in `kapel-models/tests/parity.rs`.
+
 ## Perplexity
 
 The example `perplexity` of kapel-cli scores a text as llama.cpp's `llama-perplexity`
@@ -104,6 +114,7 @@ python -m venv .venv
 .venv/bin/python tools/parity/chat_reference.py        # chat templates
 .venv/bin/python tools/parity/gguf_reference.py        # GGUF quantization formats
 .venv/bin/python tools/parity/gguf_models_reference.py # GGUF models and their originals
+.venv/bin/python tools/parity/multi_token_reference.py # a small MiMo, its multi-token layer
 cargo test --release --workspace
 cargo run --release -p kapel-models --example parity   # a table of logit differences
 
