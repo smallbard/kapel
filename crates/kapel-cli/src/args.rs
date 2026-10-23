@@ -66,6 +66,7 @@ pub(crate) struct Run {
     pub(crate) byte_activations: bool,
     pub(crate) quantize: Option<DType>,
     pub(crate) quantize_output: bool,
+    pub(crate) kv_cache: Option<DType>,
 }
 
 /// A quantized format: `int8` and `int4` (groups of 128 and 64, or `/G`),
@@ -108,6 +109,7 @@ pub(crate) fn parse(args: &[String]) -> Result<Run, String> {
         byte_activations: false,
         quantize: None,
         quantize_output: false,
+        kv_cache: None,
     };
     let mut model = None;
     let mut i = 0;
@@ -159,6 +161,21 @@ pub(crate) fn parse(args: &[String]) -> Result<Run, String> {
             "--byte-activations" => run.byte_activations = true,
             "--quantize" => run.quantize = Some(format(&value()?)?),
             "--quantize-output" => run.quantize_output = true,
+            "--kv-cache" => {
+                let v = value()?;
+                run.kv_cache = Some(match v.as_str() {
+                    "f32" => DType::F32,
+                    "bf16" => DType::BF16,
+                    "f16" => DType::F16,
+                    "f8e4m3" => DType::F8E4M3,
+                    "f8e5m2" => DType::F8E5M2,
+                    _ => {
+                        return Err(format!(
+                            "--kv-cache: {v:?} is not f32, bf16, f16, f8e4m3 or f8e5m2"
+                        ));
+                    }
+                })
+            }
             other if other.starts_with("--") => return Err(format!("unknown option {other}")),
             other if model.is_none() => model = Some(other.to_string()),
             other => return Err(format!("unexpected argument {other:?}")),

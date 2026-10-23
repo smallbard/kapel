@@ -4,8 +4,8 @@ use std::path::Path;
 
 use kapel_core::{DType, Tensor};
 use kapel_hub::{Checkpoint, read_json};
-use kapel_models::{Cache, Model};
-use kapel_ops::{Backend, Transfer};
+use kapel_models::{Cache, Model, RecordedStep};
+use kapel_ops::{ArgMax, Backend, Transfer};
 use kapel_tokenizers::{ChatTemplate, Message, Tokenizer};
 use serde_json::Value;
 
@@ -22,6 +22,8 @@ pub struct Pipeline<B> {
     template: Option<ChatTemplate>,
     eos: Vec<u32>,
     sampling: Sampling,
+    /// The type of the caches of generation; `None` for the keys'.
+    cache_dtype: Option<DType>,
 }
 
 /// How [`Pipeline::load_with`] prepares the weights.
@@ -34,6 +36,12 @@ pub struct LoadOptions {
     pub quantize: Option<DType>,
     /// Whether the output table is quantized too.
     pub quantize_output: bool,
+    /// Whether the projections that read the same input are stacked into one
+    /// weight, last ([`Model::fused`]): what a card computes faster.
+    pub fuse: bool,
+    /// The type of the caches of keys and values (`f16`, or `f8e4m3` for half
+    /// the memory); `None` for that of the keys.
+    pub cache_dtype: Option<DType>,
 }
 
 /// `model` quantized, moved to `backend` and converted as `options` say.
@@ -50,6 +58,9 @@ fn prepare<B: Backend + Transfer>(
     if let Some(dtype) = options.dtype {
         model = model.cast(backend, dtype)?;
     }
+    if options.fuse {
+        model = model.fused(backend)?;
+    }
     Ok(model)
 }
 
@@ -63,6 +74,10 @@ pub struct Request {
     /// Texts that end the answer when they appear in it; the answer stops
     /// before them.
     pub stop: Vec<String>,
+    /// Whether the tokens that end an answer are taken as any other, so that
+    /// the answer goes on to `max_tokens`: answers of known lengths, to
+    /// measure speed.
+    pub ignore_eos: bool,
 }
 
 impl Default for Request {
@@ -72,6 +87,7 @@ impl Default for Request {
             sampling: Sampling::greedy(),
             max_tokens: 256,
             stop: Vec::new(),
+            ignore_eos: false,
         }
     }
 }
@@ -172,6 +188,7 @@ impl<B: Backend + Transfer> Pipeline<B> {
             template,
             eos,
             sampling: Sampling::from_generation_config(&generation),
+            cache_dtype: options.cache_dtype,
         })
     }
 
@@ -204,12 +221,26 @@ impl<B: Backend + Transfer> Pipeline<B> {
             template: vocabulary.template,
             eos: vocabulary.eos,
             sampling: Sampling::default(),
+            cache_dtype: options.cache_dtype,
         })
     }
 
     /// The model.
     pub fn model(&self) -> &Model {
         &self.model
+    }
+
+    /// The backend the model runs on.
+    pub fn backend(&self) -> &B {
+        &self.backend
+    }
+
+    /// An empty cache of generation of the type [`LoadOptions`] chose.
+    pub fn cache(&self) -> kapel_models::KvCache {
+        match self.cache_dtype {
+            Some(dtype) => kapel_models::KvCache::new().with_dtype(dtype),
+            None => kapel_models::KvCache::new(),
+        }
     }
 
     /// The tokenizer.
@@ -268,20 +299,31 @@ impl<B: Backend + Transfer> Pipeline<B> {
         }
         Ok(Generation {
             pipeline: self,
-            cache: Cache::new(),
+            cache: match self.cache_dtype {
+                Some(dtype) => Cache::with_dtype(dtype),
+                None => Cache::new(),
+            },
             sequence: prompt.to_vec(),
             prompt_len: prompt.len(),
             sampler: Sampler::new(request.sampling.clone()),
             text: TextStream::new(request.stop.clone()),
             max_tokens: request.max_tokens,
+            ignore_eos: request.ignore_eos,
             finish: None,
+            recorded: None,
         })
     }
 
-    /// The logits of the last of `ids`, after `cache`, in host memory.
-    fn logits(&self, ids: &[u32], cache: &mut Cache) -> Result<Vec<f64>> {
-        let logits: Tensor = self.model.step(&self.backend, ids, cache)?;
-        Ok(self.backend.download(&logits)?.to_f64_vec()?)
+    /// The most likely token of `logits` `[1, vocab]`, found on the backend.
+    fn most_likely(&self, logits: &Tensor) -> Result<u32> {
+        let best = self.backend.forward(
+            &ArgMax {
+                dim: 1,
+                keepdim: false,
+            },
+            &[logits],
+        )?;
+        Ok(self.backend.download(&best)?.to_vec::<u32>()?[0])
     }
 }
 
@@ -300,7 +342,10 @@ pub struct Generation<'p, B> {
     sampler: Sampler,
     text: TextStream,
     max_tokens: usize,
+    ignore_eos: bool,
     finish: Option<Finish>,
+    /// The pass of the next tokens, recorded once.
+    recorded: Option<RecordedStep>,
 }
 
 impl<B: Backend + Transfer> Generation<'_, B> {
@@ -321,10 +366,27 @@ impl<B: Backend + Transfer> Generation<'_, B> {
         } else {
             &self.sequence[self.sequence.len() - 1..]
         };
-        let mut logits = p.logits(fresh, &mut self.cache)?;
-        let token = self.sampler.choose(&mut logits, &self.sequence);
+        // A generated token goes through a recorded pass when the backend
+        // records them (a CUDA graph on a card); the prompt as it comes.
+        let recorded = match fresh {
+            [token] if !self.cache.is_empty() => {
+                self.cache
+                    .recorded_step(&p.model, &p.backend, &mut self.recorded, *token)?
+            }
+            _ => None,
+        };
+        let logits = match recorded {
+            Some(logits) => logits,
+            None => p.model.step(&p.backend, fresh, &mut self.cache)?,
+        };
+        let token = if self.sampler.is_argmax() {
+            p.most_likely(&logits)?
+        } else {
+            let mut logits = p.backend.download(&logits)?.to_f64_vec()?;
+            self.sampler.choose(&mut logits, &self.sequence)
+        };
         self.sequence.push(token);
-        if p.eos.contains(&token) {
+        if !self.ignore_eos && p.eos.contains(&token) {
             self.finish = Some(Finish::Eos);
             let text = self.text.finish(&p.tokenizer);
             return Ok(Piece { token, text });

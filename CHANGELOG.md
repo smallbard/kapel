@@ -87,6 +87,37 @@ changelog says how.
   of a token goes) and `perplexity` (as `llama-perplexity`).
 - `tools/parity/gguf_models_reference.py` and `kapel-infer/tests/gguf.rs`: models read
   from GGUF against the models they come from.
+- `kapel-ops`: `PagedAttention`, attention of new rows over a cache of keys and values
+  kept by pages, with a page table per sequence, sliding windows and capped scores;
+  the traits `Write` (zeros, rows written in place, copies from the host) and `Record`
+  (a pass recorded once and replayed), both in `Backend`; `Glu`, a gated activation
+  of the two halves of its input; `ArgMax`, the index of the largest value, NaN
+  ignored. On every backend, in the conformity suite.
+- `kapel-cuda`: CUDA graphs. A pass is captured once, its buffers kept with the graph,
+  and replayed (`Record`); its rotary angles and small index tensors are kept too.
+- `kapel-cuda`: paged attention in `f32`, `bf16`, `f16` and `f8` caches, split by
+  chunks of keys and combined; long prompts go through the tiled attention.
+- `kapel-cuda`: products by quantized weights on the card: one warp per weight row,
+  reading the codes in place, with kernels of their own for int8, int4, Q8_0, Q4_K and
+  Q6_K; with many rows, pieces dequantized and multiplied by tiles. Quantized
+  embedding tables give their rows on the card.
+- `kapel-cuda`: element-wise operations, normalizations, RoPE, `Glu` and row writes in
+  `bf16` and `f16` without a pass through `f32`; conversions to and from `f8`; product
+  tiles chosen by the number of rows, and a kernel that reads the weights `[N, K]`
+  as they are stored.
+- `kapel-models`: `KvCache`, the cache by pages of 16 positions shared by sequences
+  (`add_sequence`, `remove_sequence`, `truncate`), in any float type including `f8`;
+  `Model::step_batch` and `extend_batch`, a step of many sequences at once;
+  `record_step` and `replay_step`; `Model::fused`, the projections of keys, queries
+  and values, and of the gated MLP, stacked into one product.
+- `kapel-infer`: `Batch` (`Pipeline::batch`), generation of many requests together, a
+  step for all at each pass, with recorded passes and greedy choice on the device;
+  `Request::ignore_eos`; `LoadOptions::fuse` and `cache_dtype`.
+- `kapel-cli`: `kapel run --kv-cache`; the examples `throughput` (as
+  `vllm bench throughput`), and `--kv-cache` for `perplexity`. `kapel-cuda`: the
+  examples `decode` and `quantized`.
+- `kapel-core`: `Tensor::storage_mut` and `Storage::as_any_mut`; `Layout::reshape`
+  reshapes strided views when their strides allow it.
 
 ### Changed
 
@@ -104,6 +135,11 @@ changelog says how.
   from safe code).
 - `kapel-cpu`: sums and means are blocked and pairwise (16M elements: 64 ms to
   0.8 ms, and far more accurate); attention is also split over query blocks.
+- `kapel-cuda`: decoding Llama 3.2 3B in `bf16` on an RTX 3090 went from 16 to 105
+  tokens per second, and 64 sequences together reach 3330 tokens per second (90% of
+  vLLM); a prompt of 4096 tokens takes 0.76 s.
+- `kapel-cuda`: small uploads keep a copy on the host, read for their indices; the
+  tests fill new buffers with NaN (`Cuda::poison_buffers`).
 - `kapel-cuda`: one backend per device, shared process-wide; shape tables are
   cached on the device; a failed allocation empties the pool and retries.
 - `kapel-hub`: the download cache is keyed by commit; only top-level files are

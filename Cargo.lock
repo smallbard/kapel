@@ -756,6 +756,7 @@ dependencies = [
 name = "kapel-cuda"
 version = "0.1.0"
 dependencies = [
+ "cuda-bindings",
  "cuda-core",
  "cutile",
  "kapel-core",
@@ -765,6 +766,7 @@ dependencies = [
  "kapel-models",
  "kapel-ops",
  "kapel-ref",
+ "serde_json",
 ]
 
 [[package]]

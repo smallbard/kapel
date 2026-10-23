@@ -155,6 +155,13 @@ impl Tensor {
         &self.storage
     }
 
+    /// The storage, to write into in place, if this tensor is its only
+    /// handle: no clone nor view of it is alive, so that nothing else sees
+    /// the change. `None` otherwise.
+    pub fn storage_mut(&mut self) -> Option<&mut dyn Storage> {
+        Arc::get_mut(&mut self.storage)
+    }
+
     fn view(&self, op: &'static str, layout: Result<Layout>) -> Result<Self> {
         if self.dtype.is_quantized() {
             return Err(Error::UnsupportedDType {

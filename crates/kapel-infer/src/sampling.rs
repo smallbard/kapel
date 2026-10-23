@@ -124,6 +124,13 @@ impl Sampler {
         Self { settings, rng }
     }
 
+    /// Whether the choice is the most likely token, whatever the sequence:
+    /// greedy, without a repetition penalty. It can then be made where the
+    /// logits are (`kapel_ops::ArgMax`, the same rule as here).
+    pub(crate) fn is_argmax(&self) -> bool {
+        self.settings.is_greedy() && self.settings.repetition_penalty == 1.0
+    }
+
     /// The next token, from the logits of the last position and the tokens
     /// of the sequence so far.
     pub(crate) fn choose(&mut self, logits: &mut [f64], sequence: &[u32]) -> u32 {

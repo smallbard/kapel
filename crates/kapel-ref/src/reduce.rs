@@ -1,7 +1,7 @@
 //! Reductions.
 
 use kapel_core::{Result, Tensor};
-use kapel_ops::{Max, Mean, Operation, Run, Sum, shape};
+use kapel_ops::{ArgMax, Max, Mean, Operation, Run, Sum, shape};
 
 use crate::Reference;
 use crate::array::{Array, lines, strides};
@@ -94,6 +94,37 @@ fn argmax(x: &Array, dim: usize) -> Vec<usize> {
             })
         })
         .collect()
+}
+
+impl Run<ArgMax> for Reference {
+    fn forward(&self, op: &ArgMax, inputs: &[&Tensor]) -> Result<Tensor> {
+        let signature = op.infer(inputs)?;
+        let x = Array::of(inputs[0])?;
+        let len = x.shape[op.dim];
+        let positions: Vec<u32> = lines(&x.shape, op.dim)
+            .map(|(start, step)| {
+                let mut best: Option<usize> = None;
+                for i in 0..len {
+                    let v = x.data[start + i * step];
+                    if !v.is_nan() && best.is_none_or(|b| v > x.data[start + b * step]) {
+                        best = Some(i);
+                    }
+                }
+                best.unwrap_or(0) as u32
+            })
+            .collect();
+        Tensor::from_slice(&positions, &signature.shape)
+    }
+
+    fn backward(
+        &self,
+        op: &ArgMax,
+        inputs: &[&Tensor],
+        grad: &Tensor,
+    ) -> Result<Vec<Option<Tensor>>> {
+        op.infer_backward(inputs, grad)?;
+        Ok(vec![None])
+    }
 }
 
 impl Run<Max> for Reference {

@@ -70,12 +70,12 @@ The rules of chapter 1 are also the review checklist:
 
 ## 13.6 The road ahead
 
-The foundation plan is complete. The first inference step, correct generation, landed on 21 October 2026, and the second, the CPU, on 22 October, but for its ARM kernels and its key and value cache in f16 or int8. The rest of the inference plan and the whole training plan are ahead:
+The foundation plan is complete. The first inference step, correct generation, landed on 21 October 2026; the second, the CPU, on 22 October, but for its ARM kernels and a cache of keys and values in int8; and the third, the card, the same day. Its targets were 70 % of vLLM's throughput for batches, met at 90 %, and 90 % of the card's bandwidth for one sequence, missed at 81 %: the products alone reach 92 %, and the rest of a token goes to the small kernels between them. The rest of the inference plan and the whole training plan are ahead:
 
 | Step | Goal | Main pieces |
 | --- | --- | --- |
-| I1 | The best single-sequence generation on CPU, x86 and ARM | done on x86 (chapter 6); left: NEON kernels and `sdot`, a cache of keys and values in f16 or int8 |
-| I2 | Batched generation on a GPU | a paged cache of 16-position pages, Flash-Decoding, kernels for few and many rows |
+| I1 | The best single-sequence generation on CPU, x86 and ARM | done on x86 (chapter 6); left: NEON kernels and `sdot`, a cache of keys and values in int8 |
+| I2 | Batched generation on a GPU | done (chapters 7, 10 and 11): a cache by pages of 16 positions, paged attention, CUDA graphs, products by quantized weights on the card, batches |
 | I3 | A production server | continuous batching, shared prefixes, an OpenAI-compatible API, constrained output |
 | I4 | Faster without changing the distribution | speculative decoding, tensor parallelism over two to four GPUs |
 | I5 | Quantizing one's own models | GPTQ and AWQ, quantized writing, perplexity and task evaluation |

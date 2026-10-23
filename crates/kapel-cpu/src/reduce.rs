@@ -1,7 +1,7 @@
 //! Reductions.
 
 use kapel_core::{Result, Tensor};
-use kapel_ops::{Max, Mean, Operation, Run, Sum};
+use kapel_ops::{ArgMax, Max, Mean, Operation, Run, Sum};
 
 use crate::backend::{CHUNK, Cpu};
 use crate::lines::lines;
@@ -197,6 +197,45 @@ fn argmax(cpu: &Cpu, x: &[f32], shape: &[usize], dim: usize) -> Vec<usize> {
         }
     });
     out
+}
+
+impl Run<ArgMax> for Cpu {
+    /// One task per block of lines, as [`Max`].
+    fn forward(&self, op: &ArgMax, inputs: &[&Tensor]) -> Result<Tensor> {
+        let signature = op.infer(inputs)?;
+        let x = io::contiguous(ArgMax::NAME, inputs[0])?;
+        let shape = inputs[0].shape();
+        let len = shape[op.dim];
+        let (count, line) = lines(shape, op.dim);
+        let mut out = vec![0u32; count];
+        let shared = crate::pool::SharedMut::new(&mut out);
+        let chunk = (CHUNK / len.max(1)).max(1);
+        self.pool.run(count.div_ceil(chunk), |task| {
+            for l in task * chunk..((task + 1) * chunk).min(count) {
+                let (start, step) = line(l);
+                let mut best: Option<usize> = None;
+                for i in 0..len {
+                    let v = x[start + i * step];
+                    if !v.is_nan() && best.is_none_or(|b| v > x[start + b * step]) {
+                        best = Some(i);
+                    }
+                }
+                // SAFETY: one slot per line, one line per task.
+                unsafe { *shared.ptr(l) = best.unwrap_or(0) as u32 };
+            }
+        });
+        Tensor::from_slice(&out, &signature.shape)
+    }
+
+    fn backward(
+        &self,
+        op: &ArgMax,
+        inputs: &[&Tensor],
+        grad: &Tensor,
+    ) -> Result<Vec<Option<Tensor>>> {
+        op.infer_backward(inputs, grad)?;
+        Ok(vec![None])
+    }
 }
 
 impl Run<Max> for Cpu {

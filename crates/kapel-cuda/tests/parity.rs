@@ -110,3 +110,102 @@ fn models_on_the_card_match_transformers() {
         );
     }
 }
+
+/// The position of the largest of `row`.
+fn best(row: &[f32]) -> usize {
+    (0..row.len())
+        .max_by(|&i, &j| row[i].total_cmp(&row[j]))
+        .unwrap_or(0)
+}
+
+/// Quantized models on the card (the GGUF files of `data/parity/gguf-models`,
+/// and models of the Hub quantized to int8 and int4 at loading), against the
+/// same model on the processor in `f32`: a prompt at once (products of many
+/// rows, through dequantized pieces), then tokens one at a time (the products
+/// that read the codes in place). The card computes in `bf16`: the most
+/// likely tokens nearly always agree.
+#[test]
+fn quantized_models_on_the_card_predict_as_on_the_processor() {
+    use kapel_models::Cache;
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/parity/gguf-models");
+    let cuda = Cuda::new(0).expect("a CUDA device");
+    let cpu = kapel_cpu::Cpu::new();
+    let mut models = Vec::new();
+    for entry in std::fs::read_dir(&root).into_iter().flatten().flatten() {
+        let Ok(text) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let Ok(reference) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        let name = reference["name"].as_str().unwrap_or_default().to_string();
+        let gguf = PathBuf::from(reference["gguf"].as_str().unwrap_or_default());
+        if let Ok(file) = kapel_hub::Gguf::open(&gguf) {
+            models.push((format!("{name} q8_0"), Model::from_gguf(&file).unwrap()));
+        }
+        let q4 = gguf.with_file_name(
+            gguf.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .replace("Q8_0", "Q4_K_M"),
+        );
+        if let Ok(file) = kapel_hub::Gguf::open(&q4) {
+            models.push((format!("{name} q4_k_m"), Model::from_gguf(&file).unwrap()));
+        }
+        let dir = PathBuf::from(reference["directory"].as_str().unwrap_or_default());
+        if let Ok(checkpoint) = Checkpoint::open(&dir) {
+            let model = Model::load(&checkpoint).unwrap();
+            for dtype in [DType::int8(128).unwrap(), DType::int4(64).unwrap()] {
+                models.push((
+                    format!("{name} {dtype}"),
+                    model.quantize(dtype, false).unwrap(),
+                ));
+            }
+        }
+    }
+    if models.is_empty() {
+        assert!(
+            std::env::var_os("KAPEL_REQUIRE_PARITY").is_none_or(|v| v != "1"),
+            "no data/parity/gguf-models, and KAPEL_REQUIRE_PARITY=1"
+        );
+        eprintln!("skipped: data/parity/gguf-models missing (see tools/parity/README.md)");
+        return;
+    }
+    let prompt: Vec<u32> = (0..32).map(|i| 1000 + 97 * i).collect();
+    let next: Vec<u32> = (0..16).map(|i| 2000 + 31 * i).collect();
+    for (name, model) in models {
+        let host = model.cast(&cpu, DType::F32).unwrap();
+        let card = model
+            .upload(&cuda)
+            .unwrap()
+            .cast(&cuda, DType::BF16)
+            .unwrap();
+        let (mut on_cpu, mut on_card) = (Cache::new(), Cache::new());
+        let mut agree = 0;
+        let mut total = 0;
+        let mut compare = |a: Vec<f32>, b: Vec<f32>| {
+            total += 1;
+            agree += usize::from(best(&a) == best(&b));
+        };
+        compare(
+            logits(&host.step(&cpu, &prompt, &mut on_cpu).unwrap()),
+            logits(
+                &cuda
+                    .download(&card.step(&cuda, &prompt, &mut on_card).unwrap())
+                    .unwrap(),
+            ),
+        );
+        for &t in &next {
+            compare(
+                logits(&host.step(&cpu, &[t], &mut on_cpu).unwrap()),
+                logits(
+                    &cuda
+                        .download(&card.step(&cuda, &[t], &mut on_card).unwrap())
+                        .unwrap(),
+                ),
+            );
+        }
+        eprintln!("{name}: {agree} of {total} most likely tokens agree");
+        assert!(agree * 10 >= 8 * total, "{name}: {agree} of {total} agree");
+    }
+}

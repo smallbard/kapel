@@ -99,7 +99,7 @@ fn the_same_seed_samples_the_same_answer() {
             ..kapel_infer::Sampling::greedy()
         },
         max_tokens: 40,
-        stop: Vec::new(),
+        ..Request::default()
     };
     let tokens = || {
         let mut g = pipeline.generate(&prompt, &request).unwrap();
@@ -109,4 +109,36 @@ fn the_same_seed_samples_the_same_answer() {
     let first = tokens();
     assert_eq!(first.len(), 40);
     assert_eq!(tokens(), first);
+}
+
+/// The prompts of a batch, generated together, give the tokens of
+/// `transformers`, each as it does alone; one ends early, the others go on.
+#[test]
+fn a_batch_gives_the_greedy_tokens_of_each_prompt() {
+    let Some(reference) = reference() else { return };
+    let pipeline = pipeline(&reference);
+    let cases = reference["cases"].as_array().unwrap();
+    let requests: Vec<(Vec<u32>, Request)> = cases
+        .iter()
+        .enumerate()
+        .map(|(i, case)| {
+            let want = ids(&case["f32"]);
+            // The first answer is cut short, to end before the others.
+            let max_tokens = if i == 0 { want.len() / 2 } else { want.len() };
+            let request = Request {
+                max_tokens,
+                ..Request::default()
+            };
+            (ids(&case["ids"]), request)
+        })
+        .collect();
+    let mut batch = pipeline.batch(&requests).unwrap();
+    while !batch.is_finished() {
+        batch.step().unwrap();
+    }
+    for (i, (case, (_, request))) in cases.iter().zip(&requests).enumerate() {
+        let want = ids(&case["f32"]);
+        assert_eq!(batch.tokens(i), &want[..request.max_tokens], "prompt {i}");
+        assert_eq!(batch.finish(i), Some(&Finish::Length), "prompt {i}");
+    }
 }

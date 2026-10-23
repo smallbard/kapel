@@ -29,7 +29,7 @@ Two dependency choices are deliberate. `kapel-tokenizers` depends on no other Ka
 
 ## One trait, three backends
 
-The central idea is the split between *what* an operation computes and *how*. `kapel-ops` defines each operation as a small struct with a documented mathematical definition and an `infer` method that checks inputs and computes the output's shape and type. A backend implements `Run<Op>` for each operation: a `forward` and a `backward`. The trait `Backend` is simply the set of all nineteen `Run` implementations.
+The central idea is the split between *what* an operation computes and *how*. `kapel-ops` defines each operation as a small struct with a documented mathematical definition and an `infer` method that checks inputs and computes the output's shape and type. A backend implements `Run<Op>` for each operation: a `forward` and a `backward`. The trait `Backend` is simply the set of all twenty-two `Run` implementations, plus two traits for generation: `Write`, which writes rows into a cache in place, and `Record`, which records a pass once and replays it (a CUDA graph on the card).
 
 Because every backend calls the same `infer` first, every backend accepts and rejects the same calls with the same errors. Because the reference defines the numbers, the CPU and CUDA backends can be tested operation by operation against it, forward and backward, with tolerances that depend only on the data type.
 
@@ -41,8 +41,8 @@ Follow `kapel run Qwen/Qwen3-0.6B --prompt "Hello"` from the command line to the
 2. **Open the checkpoint.** `Checkpoint::open` maps the safetensors files into memory. No weight is copied yet: tensors point into the mapped file.
 3. **Build the model.** `Model::load` reads `config.json` into a `Config` and looks up each weight by name. `Model::upload` moves the weights to the backend's device, and `Model::cast` converts them, for instance to bf16 on a GPU.
 4. **Prepare the text.** `Tokenizer::from_file` reads `tokenizer.json`; `ChatTemplate::from_dir` reads the Jinja chat template. The user's message is rendered by the template, then encoded into token ids.
-5. **Prefill.** `Model::step` runs the whole prompt at once through every layer and stores each layer's keys and values in a `Cache`. It returns the logits of the last position.
-6. **Decode.** A token is chosen from the logits, greedily or by sampling with the filters of `generation_config.json`. It is fed back through `Model::step`, one position at a time, each step reading the cache.
+5. **Prefill.** `Model::step` runs the whole prompt at once through every layer and writes each layer's keys and values into a `Cache`, kept by pages of 16 positions. It returns the logits of the last position.
+6. **Decode.** A token is chosen from the logits, greedily or by sampling with the filters of `generation_config.json`; greedy choice runs on the backend (`ArgMax`), so only the token comes back. It is fed back one position at a time, each step reading the cache through `PagedAttention`. On a backend that records, the step is recorded on the first token and replayed for the next ones.
 7. **Stream the text.** Each token is decoded to text. Incomplete UTF-8 characters, and text that might be the start of a stop sequence, wait until they are settled, so the text that reaches the screen is never taken back.
 
 Every step of the forward pass is an operation from the catalogue, run by the chosen backend. The rest of the book walks through these layers from the bottom up.

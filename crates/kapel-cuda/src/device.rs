@@ -121,6 +121,12 @@ pub(crate) struct Inner {
     // Declared first, so dropped first: it borrows `stream`.
     tiles: Tiles,
     tables: Mutex<Tables>,
+    /// The last tables of rotary angles, by their constants and positions:
+    /// the layers of a model's pass rotate by the same angles.
+    recent_angles: Mutex<VecDeque<(Vec<u8>, Tensor)>>,
+    /// While a pass is recorded ([`kapel_ops::Record`]), where its buffers
+    /// come from and go back to.
+    pub(crate) capture: Mutex<Option<Arc<Arena>>>,
     shared: Arc<Shared>,
     stream: Arc<CudaStream>,
     functions: HashMap<&'static str, CudaFunction>,
@@ -200,6 +206,8 @@ impl Cuda {
                     order: VecDeque::new(),
                     bytes: 0,
                 }),
+                recent_angles: Mutex::new(VecDeque::new()),
+                capture: Mutex::new(None),
                 shared: Arc::new(Shared {
                     ordinal,
                     pool: Mutex::new(Pool::new()),
@@ -220,6 +228,40 @@ impl Cuda {
     /// The ordinal of the device.
     pub(crate) fn ordinal(&self) -> u32 {
         self.inner.shared.ordinal
+    }
+
+    /// The backend's stream, as the driver knows it.
+    pub(crate) fn raw_stream(&self) -> cuda_bindings::CUstream {
+        self.inner.stream.cu_stream().cast()
+    }
+
+    /// Copies `bytes` into the storage of `target` in place, and keeps them on
+    /// the host too when they are few, as an upload does.
+    pub(crate) fn fill_from_host(&self, target: &mut Tensor, bytes: &[u8]) -> Result<()> {
+        let op = kapel_ops::COPY_FROM_HOST;
+        let stream = Arc::clone(&self.inner.stream);
+        let storage = target
+            .storage_mut()
+            .and_then(|s| s.as_any_mut())
+            .and_then(|any| any.downcast_mut::<CudaStorage>())
+            .ok_or_else(|| Error::InvalidArgument {
+                op,
+                message: "the target is not a storage of this backend".into(),
+            })?;
+        if let Some(buffer) = storage.buffer.as_mut().filter(|_| !bytes.is_empty()) {
+            if buffer.len() != bytes.len() {
+                return Err(Error::BufferSize {
+                    op,
+                    expected: buffer.len(),
+                    got: bytes.len(),
+                });
+            }
+            // Waits for the stream, as an upload does: the copy follows the
+            // work queued before it.
+            buffer.copy_from_host(&stream, bytes).map_err(driver(op))?;
+        }
+        storage.host = (bytes.len() <= MIRROR_BYTES).then(|| bytes.into());
+        Ok(())
     }
 
     /// The tile runtime on this backend's stream.
@@ -247,6 +289,7 @@ impl Cuda {
 
     /// Frees the cached tables and the pool; whether there was anything.
     fn release(&self) -> bool {
+        lock(&self.inner.recent_angles).clear();
         // Tables first: those that no operation is using go back to the pool.
         let tables = {
             let mut tables = lock(&self.inner.tables);
@@ -258,9 +301,44 @@ impl Cuda {
         tables > 0 || !buffers.is_empty()
     }
 
+    /// The arena of the pass being recorded, if one is.
+    pub(crate) fn arena(&self) -> Option<Arc<Arena>> {
+        lock(&self.inner.capture).clone()
+    }
+
+    /// A device buffer of `bytes` bytes for the pass being recorded: one it
+    /// gave back, else one of the pool, else a new one, allocated outside the
+    /// stream (stream-ordered allocations would become part of the graph).
+    fn take_recorded(&self, arena: &Arena, bytes: usize) -> Result<DeviceBuffer<u8>> {
+        if let Some(buffer) = lock(&arena.free).pop(bytes) {
+            return Ok(buffer);
+        }
+        if let Some(buffer) = lock(&self.inner.shared.pool).pop(bytes) {
+            return Ok(buffer);
+        }
+        let mut pointer = 0;
+        // SAFETY: a plain allocation of the current context, allowed while
+        // the stream records (relaxed mode); the status is checked below.
+        let status = unsafe { cuda_bindings::cuMemAlloc_v2(&mut pointer, bytes.max(1)) };
+        if status != cuda_bindings::cudaError_enum_CUDA_SUCCESS {
+            return Err(Error::Device {
+                op: "alloc",
+                message: format!("allocation of {bytes} bytes while recording: error {status}"),
+            });
+        }
+        // SAFETY: `pointer` is a fresh allocation of `bytes` bytes (at least
+        // one) in this backend's context, owned by the buffer from now on.
+        Ok(unsafe {
+            DeviceBuffer::from_raw_parts(pointer, bytes, Arc::clone(&self.inner._context))
+        })
+    }
+
     /// A device buffer of `bytes` bytes, from the pool if one is free. Its
     /// contents are unspecified.
     fn take(&self, bytes: usize) -> Result<DeviceBuffer<u8>> {
+        if let Some(arena) = self.arena() {
+            return self.take_recorded(&arena, bytes);
+        }
         take_or_alloc(
             &self.inner.shared.pool,
             bytes,
@@ -283,10 +361,29 @@ impl Cuda {
             buffer
                 .zero_async(&self.inner.stream)
                 .map_err(driver("alloc"))?;
+        } else if POISON.load(std::sync::atomic::Ordering::Relaxed) && bytes > 0 {
+            // SAFETY: the buffer is `bytes` long, and the memset is queued on
+            // the backend's stream, before any use of the buffer.
+            let status = unsafe {
+                cuda_bindings::cuMemsetD8Async(
+                    buffer.cu_deviceptr(),
+                    0xff,
+                    bytes,
+                    self.raw_stream(),
+                )
+            };
+            if status != cuda_bindings::cudaError_enum_CUDA_SUCCESS {
+                return Err(Error::Device {
+                    op: "alloc",
+                    message: format!("poisoning a buffer: error {status}"),
+                });
+            }
         }
         Ok(CudaStorage {
             buffer: Some(buffer),
             shared: Arc::clone(&self.inner.shared),
+            host: None,
+            arena: self.arena(),
         })
     }
 
@@ -301,6 +398,8 @@ impl Cuda {
         Ok(CudaStorage {
             buffer: Some(buffer),
             shared: Arc::clone(&self.inner.shared),
+            host: None,
+            arena: self.arena(),
         })
     }
 
@@ -348,6 +447,52 @@ impl Cuda {
                 tables.bytes += bytes;
             }
         }
+        Ok(table)
+    }
+
+    /// The table of rotary angles kept for `key`, or `make`'s, kept among the
+    /// last few.
+    /// The table of rotary angles of a pass being recorded for `key` (the
+    /// positions' storage and the constants): made once per recording.
+    pub(crate) fn recorded_angles(
+        &self,
+        key: Vec<u8>,
+        make: impl FnOnce() -> Result<Tensor>,
+    ) -> Result<Tensor> {
+        let Some(arena) = self.arena() else {
+            return make();
+        };
+        if let Some((_, table)) = lock(&arena.angles).iter().find(|(k, _)| *k == key) {
+            return Ok(table.clone());
+        }
+        let table = make()?;
+        lock(&arena.angles).push((key, table.clone()));
+        Ok(table)
+    }
+
+    pub(crate) fn angles(
+        &self,
+        key: Vec<u8>,
+        make: impl FnOnce() -> Result<Tensor>,
+    ) -> Result<Tensor> {
+        const KEPT: usize = 4;
+        // A recorded pass computes its angles at every replay, for the
+        // positions of the replay: none is kept, nor taken.
+        if self.arena().is_some() {
+            return make();
+        }
+        if let Some((_, table)) = lock(&self.inner.recent_angles)
+            .iter()
+            .find(|(k, _)| *k == key)
+        {
+            return Ok(table.clone());
+        }
+        let table = make()?;
+        let mut recent = lock(&self.inner.recent_angles);
+        if recent.len() == KEPT {
+            recent.pop_front();
+        }
+        recent.push_back((key, table.clone()));
         Ok(table)
     }
 
@@ -529,6 +674,25 @@ impl Cuda {
         })
     }
 
+    /// A float tensor of this backend (`f32`, `bf16` or `f16`) as an argument
+    /// of the kernels that read any of them: its type's code, then its
+    /// storage as bytes and the view, in elements, through which to read it.
+    pub(crate) fn float_arg(
+        &self,
+        op: &'static str,
+        tensor: &Tensor,
+        layout: &Layout,
+    ) -> Result<FloatArg> {
+        let code = float_code(op, tensor.dtype())?;
+        let storage = self.storage(op, tensor)?;
+        Ok(FloatArg {
+            code,
+            base: storage.pointer(),
+            bytes: storage.len(),
+            view: view_of(op, layout)?,
+        })
+    }
+
     /// An `f32` tensor of this backend as a kernel argument.
     pub(crate) fn arg(&self, op: &'static str, tensor: &Tensor) -> Result<DeviceTensor> {
         self.arg_as(op, tensor, tensor.layout())
@@ -654,7 +818,15 @@ impl Transfer for Cuda {
         let dtype = tensor.dtype();
         let start = dtype.storage_bytes(tensor.layout().offset())?;
         let len = dtype.storage_bytes(tensor.numel())?;
-        let storage = self.upload_bytes(&bytes[start..start + len])?;
+        let bytes = &bytes[start..start + len];
+        let mut storage = self.upload_bytes(bytes)?;
+        // Small tensors, such as token ids and positions, keep their values
+        // on the host too: operations that need them there (the rows of a
+        // gather, checked against the table) read them without waiting for
+        // the device.
+        if bytes.len() <= MIRROR_BYTES {
+            storage.host = Some(bytes.into());
+        }
         Tensor::from_storage(
             Arc::new(storage),
             Layout::contiguous(tensor.shape())?,
@@ -681,10 +853,35 @@ impl Transfer for Cuda {
     }
 }
 
+/// Whether every buffer handed out with unspecified contents is first filled
+/// with `0xff` bytes (NaN in every float type): an output that a kernel does
+/// not write entirely then shows. For tests.
+static POISON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+impl Cuda {
+    /// Fills from now on every buffer handed out with unspecified contents
+    /// with NaN, so that an operation that leaves part of its output unwritten
+    /// gives NaN there rather than what the buffer held before. Slower; for
+    /// tests, in the whole process.
+    #[doc(hidden)]
+    pub fn poison_buffers(on: bool) {
+        POISON.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The most bytes of an upload whose values are kept on the host as well.
+const MIRROR_BYTES: usize = 1 << 20;
+
 /// The bytes of a tensor on the device, given back to the pool when dropped.
 pub(crate) struct CudaStorage {
     buffer: Option<DeviceBuffer<u8>>,
     shared: Arc<Shared>,
+    /// The same bytes on the host, for small uploads: a storage written in
+    /// place ([`kapel_ops::Write`]) forgets it first, so the two stay equal.
+    host: Option<Box<[u8]>>,
+    /// The arena of the recorded pass that made it, where its buffer goes
+    /// back: the recording reads and writes it at every replay.
+    arena: Option<Arc<Arena>>,
 }
 
 impl CudaStorage {
@@ -692,12 +889,60 @@ impl CudaStorage {
     pub(crate) fn pointer(&self) -> u64 {
         self.buffer.as_ref().map_or(0, DeviceBuffer::cu_deviceptr)
     }
+
+    /// The same bytes on the host, if the storage was a small upload.
+    pub(crate) fn host(&self) -> Option<&[u8]> {
+        self.host.as_deref()
+    }
+
+    /// Forgets the host copy: the bytes on the device are about to change.
+    pub(crate) fn written(&mut self) {
+        self.host = None;
+    }
 }
 
 impl Drop for CudaStorage {
     fn drop(&mut self) {
         if let Some(buffer) = self.buffer.take() {
-            lock(&self.shared.pool).push(buffer.len(), buffer);
+            match &self.arena {
+                Some(arena) => lock(&arena.free).push(buffer.len(), buffer),
+                None => lock(&self.shared.pool).push(buffer.len(), buffer),
+            }
+        }
+    }
+}
+
+/// The buffers of a recorded pass. While the pass is recorded, the buffers
+/// its operations give back are handed out again to its next operations, as
+/// the pool does; afterwards, none goes back to the pool while the recording
+/// lives, since each replay writes them again. Dropped (with the recording
+/// and the last tensor made while recording), it gives them to the pool.
+pub(crate) struct Arena {
+    free: Mutex<Pool<DeviceBuffer<u8>>>,
+    shared: Arc<Shared>,
+    /// While recording, the tables of rotary angles made, by the storage of
+    /// their positions (its address and range) and their constants: the
+    /// layers of a pass rotate by the same angles, computed once per replay.
+    /// Emptied when the recording ends.
+    pub(crate) angles: Mutex<Vec<(Vec<u8>, Tensor)>>,
+}
+
+impl Arena {
+    pub(crate) fn new(cuda: &Cuda) -> Self {
+        Self {
+            free: Mutex::new(Pool::new()),
+            shared: Arc::clone(&cuda.inner.shared),
+            angles: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl Drop for Arena {
+    fn drop(&mut self) {
+        let buffers = lock(&self.free).drain();
+        let mut pool = lock(&self.shared.pool);
+        for buffer in buffers {
+            pool.push(buffer.len(), buffer);
         }
     }
 }
@@ -722,6 +967,10 @@ impl Storage for CudaStorage {
     fn as_any(&self) -> &dyn Any {
         self
     }
+
+    fn as_any_mut(&mut self) -> Option<&mut dyn Any> {
+        Some(self)
+    }
 }
 
 /// The arguments of a kernel launch, in the order of its parameters.
@@ -739,6 +988,7 @@ enum Arg {
     /// A pointer and a length: two kernel parameters.
     Slice([u64; 2]),
     View(View),
+    Paged(kapel_cuda_abi::Paged),
 }
 
 impl Args {
@@ -783,8 +1033,19 @@ impl Args {
         self.slice(x.base, x.len).view(x.view)
     }
 
+    /// A float tensor read through a view: its type's code, its storage as
+    /// bytes, then the view.
+    pub(crate) fn float(self, x: &FloatArg) -> Self {
+        self.u32(x.code).slice(x.base, x.bytes).view(x.view)
+    }
+
     pub(crate) fn view(mut self, v: View) -> Self {
         self.values.push(Arg::View(v));
+        self
+    }
+
+    pub(crate) fn paged(mut self, p: kapel_cuda_abi::Paged) -> Self {
+        self.values.push(Arg::Paged(p));
         self
     }
 
@@ -795,6 +1056,7 @@ impl Args {
             Arg::F32(_) => Param::F32,
             Arg::Slice(_) => Param::Slice,
             Arg::View(_) => Param::View,
+            Arg::Paged(_) => Param::Paged,
         })
     }
 
@@ -811,6 +1073,7 @@ impl Args {
                     pointers.push(std::ptr::from_mut(len).cast::<c_void>());
                 }
                 Arg::View(v) => pointers.push(std::ptr::from_mut(v).cast::<c_void>()),
+                Arg::Paged(p) => pointers.push(std::ptr::from_mut(p).cast::<c_void>()),
             }
         }
         pointers
@@ -825,6 +1088,32 @@ pub(crate) struct DeviceTensor {
     pub(crate) len: usize,
     /// How the tensor reads its storage.
     pub(crate) view: View,
+}
+
+/// A float tensor of this backend, as the kernels that read any float type
+/// take it.
+pub(crate) struct FloatArg {
+    /// The code of its type (`kapel_cuda_abi::float`).
+    pub(crate) code: u32,
+    /// The device address of the storage's first byte.
+    pub(crate) base: u64,
+    /// The number of bytes of the storage.
+    pub(crate) bytes: usize,
+    /// How the tensor reads its storage, in elements.
+    pub(crate) view: View,
+}
+
+/// The code of a float type for the kernels that read any of them.
+pub(crate) fn float_code(op: &'static str, dtype: DType) -> Result<u32> {
+    use kapel_cuda_abi::float;
+    match dtype {
+        DType::F32 => Ok(float::F32),
+        DType::BF16 => Ok(float::BF16),
+        DType::F16 => Ok(float::F16),
+        DType::F8E4M3 => Ok(float::F8E4M3),
+        DType::F8E5M2 => Ok(float::F8E5M2),
+        dtype => Err(Error::UnsupportedDType { op, dtype }),
+    }
 }
 
 /// An `f32` tensor of this backend in row-major order, as a slice.
@@ -853,12 +1142,41 @@ pub(crate) fn view_of(op: &'static str, layout: &Layout) -> Result<View> {
         strides: [0; MAX_RANK],
         offset: small(op, layout.offset())?,
     };
-    let lead = MAX_RANK - layout.rank();
-    for (i, (&n, &s)) in layout.shape().iter().zip(layout.strides()).enumerate() {
+    let dims = merged(layout.shape(), layout.strides());
+    let lead = MAX_RANK - dims.len();
+    for (i, (n, s)) in dims.into_iter().enumerate() {
         view.shape[lead + i] = small(op, n)?;
         view.strides[lead + i] = small(op, s)?;
     }
     Ok(view)
+}
+
+/// The dimensions `(size, stride)` of a layout with those of size 1 dropped
+/// and each dimension merged into the previous one when it continues it
+/// (`stride[i] = stride[i + 1] · size[i + 1]`): the same positions in the same
+/// row-major order, in fewer dimensions, so that `View::at` ends sooner. An
+/// empty or single-element layout keeps one dimension.
+fn merged(shape: &[usize], strides: &[usize]) -> Vec<(usize, usize)> {
+    if shape.contains(&0) {
+        return vec![(0, 1)];
+    }
+    let mut dims: Vec<(usize, usize)> = Vec::new();
+    for (&n, &s) in shape.iter().zip(strides) {
+        if n == 1 {
+            continue;
+        }
+        match dims.last_mut() {
+            Some((m, t)) if *t == s * n => {
+                *m *= n;
+                *t = s;
+            }
+            _ => dims.push((n, s)),
+        }
+    }
+    if dims.is_empty() {
+        dims.push((1, 1));
+    }
+    dims
 }
 
 /// A size or an offset as a kernel integer.
@@ -917,6 +1235,19 @@ mod tests {
         );
         assert_eq!(got, Err("full"));
         assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn views_merge_the_dimensions_that_continue_each_other() {
+        // Row-major: one dimension.
+        assert_eq!(merged(&[2, 3, 4], &[12, 4, 1]), [(24, 1)]);
+        // A transpose stays two dimensions; sizes 1 go.
+        assert_eq!(merged(&[3, 1, 2], &[1, 9, 3]), [(3, 1), (2, 3)]);
+        // A broadcast row, and a narrowed one.
+        assert_eq!(merged(&[4, 5], &[0, 1]), [(4, 0), (5, 1)]);
+        assert_eq!(merged(&[2, 3], &[10, 1]), [(2, 10), (3, 1)]);
+        assert_eq!(merged(&[1, 1], &[1, 1]), [(1, 1)]);
+        assert_eq!(merged(&[2, 0], &[0, 1]), [(0, 1)]);
     }
 
     #[test]

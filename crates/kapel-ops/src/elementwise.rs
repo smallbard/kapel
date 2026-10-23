@@ -62,6 +62,47 @@ impl Operation for Unary {
     }
 }
 
+/// A gated unit: `y = f(x[…, :n]) · x[…, n:]` for an input `x [..., 2n]`, the
+/// gate first. It is the MLP of Llama (SwiGLU, `f` = SiLU), of Gemma (GeGLU)
+/// and of most decoders, once their gate and up projections are stacked into
+/// one product: one operation instead of a [`Unary`] and a [`Binary`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Glu {
+    /// The function of the gate.
+    pub activation: UnaryKind,
+}
+
+impl Operation for Glu {
+    const NAME: &'static str = "glu";
+
+    fn infer(&self, inputs: &[&Tensor]) -> Result<Signature> {
+        let op = Self::NAME;
+        arity(op, inputs, &[1], "1")?;
+        let x = inputs[0];
+        float(op, x)?;
+        let width = x.shape().last().copied().unwrap_or(0);
+        if x.rank() == 0 || width % 2 != 0 {
+            return Err(kapel_core::Error::InvalidArgument {
+                op,
+                message: format!(
+                    "the last dimension holds the gate then the values: even, got {:?}",
+                    x.shape()
+                ),
+            });
+        }
+        let mut shape = x.shape().to_vec();
+        *shape.last_mut().expect("rank checked") = width / 2;
+        Ok(Signature {
+            shape,
+            dtype: x.dtype(),
+        })
+    }
+
+    fn differentiable(&self, _: usize) -> bool {
+        true
+    }
+}
+
 /// A function of two elements.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]

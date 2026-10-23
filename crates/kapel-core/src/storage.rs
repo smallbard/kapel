@@ -29,6 +29,13 @@ pub trait Storage: Send + Sync + fmt::Debug + 'static {
     /// The storage as [`Any`], for a backend to recover its own storage type.
     fn as_any(&self) -> &dyn Any;
 
+    /// The storage as mutable [`Any`], for a backend to write into it in
+    /// place; `None` for a storage that cannot be written, such as a file
+    /// mapped read-only.
+    fn as_any_mut(&mut self) -> Option<&mut dyn Any> {
+        None
+    }
+
     /// The bytes, if they are in host memory and can be read in place: an owned
     /// host buffer, or a file mapped in memory.
     fn host_bytes(&self) -> Option<&[u8]> {
@@ -208,6 +215,10 @@ impl Storage for HostStorage {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn as_any_mut(&mut self) -> Option<&mut dyn Any> {
+        Some(self)
     }
 
     fn host_bytes(&self) -> Option<&[u8]> {

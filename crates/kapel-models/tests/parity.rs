@@ -7,7 +7,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use kapel_hub::{Checkpoint, SafeTensors};
-use kapel_models::{Cache, Model};
+use kapel_models::{Cache, KvCache, Model};
 
 /// The largest difference, relative to the largest logit, over every text.
 fn worst(model: &Model, reference: &SafeTensors, cpu: &kapel_cpu::Cpu) -> f64 {
@@ -84,6 +84,131 @@ fn a_cache_gives_the_logits_of_the_whole_sequence() {
             .collect();
         let relative = cached_against_whole(&model, &ids, &cpu);
         assert!(relative < 1e-5, "{name}: relative difference {relative:e}");
+    }
+}
+
+/// The largest difference between two lists of logits, relative to the
+/// largest of the second.
+fn relative(got: &[f32], want: &[f32]) -> f64 {
+    let scale = want.iter().fold(0.0f64, |m, v| m.max(f64::from(v.abs())));
+    let worst = got
+        .iter()
+        .zip(want)
+        .fold(0.0f64, |m, (a, b)| m.max(f64::from((a - b).abs())));
+    worst / scale
+}
+
+/// The texts of a reference, as token ids.
+fn texts(reference: &SafeTensors) -> Vec<Vec<u32>> {
+    (0..)
+        .map_while(|i| reference.tensor(&format!("ids_{i}")).ok())
+        .map(|ids| {
+            ids.to_vec::<i32>()
+                .unwrap()
+                .into_iter()
+                .map(|v| v as u32)
+                .collect()
+        })
+        .collect()
+}
+
+/// Every model of `data/parity`, by name, with its reference.
+fn models() -> Vec<(String, Model, SafeTensors)> {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/parity");
+    let mut found = Vec::new();
+    for dir in std::fs::read_dir(&root).into_iter().flatten().flatten() {
+        let Ok(reference) = SafeTensors::open(dir.path().join("reference.safetensors")) else {
+            continue;
+        };
+        let name = dir.file_name().to_string_lossy().into_owned();
+        let model = Model::load(&Checkpoint::open(dir.path()).unwrap()).unwrap();
+        found.push((name, model, reference));
+    }
+    found
+}
+
+/// Several sequences in one pass give the logits each gives alone: their
+/// prompts together, then a token of each together, after caches of
+/// different lengths.
+#[test]
+fn a_batch_gives_the_logits_of_its_sequences_alone() {
+    let cpu = kapel_cpu::Cpu::new();
+    for (name, model, reference) in models() {
+        let texts = texts(&reference);
+        let mut alone = Vec::new();
+        for ids in &texts {
+            let mut cache = Cache::new();
+            let first = model
+                .step(&cpu, ids, &mut cache)
+                .unwrap()
+                .to_vec::<f32>()
+                .unwrap();
+            let next = model
+                .step(&cpu, &ids[..1], &mut cache)
+                .unwrap()
+                .to_vec::<f32>()
+                .unwrap();
+            alone.push((first, next));
+        }
+        let mut cache = KvCache::with_pages(64);
+        let ids: Vec<_> = texts.iter().map(|_| cache.add_sequence()).collect();
+        let batch: Vec<_> = ids
+            .iter()
+            .zip(&texts)
+            .map(|(&id, t)| (id, &t[..]))
+            .collect();
+        let first = model
+            .step_batch(&cpu, &mut cache, &batch)
+            .unwrap()
+            .to_vec::<f32>()
+            .unwrap();
+        let batch: Vec<_> = ids
+            .iter()
+            .zip(&texts)
+            .map(|(&id, t)| (id, &t[..1]))
+            .collect();
+        let next = model
+            .step_batch(&cpu, &mut cache, &batch)
+            .unwrap()
+            .to_vec::<f32>()
+            .unwrap();
+        let vocab = first.len() / texts.len();
+        for (s, (want_first, want_next)) in alone.iter().enumerate() {
+            let rows = s * vocab..(s + 1) * vocab;
+            let worst =
+                relative(&first[rows.clone()], want_first).max(relative(&next[rows], want_next));
+            assert!(
+                worst < 1e-5,
+                "{name}, sequence {s}: relative difference {worst:e}"
+            );
+        }
+    }
+}
+
+/// Stacked projections ([`Model::fused`]) give the logits of the model.
+#[test]
+fn a_fused_model_gives_the_logits_of_the_model() {
+    let cpu = kapel_cpu::Cpu::new();
+    for (name, model, reference) in models() {
+        let fused = model.fused(&cpu).unwrap();
+        for ids in texts(&reference) {
+            let want = model.forward(&cpu, &ids).unwrap().to_vec::<f32>().unwrap();
+            let got = fused.forward(&cpu, &ids).unwrap().to_vec::<f32>().unwrap();
+            let worst = relative(&got, &want);
+            assert!(worst < 1e-5, "{name}: relative difference {worst:e}");
+            let mut cache = Cache::new();
+            let got = fused
+                .step(&cpu, &ids, &mut cache)
+                .unwrap()
+                .to_vec::<f32>()
+                .unwrap();
+            let vocab = got.len();
+            let worst = relative(&got, &want[want.len() - vocab..]);
+            assert!(
+                worst < 1e-5,
+                "{name}, with a cache: relative difference {worst:e}"
+            );
+        }
     }
 }
 

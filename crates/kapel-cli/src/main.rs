@@ -39,6 +39,9 @@ options:
   --quantize FORMAT        quantize the linear projections: int8, int4 (groups of
                            128 and 64, or int8/G, int4/G), q8_0, q4_0
   --quantize-output        quantize the output table too
+  --kv-cache TYPE          the type of the cache of keys and values: f32, bf16,
+                           f16, f8e4m3 or f8e5m2 (default the type of the keys;
+                           f8 halves its memory)
   --byte-activations       on cpu, quantize the activations of the products by
                            quantized weights to bytes, as llama.cpp does: faster,
                            and the results change a little
@@ -89,6 +92,8 @@ fn execute(run: &Run) -> Result<(), String> {
                 dtype: run.dtype.or(Some(kapel_core::DType::F32)),
                 quantize: run.quantize,
                 quantize_output: run.quantize_output,
+                fuse: false,
+                cache_dtype: run.kv_cache,
             };
             let cpu = kapel_cpu::Cpu::new().with_byte_activations(run.byte_activations);
             serve(
@@ -103,6 +108,8 @@ fn execute(run: &Run) -> Result<(), String> {
                 dtype: run.dtype.or(Some(kapel_core::DType::BF16)),
                 quantize: run.quantize,
                 quantize_output: run.quantize_output,
+                fuse: true,
+                cache_dtype: run.kv_cache,
             };
             serve(
                 run,
@@ -120,6 +127,7 @@ fn serve<B: Backend + Transfer>(run: &Run, pipeline: Pipeline<B>) -> Result<(), 
         sampling: pipeline.default_sampling().clone(),
         max_tokens: run.max_tokens,
         stop: run.stop.clone(),
+        ignore_eos: false,
     };
     run.sampling.apply(&mut request.sampling);
     let chat = !run.raw && pipeline.has_chat_template();

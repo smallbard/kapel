@@ -10,11 +10,13 @@ The reference backend defines what correct means in Kapel. It computes every ope
 pub(crate) struct Array { shape: Vec<usize>, data: Vec<f64> }
 ```
 
-Outputs are `f64` tensors, except for `Cast` (its target type) and the copies `Contiguous` and `Concat` (their inputs' type). `Transfer` is the identity on the host and `WrongDevice` elsewhere.
+Outputs are `f64` tensors, except for `Cast` (its target type), the copies `Contiguous` and `Concat` (their inputs' type) and `ArgMax` (`u32` positions). `Transfer` is the identity on the host and `WrongDevice` elsewhere. `Write` writes into host storage, each value encoded in the table's type by `DType::encode`, and `Record` records nothing: `records()` is false, and a pass is simply run.
 
 Each operation is a few lines. A matrix product is a triple loop; its backward is `∂a = g · bᵀ` and `∂b = aᵀ · g`, followed by `sum_to`, which sums the gradient of a broadcast input over its repeated dimensions. A unary operation is a table of pairs `(f, f')`, and its backward multiplies the gradient by `f'(x)`. Softmax subtracts the row maximum first and its backward is `y ⊙ (g − Σ g·y)`. RoPE's backward is the same rotation run in the other direction. Gather and scatter are each other's backward.
 
 Attention shows how the reference handles edge cases explicitly. `Inputs::weights` keeps only the visible keys, then drops any score equal to −∞ before the softmax, which "keeps a row whose keys are all masked from computing −∞ − (−∞)": such a row gives zeros, as the catalogue promises.
+
+Paged attention reads the page table and the rows at their values, calls `check_indices`, then follows the definition line by line: for each query and head, the scores of its visible positions, located through the page table, their softmax, and the weighted sum of the values.
 
 Every `forward` starts with `op.infer`, and every `backward` with `op.infer_backward`, so the reference rejects bad calls exactly as the fast backends do.
 
@@ -34,8 +36,12 @@ Beyond the main list, three groups target the places where backends break:
 - **Empty tensors**: a dimension of size 0 in products, reductions, norms, attention, RoPE and gathers. A product with K = 0 must give zeros.
 - **Strided inputs**: transposed, narrowed and stride-0 broadcast views, including attention on `[B, T, H, D]` tensors seen as `[B, H, T, D]`.
 - **Masked attention**: one query whose keys are all masked with −∞ (zeros and no gradient), and the same row masked with `f32::MIN` (uniform weights).
+- **Paged attention**: one sequence decoding; two sequences sharing a cache with their pages interleaved, one of them computing several queries; a window with capped scores and a set scale; queries narrowed out of a wider projection; a cache of another float type than the queries, including `f8e4m3` and `f8e5m2`; a query that sees nothing; heads of 64 and 128 over 300 positions, long enough for a backend to split them; and a prompt of 400 queries after 10 cached positions, next to a query of another sequence, with and without a window.
+- **`ArgMax` and `Glu`**: rows of rounded values, so that ties occur, and rows mixing NaN and −∞; SiLU and GELU gates, on a transposed input too.
 
 Each input is an argument plus a view (whole, transposed, narrowed or broadcast), and the view is applied after upload, so a GPU backend really receives a strided device tensor.
+
+**Rows written in place.** `Write` is not an operation, so it has its own check: three rows written into tables of the type under test, of `f16` and of `f8e4m3`, compared bit for bit with the reference, and four calls that must be refused: a row out of range, a row written twice, a shared table and rows of another width.
 
 **One check.** For every case, `Conformity::run` does five things:
 

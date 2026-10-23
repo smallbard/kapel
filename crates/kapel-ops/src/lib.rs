@@ -18,6 +18,7 @@ mod elementwise;
 mod index;
 mod matmul;
 mod norm;
+mod paged;
 mod reduce;
 mod rope;
 pub mod shape;
@@ -27,12 +28,16 @@ use std::fmt;
 
 pub use attention::Attention;
 pub use copy::{Concat, Contiguous};
-pub use elementwise::{Affine, Binary, BinaryKind, Cast, Unary, UnaryKind};
+pub use elementwise::{Affine, Binary, BinaryKind, Cast, Glu, Unary, UnaryKind};
 pub use index::{GatherRows, ScatterAddRows};
 use kapel_core::{DType, Error, Result, Tensor};
 pub use matmul::{Matmul, QuantizedMatmul};
 pub use norm::{LayerNorm, LogSoftmax, RmsNorm, Softmax};
-pub use reduce::{Max, Mean, Sum};
+pub use paged::{
+    COPY_FROM_HOST, PagedAttention, Record, Recording, WRITE_ROWS, Write, check_copy, check_write,
+    check_written,
+};
+pub use reduce::{ArgMax, Max, Mean, Sum};
 pub use rope::{Rope, RopeLayout, RopeScaling};
 
 /// The shape and data type of an operation's output.
@@ -142,9 +147,13 @@ pub trait Transfer {
     fn download(&self, tensor: &Tensor) -> Result<Tensor>;
 }
 
-/// A backend that runs the whole catalogue.
+/// A backend that runs the whole catalogue, and writes the caches of
+/// generation in place.
 pub trait Backend:
-    Run<Unary>
+    Write
+    + Record
+    + Run<Unary>
+    + Run<Glu>
     + Run<Binary>
     + Run<Affine>
     + Run<Cast>
@@ -155,11 +164,13 @@ pub trait Backend:
     + Run<Sum>
     + Run<Mean>
     + Run<Max>
+    + Run<ArgMax>
     + Run<Softmax>
     + Run<LogSoftmax>
     + Run<LayerNorm>
     + Run<RmsNorm>
     + Run<Attention>
+    + Run<PagedAttention>
     + Run<Rope>
     + Run<GatherRows>
     + Run<ScatterAddRows>
@@ -167,7 +178,10 @@ pub trait Backend:
 }
 
 impl<B> Backend for B where
-    B: Run<Unary>
+    B: Write
+        + Record
+        + Run<Unary>
+        + Run<Glu>
         + Run<Binary>
         + Run<Affine>
         + Run<Cast>
@@ -178,11 +192,13 @@ impl<B> Backend for B where
         + Run<Sum>
         + Run<Mean>
         + Run<Max>
+        + Run<ArgMax>
         + Run<Softmax>
         + Run<LogSoftmax>
         + Run<LayerNorm>
         + Run<RmsNorm>
         + Run<Attention>
+        + Run<PagedAttention>
         + Run<Rope>
         + Run<GatherRows>
         + Run<ScatterAddRows>

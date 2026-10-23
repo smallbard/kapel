@@ -31,6 +31,43 @@ pub struct Max {
     pub keepdim: bool,
 }
 
+/// The position along `dim` of the maximum, as a `u32`: the first one on a
+/// tie. NaN is never the maximum; a line of NaN only gives 0. This is the
+/// choice of greedy decoding, made where the logits are.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ArgMax {
+    /// The dimension to reduce.
+    pub dim: usize,
+    /// Keep the reduced dimension, with size 1.
+    pub keepdim: bool,
+}
+
+impl Operation for ArgMax {
+    const NAME: &'static str = "argmax";
+
+    fn infer(&self, inputs: &[&Tensor]) -> Result<Signature> {
+        let signature = infer_reduction(Self::NAME, inputs, &[self.dim], self.keepdim)?;
+        let len = inputs[0].shape()[self.dim];
+        if len == 0 || len > u32::MAX as usize {
+            return Err(kapel_core::Error::InvalidArgument {
+                op: Self::NAME,
+                message: format!(
+                    "dimension {} has {len} elements: a position needs 1 to 2³² of them",
+                    self.dim
+                ),
+            });
+        }
+        Ok(Signature {
+            dtype: kapel_core::DType::U32,
+            ..signature
+        })
+    }
+
+    fn differentiable(&self, _: usize) -> bool {
+        false
+    }
+}
+
 fn infer_reduction(
     op: &'static str,
     inputs: &[&Tensor],

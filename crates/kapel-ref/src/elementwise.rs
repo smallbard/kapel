@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use kapel_core::{Error, HostStorage, Layout, Result, Tensor};
 use kapel_ops::{
-    Affine, Binary, BinaryKind, Cast, Concat, Contiguous, Operation, Run, Unary, UnaryKind,
+    Affine, Binary, BinaryKind, Cast, Concat, Contiguous, Glu, Operation, Run, Unary, UnaryKind,
 };
 
 use crate::Reference;
@@ -96,6 +96,47 @@ impl Run<Unary> for Reference {
             .zip(&g.data)
             .map(|(&v, &g)| Ok(g * unary(op.kind, v)?.1))
             .collect::<Result<_>>()?;
+        Ok(vec![Some(Array::new(&x.shape, data).tensor()?)])
+    }
+}
+
+impl Run<Glu> for Reference {
+    fn forward(&self, op: &Glu, inputs: &[&Tensor]) -> Result<Tensor> {
+        let signature = op.infer(inputs)?;
+        let x = Array::of(inputs[0])?;
+        let n = *signature.shape.last().expect("rank checked");
+        let mut data = Vec::with_capacity(x.data.len() / 2);
+        if n > 0 {
+            for row in x.data.chunks_exact(2 * n) {
+                let (gate, value) = row.split_at(n);
+                for (&a, &b) in gate.iter().zip(value) {
+                    data.push(unary(op.activation, a)?.0 * b);
+                }
+            }
+        }
+        Array::new(&signature.shape, data).tensor()
+    }
+
+    /// `∂gate = g · value · f'(gate)`, `∂value = g · f(gate)`.
+    fn backward(&self, op: &Glu, inputs: &[&Tensor], grad: &Tensor) -> Result<Vec<Option<Tensor>>> {
+        let signature = op.infer_backward(inputs, grad)?;
+        let (x, g) = (Array::of(inputs[0])?, Array::of(grad)?);
+        let n = *signature.shape.last().expect("rank checked");
+        let mut data = vec![0.0; x.data.len()];
+        if n > 0 {
+            for ((row, out), g) in x
+                .data
+                .chunks_exact(2 * n)
+                .zip(data.chunks_exact_mut(2 * n))
+                .zip(g.data.chunks_exact(n))
+            {
+                for j in 0..n {
+                    let (f, slope) = unary(op.activation, row[j])?;
+                    out[j] = g[j] * row[n + j] * slope;
+                    out[n + j] = g[j] * f;
+                }
+            }
+        }
         Ok(vec![Some(Array::new(&x.shape, data).tensor()?)])
     }
 }

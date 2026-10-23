@@ -22,9 +22,11 @@ pub(crate) enum Param {
     Slice,
     /// A [`kapel_cuda_abi::View`] by value.
     View,
+    /// A [`kapel_cuda_abi::Paged`] by value.
+    Paged,
 }
 
-use Param::{F32, Slice, U32, View};
+use Param::{F32, Paged, Slice, U32, View};
 
 /// Every kernel of `kernels.ptx`, with its arguments in order.
 pub(crate) const KERNELS: &[(&str, &[Param])] = &[
@@ -69,6 +71,99 @@ pub(crate) const KERNELS: &[(&str, &[Param])] = &[
     ("gather_rows", &[Slice, Slice, U32, Slice]),
     ("gather_rows_16", &[Slice, Slice, U32, Slice]),
     ("scatter_rows", &[Slice, Slice, Slice, U32, Slice]),
+    ("unary_any", &[U32, U32, Slice, View, U32, Slice]),
+    ("affine_any", &[F32, F32, U32, Slice, View, U32, Slice]),
+    (
+        "binary_any",
+        &[U32, U32, Slice, View, U32, Slice, View, U32, Slice],
+    ),
+    (
+        "norm_any",
+        &[U32, U32, Slice, Slice, Slice, F32, F32, U32, Slice],
+    ),
+    (
+        "norm_block_any",
+        &[U32, U32, Slice, Slice, Slice, F32, F32, U32, Slice],
+    ),
+    (
+        "rope_any",
+        &[U32, Slice, View, Slice, Slice, U32, U32, U32, U32, Slice],
+    ),
+    (
+        "write_rows_any",
+        &[U32, Slice, View, Slice, U32, U32, Slice],
+    ),
+    (
+        "paged_attention",
+        &[
+            Paged, Slice, Slice, Slice, Slice, Slice, Slice, Slice, Slice,
+        ],
+    ),
+    ("paged_combine", &[Paged, Slice, Slice, Slice]),
+    (
+        "norm_16",
+        &[U32, U32, Slice, Slice, Slice, F32, F32, U32, Slice],
+    ),
+    ("glu_any", &[U32, U32, Slice, U32, U32, Slice]),
+    ("glu_backward", &[U32, Slice, Slice, U32, Slice]),
+    ("argmax_rows", &[U32, Slice, U32, Slice]),
+    (
+        "paged_attention_16",
+        &[
+            Paged, U32, Slice, Slice, Slice, Slice, Slice, Slice, Slice, Slice,
+        ],
+    ),
+    (
+        "qgemv",
+        &[U32, U32, U32, Slice, U32, Slice, U32, U32, U32, U32, Slice],
+    ),
+    ("dequantize", &[U32, U32, U32, Slice, U32, U32, Slice]),
+    (
+        "dequantize_rows",
+        &[U32, U32, U32, Slice, Slice, U32, Slice],
+    ),
+    ("argmax_parts", &[U32, Slice, U32, U32, Slice, Slice]),
+    ("argmax_merge", &[U32, Slice, Slice, Slice]),
+    (
+        "qgemv_int8",
+        &[U32, U32, Slice, U32, Slice, U32, U32, U32, Slice],
+    ),
+    (
+        "qgemv_int8_1",
+        &[U32, U32, Slice, U32, Slice, U32, U32, Slice],
+    ),
+    (
+        "qgemv_int4",
+        &[U32, U32, Slice, U32, Slice, U32, U32, U32, Slice],
+    ),
+    (
+        "qgemv_int4_1",
+        &[U32, U32, Slice, U32, Slice, U32, U32, Slice],
+    ),
+    (
+        "qgemv_q8_0",
+        &[U32, U32, Slice, U32, Slice, U32, U32, U32, Slice],
+    ),
+    (
+        "qgemv_q8_0_1",
+        &[U32, U32, Slice, U32, Slice, U32, U32, Slice],
+    ),
+    (
+        "qgemv_q4k",
+        &[U32, U32, Slice, U32, Slice, U32, U32, U32, Slice],
+    ),
+    (
+        "qgemv_q4k_1",
+        &[U32, U32, Slice, U32, Slice, U32, U32, Slice],
+    ),
+    (
+        "qgemv_q6k",
+        &[U32, U32, Slice, U32, Slice, U32, U32, U32, Slice],
+    ),
+    (
+        "qgemv_q6k_1",
+        &[U32, U32, Slice, U32, Slice, U32, U32, Slice],
+    ),
 ];
 
 /// The arguments of kernel `name`, if there is one.
@@ -108,6 +203,10 @@ mod tests {
                 Param::View => vec![Ptx::Bytes {
                     size: size_of::<AbiView>(),
                     align: align_of::<AbiView>(),
+                }],
+                Param::Paged => vec![Ptx::Bytes {
+                    size: size_of::<kapel_cuda_abi::Paged>(),
+                    align: align_of::<kapel_cuda_abi::Paged>(),
                 }],
             })
             .collect()

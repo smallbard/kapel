@@ -208,13 +208,18 @@ impl Layout {
         })
     }
 
-    /// The same elements with another shape. A contiguous layout can take any
-    /// shape with the same number of elements; a strided view needs a copy.
+    /// The same elements with another shape, in the same row-major order,
+    /// without moving them. A contiguous layout can take any shape with the
+    /// same number of elements. A strided view can take the shapes that split
+    /// or merge only dimensions that continue one another (`stride[i] =
+    /// stride[i + 1] · size[i + 1]`): the columns of a matrix narrowed from a
+    /// wider one can be cut into heads, but the rows of a transpose cannot be
+    /// merged; those need a copy.
     ///
     /// # Errors
     ///
-    /// [`Error::ElementCountMismatch`], or [`Error::NotContiguous`] for a strided
-    /// view.
+    /// [`Error::ElementCountMismatch`], or [`Error::NotContiguous`] for a
+    /// strided view that cannot take the shape.
     pub fn reshape(&self, shape: &[usize]) -> Result<Self> {
         let count = shape
             .iter()
@@ -227,11 +232,13 @@ impl Layout {
                 got: count,
             });
         }
-        if !self.is_contiguous() {
-            return Err(Error::NotContiguous { op: "reshape" });
-        }
         let mut out = Self::contiguous(shape)?;
         out.offset = self.offset;
+        if self.is_contiguous() || count == 0 {
+            return Ok(out);
+        }
+        out.strides = view_strides(&self.shape, &self.strides, shape)
+            .ok_or(Error::NotContiguous { op: "reshape" })?;
         Ok(out)
     }
 
@@ -274,6 +281,41 @@ impl Iterator for Offsets<'_> {
         }
         Some(current)
     }
+}
+
+/// The strides of `new`, a reshape of the non-empty layout `old` (`shape`,
+/// `strides`) that keeps its elements in place, if there are some: the old
+/// dimensions are taken in groups that continue one another, from the last,
+/// and the new dimensions must tile each group exactly.
+fn view_strides(shape: &[usize], strides: &[usize], new: &[usize]) -> Option<Vec<usize>> {
+    let mut out = vec![0; new.len()];
+    let mut next = new.len();
+    let (mut base, mut seen, mut placed) = (strides.last().copied().unwrap_or(1), 1, 1);
+    for d in (0..shape.len()).rev() {
+        seen *= shape[d];
+        let group_ends = d == 0 || (shape[d - 1] != 1 && strides[d - 1] != seen * base);
+        if group_ends {
+            while next > 0 && (placed < seen || new[next - 1] == 1) {
+                next -= 1;
+                out[next] = placed * base;
+                placed *= new[next];
+            }
+            if placed != seen {
+                return None;
+            }
+            if d > 0 {
+                base = strides[d - 1];
+                seen = 1;
+                placed = 1;
+            }
+        }
+    }
+    // Dimensions of size 1 left over, before every other.
+    while next > 0 && new[next - 1] == 1 {
+        next -= 1;
+        out[next] = placed * base;
+    }
+    (next == 0).then_some(out)
 }
 
 #[cfg(test)]
@@ -368,6 +410,29 @@ mod tests {
         let scalar = Layout::contiguous(&[]).unwrap();
         assert_eq!(offsets(&scalar), vec![0]);
         assert_eq!(scalar.numel(), 1);
+    }
+
+    #[test]
+    fn a_strided_view_takes_the_shapes_that_keep_its_elements_in_place() {
+        // The columns 2..8 of a [4, 10] matrix, cut into 3 heads of 2.
+        let narrow = Layout::contiguous(&[4, 10])
+            .unwrap()
+            .narrow(1, 2, 6)
+            .unwrap();
+        let heads = narrow.reshape(&[4, 3, 2]).unwrap();
+        assert_eq!(heads.strides(), [10, 2, 1]);
+        assert_eq!(offsets(&heads), offsets(&narrow));
+        // A leading 1, and the heads merged back.
+        let one = heads.reshape(&[1, 4, 6]).unwrap();
+        assert_eq!(offsets(&one), offsets(&narrow));
+        // Rows of a narrowed matrix cannot be merged; nor those of a transpose.
+        assert!(narrow.reshape(&[24]).is_err());
+        let t = Layout::contiguous(&[3, 4])
+            .unwrap()
+            .transpose(0, 1)
+            .unwrap();
+        assert!(t.reshape(&[12]).is_err());
+        assert_eq!(t.reshape(&[4, 3, 1]).unwrap().strides()[..2], [1, 4]);
     }
 
     #[test]

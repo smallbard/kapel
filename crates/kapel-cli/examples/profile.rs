@@ -56,6 +56,41 @@ impl<O: Operation, B: Run<O>> Run<O> for Timed<B> {
     }
 }
 
+impl<B: kapel_ops::Write> kapel_ops::Write for Timed<B> {
+    fn zeros(&self, shape: &[usize], dtype: kapel_core::DType) -> kapel_core::Result<Tensor> {
+        self.inner.zeros(shape, dtype)
+    }
+
+    fn write_rows(
+        &self,
+        table: &mut Tensor,
+        index: &Tensor,
+        rows: &Tensor,
+    ) -> kapel_core::Result<()> {
+        let start = Instant::now();
+        let result = self.inner.write_rows(table, index, rows);
+        self.record(kapel_ops::WRITE_ROWS.to_string(), start.elapsed());
+        result
+    }
+
+    fn copy_from_host(&self, target: &mut Tensor, values: &Tensor) -> kapel_core::Result<()> {
+        self.inner.copy_from_host(target, values)
+    }
+}
+
+impl<B: kapel_ops::Record> kapel_ops::Record for Timed<B> {
+    fn records(&self) -> bool {
+        self.inner.records()
+    }
+
+    fn record(
+        &self,
+        pass: &mut dyn FnMut() -> kapel_core::Result<Tensor>,
+    ) -> kapel_core::Result<Option<kapel_ops::Recording>> {
+        self.inner.record(pass)
+    }
+}
+
 impl<B: Transfer> Transfer for Timed<B> {
     fn upload(&self, tensor: &Tensor) -> Result<Tensor> {
         self.inner.upload(tensor)

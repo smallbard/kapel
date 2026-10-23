@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use kapel_core::{Error, HostStorage, Layout, Result, Tensor};
 use kapel_ops::{
-    Affine, Binary, BinaryKind, Cast, Concat, Contiguous, Operation, Run, Unary, UnaryKind,
+    Affine, Binary, BinaryKind, Cast, Concat, Contiguous, Glu, Operation, Run, Unary, UnaryKind,
 };
 
 use crate::backend::{CHUNK, Cpu};
@@ -174,6 +174,67 @@ impl Run<Unary> for Cpu {
             &out,
             &signature.shape,
             signature.dtype,
+        )?)])
+    }
+}
+
+impl Run<Glu> for Cpu {
+    /// One task per block of rows; the activation of the gates is vectorized
+    /// for SiLU, as for [`Unary`].
+    fn forward(&self, op: &Glu, inputs: &[&Tensor]) -> Result<Tensor> {
+        let signature = op.infer(inputs)?;
+        check_unary(op.activation)?;
+        let x = io::contiguous(Glu::NAME, inputs[0])?;
+        let n = *signature.shape.last().expect("rank checked");
+        let isa = self.isa;
+        io::output(&self.buffers, &signature.shape, signature.dtype, |out| {
+            if n == 0 {
+                return;
+            }
+            let rows = (CHUNK / n).max(1);
+            self.fill(out, rows * n, |start, part| {
+                let first = start / n;
+                for (r, y) in part.chunks_exact_mut(n).enumerate() {
+                    let row = &x[(first + r) * 2 * n..][..2 * n];
+                    let (gate, value) = row.split_at(n);
+                    match op.activation {
+                        UnaryKind::Silu => math::silu(isa, gate, y),
+                        kind => y
+                            .iter_mut()
+                            .zip(gate)
+                            .for_each(|(y, &a)| *y = unary_value(kind, a)),
+                    }
+                    y.iter_mut().zip(value).for_each(|(y, &b)| *y *= b);
+                }
+            });
+        })
+    }
+
+    fn backward(&self, op: &Glu, inputs: &[&Tensor], grad: &Tensor) -> Result<Vec<Option<Tensor>>> {
+        let signature = op.infer_backward(inputs, grad)?;
+        check_unary(op.activation)?;
+        let x = io::contiguous(Glu::NAME, inputs[0])?;
+        let g = io::contiguous(Glu::NAME, grad)?;
+        let n = *signature.shape.last().expect("rank checked");
+        let mut out = vec![0.0; x.len()];
+        if n > 0 {
+            for ((row, y), g) in x
+                .chunks_exact(2 * n)
+                .zip(out.chunks_exact_mut(2 * n))
+                .zip(g.chunks_exact(n))
+            {
+                for j in 0..n {
+                    let a = row[j];
+                    y[j] = g[j] * row[n + j] * unary_derivative(op.activation, a);
+                    y[n + j] = g[j] * unary_value(op.activation, a);
+                }
+            }
+        }
+        Ok(vec![Some(io::write(
+            &self.buffers,
+            &out,
+            inputs[0].shape(),
+            inputs[0].dtype(),
         )?)])
     }
 }

@@ -8,12 +8,25 @@
 //!   accumulators, compiled by `tileiras` at their first launch and kept in a
 //!   cache on disk;
 //! - the other operations are cuda-oxide kernels (`kernels/`, built by
-//!   `kernels/build.sh`), whose PTX is embedded in this crate. They compute in
-//!   `f32`: inputs in `bf16` or `f16` are widened on the device, and results
-//!   rounded back, ties to even, as the host rounds them.
+//!   `kernels/build.sh`), whose PTX is embedded in this crate. The operations
+//!   of a decoding step (element-wise, normalizations, RoPE, `Glu`, row
+//!   writes) read and write `bf16` and `f16` directly, computing in `f32`;
+//!   the others widen their inputs on the device. Results are rounded back,
+//!   ties to even, as the host rounds them;
+//! - paged attention reads caches in `f32`, `bf16`, `f16` and `f8`, split into
+//!   chunks of keys that are then combined; long prompts go through the tiled
+//!   attention;
+//! - products by quantized weights read the codes in place for a few rows
+//!   (decoding), and multiply pieces of dequantized weights by tiles for many
+//!   (the prompt). Q2_K and Q3_K go through the host.
+//!
+//! A pass can be recorded once as a CUDA graph and replayed
+//! ([`kapel_ops::Record`]): its buffers stay with the graph, and no other
+//! thread may use the backend while it records.
 //!
 //! The whole catalogue conforms in `f32`, `bf16` and `f16`, and the models of
-//! `kapel-models` run on the card (`tests/parity.rs`, `examples/prefill.rs`).
+//! `kapel-models` run on the card (`tests/parity.rs`, `tests/recorded.rs`,
+//! `examples/prefill.rs`, `examples/decode.rs`, `examples/quantized.rs`).
 //!
 //! Each kernel gives the same bits on every run: one thread, or one tile block,
 //! computes each output, adding its terms in a fixed order, without atomics.
@@ -28,7 +41,13 @@ mod attention;
 #[cfg(feature = "cuda")]
 mod device;
 #[cfg(feature = "cuda")]
+mod graph;
+#[cfg(feature = "cuda")]
 mod ops;
+#[cfg(feature = "cuda")]
+mod paged;
+#[cfg(feature = "cuda")]
+mod quantized;
 mod signatures;
 #[cfg(feature = "cuda")]
 mod tile;
@@ -45,6 +64,8 @@ mod tests {
     use super::*;
 
     fn cuda() -> Cuda {
+        // Outputs left partly unwritten give NaN, and fail.
+        Cuda::poison_buffers(true);
         Cuda::new(0).expect("a CUDA device")
     }
 

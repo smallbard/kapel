@@ -73,6 +73,7 @@ mod lines;
 pub mod math;
 mod matmul;
 mod norm;
+mod paged;
 pub mod pool;
 mod quantized;
 mod reduce;

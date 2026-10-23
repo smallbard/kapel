@@ -1,6 +1,6 @@
 # 7. The CUDA backend: kapel-cuda
 
-`kapel-cuda` runs the catalogue on NVIDIA GPUs. It is written entirely in Rust, host and device alike, with two families of kernels: simple *thread kernels*, one thread per element or per line, for everything but products and attention; and *tile kernels*, compiled from Rust by cutile-rs, for matrix products and FlashAttention. On an RTX 3090, bf16 products reach 69 Top/s at 4096³, and attention 44 to 51 Top/s forward and 37 to 41 backward.
+`kapel-cuda` runs the catalogue on NVIDIA GPUs. It is written entirely in Rust, host and device alike, with two families of kernels: *thread kernels*, one thread, warp or block per element, row or chunk, for everything but dense products and prompt attention; and *tile kernels*, compiled from Rust by cutile-rs, for matrix products and FlashAttention. Generation adds three pieces on top: attention over a cache kept by pages, products that read quantized weights in place, and passes recorded once as CUDA graphs and replayed. On an RTX 3090, bf16 products reach 69 Top/s at 4096³, attention 44 to 51 Top/s forward and 37 to 41 backward, and Llama 3.2 3B in bf16 decodes at 105 tokens per second for one sequence and 3330 for 64 together, 90 % of vLLM.
 
 ## 7.1 Two toolchains, one stable build
 
@@ -9,8 +9,8 @@
 | Tool | cuda-oxide (`cargo oxide`) | cutile-rs |
 | Source | `kernels/src/lib.rs`, a separate crate on a pinned nightly | `tile.rs` and `attention.rs` inside the backend |
 | Compiled | ahead of time to PTX, checked in as `kernels.ptx` | at first launch by `tileiras`, then cached in `~/.cache/cutile/kernels` |
-| Covers | copies, conversions, element-wise, reductions, softmax, norms, RoPE, gathers | matrix products, attention forward and backward |
-| Arithmetic | f32; 16-bit inputs are widened, then rounded back | f32, bf16, f16, with f32 accumulators |
+| Covers | copies, conversions, element-wise, reductions, softmax, norms, RoPE, gathers, paged attention, quantized products | matrix products, attention forward and backward |
+| Arithmetic | f32; 16-bit and 8-bit values are widened in registers, then rounded back | f32, bf16, f16, with f32 accumulators |
 
 The split exists because the published crates must build on stable Rust, and cuda-oxide needs a nightly compiler. The kernels crate is therefore kept outside the workspace and compiled by `kernels/build.sh`; the backend embeds the result with `include_str!("../kernels.ptx")` and loads it at startup. Tile kernels need CUDA 13.2 or later on the machine.
 
@@ -26,7 +26,9 @@ Opening a backend creates a context and one stream, loads the PTX module, and pr
 
 **Cached tables.** Reductions, softmax, max and RoPE need small index tables derived from shapes. Uploading from ordinary host memory waits for the stream, so these tables are cached on the device, up to 64 MiB, with oldest-first eviction.
 
-**What waits.** Most operations return as soon as their kernels are queued. The exceptions are `download` and `upload`, the first use of a shape by an operation that needs a table, and the operations that still go through the host: gathers and scatters (their row lists), casts to or from non-float types, quantized products and gathers from quantized tables (dequantized on the host for now), and attention masks that are not `f32`.
+**Host mirrors.** An upload of at most 1 MiB keeps a copy of its bytes on the host, next to the device buffer. Token ids, positions and page tables are such uploads, and an operation that needs their values on the host (the rows of a scatter, the prompts of a paged attention) reads the copy instead of waiting for the stream. A gather reads its row indices in place on the device when they are contiguous `u32` or `i32`. A kernel that writes into a storage drops its mirror.
+
+**What waits.** Most operations return as soon as their kernels are queued. The exceptions are `download` and `upload`, the first use of a shape by an operation that needs a table, index tensors made on the device and then needed on the host, and the operations that still go through the host: casts to or from non-float types, products and gathers by weights in Q2_K or Q3_K (dequantized on the host), and attention masks that are not `f32`.
 
 ## 7.3 Launching a thread kernel
 
@@ -34,7 +36,7 @@ Kernels are loaded by name at run time, so nothing checks at compile time that a
 
 ```rust
 // signatures.rs: every kernel and its parameters, as the host sees them
-const KERNELS: &[(&str, &[Param])] = &[ ("affine", &[F32, F32, Slice, Slice]), /* … 29 kernels */ ];
+const KERNELS: &[(&str, &[Param])] = &[ ("affine", &[F32, F32, Slice, Slice]), /* … 58 kernels */ ];
 ```
 
 Arguments are built with a small `Args` builder (`.u32()`, `.f32()`, `.slice()`, `.view()`), and `launch` checks them against the table before anything is queued. It also refuses more than 2³² threads or a slice longer than 2³² elements with `Overflow`, because kernels index in 32 bits. A host-only test parses the `.entry` declarations of the checked-in PTX and compares them with the table, so a kernel changed without updating the host fails the ordinary test suite on every platform. In CI, the GPU job also rebuilds the PTX and fails if it differs from the checked-in file.
@@ -47,7 +49,7 @@ pub struct View { pub shape: [u32; 8], pub strides: [u32; 8], pub offset: u32 } 
 // View::at(flat) turns a row-major index into a storage position; a stride of 0 broadcasts
 ```
 
-Operation codes such as `unary::EXP` are plain `u32` constants rather than enums, because an unknown value must not be undefined behaviour: kernels return NaN for a code they do not know.
+Operation codes such as `unary::EXP` are plain `u32` constants rather than enums, because an unknown value must not be undefined behaviour: kernels return NaN for a code they do not know. The same goes for types: `float::F32`, `BF16`, `F16`, `F8E4M3` and `F8E5M2`, and the quantized formats in `quant`, are codes that a kernel decodes per element.
 
 ## 7.4 The thread kernels
 
@@ -56,16 +58,21 @@ The kernels follow two rules from their module documentation: no two threads wri
 | Kernels | Role |
 | --- | --- |
 | `copy_view_*`, `copy_into_*` | strided copies by element size; `Contiguous` and `Concat` |
-| `widen_16`, `narrow_16` | bf16 and f16 to f32 and back, bit-exact with the host, NaN made quiet |
+| `widen_16`, `narrow_16`, `widen_8`, `narrow_8` | bf16, f16, f8 E4M3 and E5M2 to f32 and back, bit-exact with the host, NaN made quiet |
 | `unary_forward`, `unary_backward`, `affine`, `binary_forward`, `binary_backward` | element-wise operations through broadcast views |
+| `unary_any`, `affine_any`, `binary_any`, `glu_any`, `glu_backward` | the same, and `Glu`, reading and writing one type, 16-bit included |
 | `reduce_sum`, `spread` | sums and means, terms added in order, and their backward |
 | `line_max`, `place` | maximum with its first position, and its backward |
 | `softmax_lines`, `softmax_lines_backward` | one thread per line, softmax or log-softmax |
 | `norm_rows`, `norm_rows_backward`, `column_sum` | LayerNorm and RMSNorm, one warp per row, weight gradients summed in order |
-| `rope_table`, `rope` | angles in f64, then the rotation |
-| `gather_rows`, `scatter_rows` | row gather, and a scatter-add that sums each target row's sources in order of appearance |
+| `norm_any`, `norm_block_any`, `norm_16` | norms in the rows' own type; `norm_16`, one block per row in 128-bit loads, up to 8192 columns |
+| `rope_table`, `rope`, `rope_any` | angles in f64, then the rotation, in f32 or in the rows' type |
+| `gather_rows`, `scatter_rows`, `write_rows_any` | row gather, a scatter-add that sums each target row's sources in order of appearance, and rows written in place |
+| `argmax_rows`, `argmax_parts`, `argmax_merge` | the largest value of each row, NaN ignored, for long rows in parts then merged |
+| `paged_attention`, `paged_attention_16`, `paged_combine` | attention over a cache by pages (section 7.7) |
+| `qgemv`, `qgemv_*`, `dequantize`, `dequantize_rows` | products and gathers by quantized weights (section 7.9) |
 
-Only products and attention compute in the inputs' 16-bit type. Every other operation goes through a macro, `in_f32!`, that widens the inputs, computes in f32 and rounds the output, and each gradient, back to the right type.
+Backward passes, and forward passes in types without a kernel of their own, go through a macro, `in_f32!`, that widens the inputs, computes in f32 and rounds the output, and each gradient, back to the right type. The forward operations of a decoding step have a second branch, `native:`, taken when every input has the output's type: element-wise operations, norms, RoPE, `Glu` and row writes then read and write bf16 or f16 directly, computing each element in f32 in registers, with the same rounding. A 16-bit model thus never writes an f32 copy of its activations: at one token, those copies cost more than the products.
 
 ## 7.5 Tiled products
 
@@ -77,7 +84,19 @@ for i in 0i32..num_tiles(&part_x, 2) { /* load tx, ty */ acc = mma(tx, ty, acc);
 let out: Tile<E, { [BM, BN] }> = convert_tile(acc);
 ```
 
-Out-of-bounds loads read zeros and out-of-bounds stores are dropped, so tile sizes need not divide the problem. Operands are read in place through their strides. Tile sizes come from a sweep on the RTX 3090: two blocks of 128 × 64 × 32 per multiprocessor reach 70 Top/s at 4096³, against 53 for one block of 128 × 64 × 64, and neighbouring choices can be three times slower.
+Out-of-bounds loads read zeros and out-of-bounds stores are dropped, so tile sizes need not divide the problem. Operands are read in place through their strides. The weights of a linear layer are stored `[N, K]` and multiplied transposed; reading them through swapped strides is five times slower, so a second kernel, `batched_matmul_nt`, loads each tile of `[N, K]` along `K`, its contiguous dimension, and transposes it in registers.
+
+Tile sizes depend on the number of rows `m`, from sweeps on the RTX 3090 (`tiles_for` in `tile.rs`):
+
+| Rows `m` (16-bit) | Tile `BM × BN × BK` | Blocks per multiprocessor |
+| --- | --- | --- |
+| ≤ 16, `n` ≤ 1024 | 16 × 32 × 256 | 4 |
+| ≤ 16 | 16 × 64 × 128 | default |
+| ≤ 32 | 32 × 64 × 128 | 2 |
+| ≤ 256 | 64 × 64 × 64 | 2 |
+| more | 64 × 128 × 32 | 2 |
+
+Few rows (decoding) read the weights once each in long, thin tiles, and are limited by bandwidth: at one row, the products of Llama 3.2 3B take 7.9 ms per token, 92 % of the card's measured bandwidth. Many rows are limited by arithmetic: 60 to 70 Top/s, against 53 for one block of 128 × 64 × 64; neighbouring choices can be three times slower. f32 uses 64 × 64 × 32.
 
 ## 7.6 FlashAttention 2
 
@@ -108,6 +127,50 @@ Because each output is written by exactly one tile block, adding its terms in a 
 
 These are the best of a sweep on the RTX 3090, causal, from 1 to 4 thousand positions; neighbouring choices can be up to six times slower.
 
-## 7.7 Testing on the card
+## 7.7 Paged attention
 
-The GPU tests run the conformity suite in `f32`, `bf16` and `f16`, plus targeted tests: every one of the 65,536 bf16 and f16 bit patterns converted exactly as the host converts them; attention over many tiles with windows, masks, softcaps and grouped heads, run twice to check identical bits; extreme masks; norms with bf16 weights; one backend per device; and refused 32-bit overflows. A parity test runs whole models on the card and compares their logits with `transformers`: within 2e-5 in `f32`, and in `bf16` within twice the CPU's own `bf16` error.
+Generation keeps the keys and values of every sequence in two tables `[L, Hkv, D]`, cut into pages of 16 lines; each sequence has a list of pages (see chapter 10). `PagedAttention` takes the new queries `[R, Hq, D]`, the tables, the page lists `[S, P]` and, for each query, its sequence and the number of positions it sees. New keys and values are first written into their lines by `Write::write_rows`, in place.
+
+The kernel `paged_attention_16` reads bf16, f16 or f8 caches; `paged_attention` is the generic version, for f32 and the other cases. Each tile block takes up to four query heads of one key head, for one query and one *chunk* of positions; the lanes of a warp each read a key or a value in one load of 128 or 64 bits, keeping the queries in registers. f8 values go through a lookup table shared by the block. Every chunk writes its own maximum, sum and partial output, and `paged_combine` adds the chunks in order, as FlashAttention adds its tiles.
+
+The chunk length depends on the shape alone, never on the data: positions are cut so that a launch has about `BLOCKS` = 164 tile blocks per 256 positions, two per multiprocessor, down to chunks of 32. A query with fewer positions than its chunks leaves the last ones empty, and they return at once. With many sequences, each query already fills the card and a chunk covers a whole sequence; with one, its positions are spread over the card.
+
+Paged kernels read each query's keys apart, which is cheap for a token but grows as the square of a long prompt. A sequence with at least `PREFILL_QUERIES` = 384 consecutive queries is therefore handled by FlashAttention 2: its keys are gathered from the pages into a contiguous tensor, attention runs causally from the first query's position, and the result is placed into the output rows. A prompt of 4096 tokens of Llama 3.2 3B takes 0.76 s this way, against 1.5 s through the paged kernels.
+
+## 7.8 Recorded passes
+
+At one token, a model is a few hundred small kernels, and launching them costs as much as running them. `Record::record` runs a pass while the backend's stream is captured, in *relaxed* mode, and instantiates the CUDA graph it gives; `Recording::replay` then launches every kernel of the pass in one call to the driver (`graph.rs`).
+
+A replay writes into the very buffers of the recorded pass, so these must not go back to the pool. While recording, the backend allocates from an `Arena` instead: buffers freed during the pass are reused by its next operations, as the pool does, and those in use at the end stay the recording's until it is dropped. Inputs are replaced between replays by `Write::copy_from_host`, which copies new bytes into the same buffer.
+
+A recorded pass must not wait for the device or copy from the host, since nothing runs during capture. The first pass of a shape is therefore run once before it is recorded: its tile kernels are compiled and its tables made. Rotary angle tables are cached by the bytes of their positions, and kept with the recording, so that the layers of a pass share one table, computed once per replay. Host mirrors (section 7.2) give index values without waiting.
+
+The stream is the device's only one, so while a pass records, no other thread may use the backend: its work would be recorded too. The tests of `tests/recorded.rs` take a lock for this, and check that replays give the bits of eager steps, that a recording changes nothing around it, and that a replay takes new inputs.
+
+## 7.9 Quantized products
+
+Products by quantized weights read the codes on the card (`quantized.rs`). For at most 8 rows of activations, the decoding case, one warp computes one weight row: each lane decodes eight weights at a time, takes the scale of each block out of the sum (`a · Σ q·x + b · Σ x`), and the lanes' sums are added by a fixed butterfly. The generic kernel `qgemv` decodes any format through its code; int8, int4, Q8_0, Q4_K and Q6_K have kernels of their own (`qgemv_int8`, `qgemv_q4k`, …), with aligned loads and activations read in 128-bit loads, and a `_1` variant for one row. Several weights that read the same input, stacked by the model, are computed in one call, each into its columns.
+
+For more rows, the prompt, pieces of at most 32 MiB of weights are dequantized into the activations' type by `dequantize` and multiplied by the tiled product. Rows of quantized embedding tables are dequantized on the card by `dequantize_rows`. Q2_K and Q3_K have no kernels and go through the host.
+
+## 7.10 Performance
+
+Measured on an RTX 3090 with Llama 3.2 3B in bf16, 128 tokens of prompt and 256 generated, against vLLM 0.32 on the same random prompts (`tools/parity/README.md`):
+
+| Measure | Kapel | Reference |
+| --- | --- | --- |
+| 64 sequences | 3328 tokens/s | vLLM 3710 (90 %) |
+| one sequence | 105 tokens/s (110 in decoding) | vLLM 108.5 |
+| bandwidth, one sequence | 720 GB/s | 81 % of the 885 GB/s a copy reaches |
+| prompt of 4096 tokens | 0.76 s | |
+| f8 E4M3 cache, 64 sequences | 3331 tokens/s | same as bf16 |
+
+Llama 3.2 1B decodes at 425 tokens per second in Q4_K_M, 412 in Q8_0 and 272 in bf16; Llama 3.2 3B at 166 in int8 and 179 in int4.
+
+The limits are known. At one sequence, products alone reach 92 % of the bandwidth, but the small kernels between them (norms, RoPE, cache writes, attention) take the rest of the time. Quantized weights with 9 to a few hundred rows of activations are dequantized at every pass. 4-bit formats are limited by the instructions that decode them, not by bandwidth, and `qgemv` with 2 to 8 rows is slower than it should be.
+
+## 7.11 Testing on the card
+
+The GPU tests run the conformity suite in `f32`, `bf16` and `f16`, plus targeted tests: every one of the 65,536 bf16 and f16 bit patterns converted exactly as the host converts them; attention over many tiles with windows, masks, softcaps and grouped heads, run twice to check identical bits; extreme masks; norms with bf16 weights; one backend per device; refused 32-bit overflows. The conformity suite also covers paged attention, row writes and `ArgMax`, with caches in every float type. These tests call `Cuda::poison_buffers(true)`, which fills every new buffer with NaN, so that an output left partly unwritten fails instead of passing by luck. A parity test runs whole models on the card and compares their logits with `transformers`: within 2e-5 in `f32`, and in `bf16` within twice the CPU's own `bf16` error. Others check that a batch of sequences gives the logits of each one alone, that fused projections change nothing, and that quantized models predict on the card as on the processor.
+
+Two examples measure the products of decoding: `examples/decode.rs` for bf16, against a plain copy, and `examples/quantized.rs` for each quantized format, both reporting the bandwidth reached on the weights.

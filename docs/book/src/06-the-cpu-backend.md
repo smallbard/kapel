@@ -1,6 +1,6 @@
 # 6. The CPU backend: kapel-cpu
 
-`kapel-cpu` runs the whole catalogue on x86 processors with AVX-512 or AVX2, and on any other target with portable code that the compiler vectorizes. It computes in `f32`; inputs may be `f32`, `bf16` or `f16`, and outputs take the input type. `f64` is left to the reference. Most of the speed comes from four pieces: a deterministic thread pool, a blocked matrix product in the style of BLIS, vectorized row functions, and products by quantized weights that read the codes in place. Most of the safety comes from one small type, `Isa`.
+`kapel-cpu` runs the whole catalogue on x86 processors with AVX-512 or AVX2, and on any other target with portable code that the compiler vectorizes. It computes in `f32`; inputs may be `f32`, `bf16` or `f16` (and a cache of keys and values `f8` too), and outputs take the input type. `f64` is left to the reference. Most of the speed comes from four pieces: a deterministic thread pool, a blocked matrix product in the style of BLIS, vectorized row functions, and products by quantized weights that read the codes in place. Most of the safety comes from one small type, `Isa`.
 
 ## 6.1 The backend value
 
@@ -84,6 +84,8 @@ The C block stays in registers for a whole `kc` slice and is written once at the
 
 `math.rs` holds the row functions: `dot`, `sum`, `max`, `scale`, `axpy`, `exp` and the activation functions. Each works in packets of 16 lanes and combines its partial sums pairwise in a fixed order, so the same row gives the same bits. The exponential is Cephes's algorithm: reduce x to n · ln 2 + r with a two-part ln 2, evaluate a degree-7 polynomial, and build 2ⁿ directly in the exponent bits. Tests hold it within two ulps over \[−87, 87\]. The bits of 2ⁿ come from adding 1.5 · 2²³ to n, which puts n in the low bits of the mantissa: a conversion `n as i32` gives the same bits, but Rust's conversion saturates, and that kept the compiler from vectorizing the loop. The trick made the exponential, and SiLU and softmax with it, 3.7 times faster.
 
+`Glu` computes `f(gate) · up` in one pass over each row, the gate the first half of the row, and `ArgMax` scans each line for its first maximum, skipping NaN.
+
 Binary operations on two inputs of the output's shape, the residual sums and gated products of a model, take a direct loop; the others compute the broadcast offsets of each input.
 
 Sums and means are cut into blocks of 1,024 elements, summed with `math::sum`, then combined pairwise, so the error grows with the logarithm of the length. Blocks of all outputs are spread over the threads, so one huge sum uses every core: 16 million elements went from 64 ms to 0.8 ms when this was introduced, and became far more accurate.
@@ -95,6 +97,10 @@ Softmax subtracts the row maximum, computes `exp(x − max)` and its sum in one 
 The CPU attention is not FlashAttention. For a block of 128 query rows, it computes the full score matrix with the product, applies the scale, softcap, mask and visibility rules, then a row softmax, and multiplies by V. A task owns a batch, a key head and a query block, and loops over the query heads that share that key head, so keys and values stay in cache.
 
 The backward computes `∂v += Pᵀg`, `∂P = g·vᵀ`, `∂S = P ⊙ (∂P − rowsum(∂P ⊙ P))`, then `∂q` and `∂k` from ∂S. Query blocks write partial `∂k` and `∂v` buffers that are added in block order. A row with no visible key gives zeros, but a row with a NaN score gives NaN: a NaN must never be hidden.
+
+**Over pages.** `PagedAttention` reads a cache that may be large and mostly unused by the step. A task is one sequence, one key head and a block of up to 32 of that sequence's queries: it gathers the lines the block sees through the page table, converts them to `f32` once, then computes each query's scores with `math::dot`, their softmax and the weighted sum of the values with `math::axpy`. Each output row belongs to one task and adds its terms in position order, so the result does not depend on the threads. The cache may be in `f32`, `bf16`, `f16`, `f8e4m3` or `f8e5m2`; an 8-bit value is decoded through a table of its 256 byte values, built once.
+
+**Writing the cache.** `write_rows` writes into the host storage of the table, its only handle. Rows of the table's own type are copied as bytes, row by row; others are converted, `f32` and `bf16` directly and the other types, `f8` included, by `DType::encode`. `Record` records nothing on the processor: each operation is computed when it is called, so a pass is simply run.
 
 ## 6.7 Quantized products
 

@@ -33,9 +33,10 @@ use std::panic::{self, AssertUnwindSafe};
 
 use kapel_core::{DType, Result, Tensor};
 use kapel_ops::{
-    Affine, Attention, Backend, Binary, BinaryKind, Cast, Concat, Contiguous, GatherRows,
-    LayerNorm, LogSoftmax, Matmul, Max, Mean, Operation, QuantizedMatmul, RmsNorm, Rope,
-    RopeLayout, RopeScaling, Run, ScatterAddRows, Softmax, Sum, Transfer, Unary, UnaryKind,
+    Affine, ArgMax, Attention, Backend, Binary, BinaryKind, Cast, Concat, Contiguous, GatherRows,
+    Glu, LayerNorm, LogSoftmax, Matmul, Max, Mean, Operation, PagedAttention, QuantizedMatmul,
+    RmsNorm, Rope, RopeLayout, RopeScaling, Run, ScatterAddRows, Softmax, Sum, Transfer, Unary,
+    UnaryKind, WRITE_ROWS, Write,
 };
 
 use crate::Reference;
@@ -70,14 +71,16 @@ pub fn tolerance(dtype: DType) -> f64 {
 }
 
 /// Runs every case on `backend`, computing in `dtype`, and returns the failures.
-pub fn check<B: Backend + Transfer>(backend: &B, dtype: DType) -> Vec<Failure> {
+pub fn check<B: Backend + Transfer + Write>(backend: &B, dtype: DType) -> Vec<Failure> {
     let mut visitor = Conformity {
         backend,
         dtype,
         failures: Vec::new(),
     };
     cases(&mut visitor, dtype);
-    visitor.failures
+    let mut failures = visitor.failures;
+    failures.extend(write_failures(backend, dtype));
+    failures
 }
 
 /// Runs every case on `backend`, computing in `dtype`, and panics with the list
@@ -86,7 +89,7 @@ pub fn check<B: Backend + Transfer>(backend: &B, dtype: DType) -> Vec<Failure> {
 /// # Panics
 ///
 /// If a case fails.
-pub fn assert_conforms<B: Backend + Transfer>(backend: &B, dtype: DType) {
+pub fn assert_conforms<B: Backend + Transfer + Write>(backend: &B, dtype: DType) {
     let failures = check(backend, dtype);
     assert!(
         failures.is_empty(),
@@ -687,6 +690,83 @@ fn cases<V: Visitor>(v: &mut V, dtype: DType) {
     empty_cases(v, rng, dtype);
     strided_cases(v, rng, dtype);
     masked_attention_cases(v, rng, dtype);
+    paged_cases(v, rng, dtype);
+    glu_cases(v, rng, dtype);
+    argmax_cases(v, rng, dtype);
+}
+
+/// Positions of maxima: along the last dimension and another, with ties
+/// (values rounded to the type), and lines with NaN.
+fn argmax_cases<V: Visitor>(v: &mut V, rng: &mut Rng, dtype: DType) {
+    let last = ArgMax {
+        dim: 1,
+        keepdim: false,
+    };
+    let rounded = |rng: &mut Rng, shape: &[usize]| {
+        let x = random(rng, shape, DType::F64, -4.0, 4.0);
+        let values: Vec<f64> = x
+            .to_f64_vec()
+            .expect("host")
+            .iter()
+            .map(|v| v.round())
+            .collect();
+        let x = Tensor::from_slice(&values, shape).expect("sizes agree");
+        Run::<Cast>::forward(&Reference, &Cast { dtype }, &[&x]).expect("a float type")
+    };
+    v.visit(
+        &last,
+        "rows of 300, ties".into(),
+        vec![plain(rounded(rng, &[5, 300]))],
+    );
+    v.visit(
+        &ArgMax {
+            dim: 0,
+            keepdim: true,
+        },
+        "columns, kept".into(),
+        vec![plain(rounded(rng, &[7, 4]))],
+    );
+    let nan = f32::NAN;
+    let x = Tensor::from_slice(
+        &[
+            nan,
+            1.0,
+            3.0,
+            3.0,
+            nan,
+            nan,
+            nan,
+            nan,
+            f32::NEG_INFINITY,
+            nan,
+            f32::NEG_INFINITY,
+            -1.0,
+        ],
+        &[3, 4],
+    )
+    .expect("sizes agree");
+    v.visit(&last, "NaN, −∞ and ties".into(), vec![plain(x)]);
+}
+
+/// Gated units: SiLU and GELU gates, rows of several widths, a strided input.
+fn glu_cases<V: Visitor>(v: &mut V, rng: &mut Rng, dtype: DType) {
+    let x = |rng: &mut Rng, shape: &[usize]| random(rng, shape, dtype, -2.0, 2.0);
+    let silu = Glu {
+        activation: UnaryKind::Silu,
+    };
+    v.visit(&silu, "SiLU, [3, 10]".into(), vec![plain(x(rng, &[3, 10]))]);
+    v.visit(
+        &Glu {
+            activation: UnaryKind::GeluTanh,
+        },
+        "GELU, [2, 3, 8]".into(),
+        vec![plain(x(rng, &[2, 3, 8]))],
+    );
+    v.visit(
+        &silu,
+        "SiLU, transposed input".into(),
+        vec![transposed(x(rng, &[6, 4]))],
+    );
 }
 
 /// Cases with a dimension of size 0: the results are empty, or zeros where
@@ -1243,4 +1323,236 @@ impl Visitor for FiniteDifferences {
                 message,
             }));
     }
+}
+
+/// Attention over pages: one sequence decoding, several sequences with
+/// several queries each (a prompt after a cache), a window, a softcap, a
+/// query that sees nothing, strided queries, and a cache of another type
+/// than the queries.
+fn paged_cases<V: Visitor>(v: &mut V, rng: &mut Rng, dtype: DType) {
+    let x = |rng: &mut Rng, shape: &[usize], dtype: DType| random(rng, shape, dtype, -1.0, 1.0);
+    let table = |values: &[u32], shape: &[usize]| {
+        plain(Tensor::from_slice(values, shape).expect("sizes agree"))
+    };
+    // Pages of 4 lines, 6 pages: 24 lines, 2 key heads of 8.
+    let (lines, hkv, d) = (24, 2, 8);
+    let cache = |rng: &mut Rng, dtype: DType| {
+        vec![
+            plain(x(rng, &[lines, hkv, d], dtype)),
+            plain(x(rng, &[lines, hkv, d], dtype)),
+        ]
+    };
+    let paged = PagedAttention::new(4);
+    let mut args = vec![plain(x(rng, &[1, 4, d], dtype))];
+    args.extend(cache(rng, dtype));
+    args.push(table(&[5, 0, 3], &[1, 3]));
+    args.push(table(&[0, 10], &[1, 2]));
+    v.visit(&paged, "one sequence decoding, 10 positions".into(), args);
+
+    // Sequence 0 on pages 1, 4; sequence 1 on pages 2, 0, 5. Three queries of
+    // sequence 1 (a prompt after 4 cached positions), two of sequence 0.
+    let pages = [1, 4, 0, 2, 0, 5];
+    let rows = [1, 5, 0, 7, 1, 6, 1, 7, 0, 8];
+    let several = |rng: &mut Rng, q: Arg, dtype_cache: DType| {
+        let mut args = vec![q];
+        args.extend(cache(rng, dtype_cache));
+        args.push(table(&pages, &[2, 3]));
+        args.push(table(&rows, &[5, 2]));
+        args
+    };
+    let q = plain(x(rng, &[5, 6, d], dtype));
+    v.visit(
+        &paged,
+        "two sequences, five queries".into(),
+        several(rng, q, dtype),
+    );
+    let windowed = PagedAttention {
+        window: Some(3),
+        softcap: Some(2.0),
+        scale: Some(0.7),
+        ..paged
+    };
+    let q = plain(x(rng, &[5, 6, d], dtype));
+    v.visit(
+        &windowed,
+        "window of 3, scores capped at 2, scale 0.7".into(),
+        several(rng, q, dtype),
+    );
+    // Queries narrowed out of a wider projection, as from a fused one.
+    let q = viewed(
+        x(rng, &[5, 10, d], dtype),
+        View::Narrow {
+            dim: 1,
+            start: 2,
+            len: 6,
+        },
+    );
+    v.visit(&paged, "strided queries".into(), several(rng, q, dtype));
+    let q = plain(x(rng, &[5, 6, d], dtype));
+    let other = if dtype == DType::F16 {
+        DType::BF16
+    } else {
+        DType::F16
+    };
+    v.visit(
+        &paged,
+        format!("a cache in {other}"),
+        several(rng, q, other),
+    );
+    let mut args = vec![plain(x(rng, &[2, 2, d], dtype))];
+    args.extend(cache(rng, dtype));
+    args.push(table(&[3, 1], &[1, 2]));
+    args.push(table(&[0, 0, 0, 3], &[2, 2]));
+    v.visit(&paged, "a query that sees nothing".into(), args);
+
+    // The widths of real heads, a long sequence (cut into several chunks by
+    // a backend), and a short one: pages of 16, in a shuffled order.
+    for (d, hq, window) in [(64, 6, None), (128, 8, Some(100)), (128, 16, None)] {
+        let lines = 40 * 16;
+        let pages: Vec<u32> = (0..40).map(|p| (p * 7) % 40).collect();
+        let rows = [0, 300, 1, 5, 1, 6];
+        let wide = PagedAttention {
+            window,
+            ..PagedAttention::new(16)
+        };
+        let mut args = vec![plain(x(rng, &[3, hq, d], dtype))];
+        args.push(plain(x(rng, &[lines, 2, d], dtype)));
+        args.push(plain(x(rng, &[lines, 2, d], dtype)));
+        args.push(table(&pages, &[2, 20]));
+        args.push(table(&rows, &[3, 2]));
+        v.visit(
+            &wide,
+            format!("heads of {d}, {hq} queries for 2 keys, 300 positions, window {window:?}"),
+            args,
+        );
+    }
+
+    // Caches of 8-bit floats, with heads of 64.
+    for cache_dtype in [DType::F8E4M3, DType::F8E5M2] {
+        let lines = 10 * 16;
+        let pages: Vec<u32> = (0..10).rev().collect();
+        let rows = [0, 70, 1, 9, 0, 71];
+        let mut args = vec![plain(x(rng, &[3, 6, 64], dtype))];
+        args.push(plain(x(rng, &[lines, 3, 64], cache_dtype)));
+        args.push(plain(x(rng, &[lines, 3, 64], cache_dtype)));
+        args.push(table(&pages, &[2, 5]));
+        args.push(table(&rows, &[3, 2]));
+        v.visit(
+            &PagedAttention::new(16),
+            format!("a cache in {cache_dtype}, heads of 64"),
+            args,
+        );
+    }
+
+    // A prompt of 400 positions after 10 cached ones (a backend may compute
+    // it apart, as a prefill), then a query of another sequence decoding.
+    for window in [None, Some(170)] {
+        let lines = 52 * 16;
+        let pages: Vec<u32> = (0..52).map(|p| (p * 5) % 52).collect();
+        let mut rows: Vec<u32> = (0..400).flat_map(|i| [0, 11 + i]).collect();
+        rows.extend([1, 9]);
+        let prompt = PagedAttention {
+            window,
+            ..PagedAttention::new(16)
+        };
+        let mut args = vec![plain(x(rng, &[401, 4, 64], dtype))];
+        args.push(plain(x(rng, &[lines, 2, 64], dtype)));
+        args.push(plain(x(rng, &[lines, 2, 64], dtype)));
+        args.push(table(&pages, &[2, 26]));
+        args.push(table(&rows, &[401, 2]));
+        v.visit(
+            &prompt,
+            format!("a prompt of 400 after 10 positions, and a query decoding, window {window:?}"),
+            args,
+        );
+    }
+}
+
+/// Rows written in place, compared to the reference, and the calls that must
+/// be refused.
+fn write_failures<B: Write + Transfer>(backend: &B, dtype: DType) -> Vec<Failure> {
+    let mut failures = Vec::new();
+    let mut fail = |case: &str, message: String| {
+        failures.push(Failure {
+            op: WRITE_ROWS,
+            case: case.into(),
+            message,
+        });
+    };
+    let mut rng = Rng::new(11);
+    let rows = random(&mut rng, &[3, 2, 4], dtype, -1.0, 1.0);
+    let index = Tensor::from_slice(&[4u32, 0, 2], &[3]).expect("sizes agree");
+    for table_dtype in [dtype, DType::F16, DType::F8E4M3] {
+        let case = format!("3 rows of {dtype} into 5 rows of {table_dtype}");
+        let outcome = (|| -> Result<Option<String>> {
+            let mut expected = Write::zeros(&Reference, &[5, 2, 4], table_dtype)?;
+            Reference.write_rows(&mut expected, &index, &rows)?;
+            let mut table = backend.zeros(&[5, 2, 4], table_dtype)?;
+            backend.write_rows(
+                &mut table,
+                &backend.upload(&index)?,
+                &backend.upload(&rows)?,
+            )?;
+            let got = backend.download(&table)?;
+            if got.dtype() != table_dtype {
+                return Ok(Some(format!(
+                    "type {}, expected {table_dtype}",
+                    got.dtype()
+                )));
+            }
+            // Conversions are exact: the same bits.
+            Ok((got.to_f64_vec()? != expected.to_f64_vec()?)
+                .then(|| "the table differs from the reference".to_string()))
+        })();
+        match outcome {
+            Ok(None) => {}
+            Ok(Some(message)) => fail(&case, message),
+            Err(error) => fail(&case, error.to_string()),
+        }
+    }
+    let refused = |what: &str, call: &dyn Fn() -> Result<()>| match call() {
+        Ok(()) => Some(format!("{what} was accepted")),
+        Err(_) => None,
+    };
+    let upload = |t: &Tensor| backend.upload(t).expect("an upload");
+    type Check<'a> = (&'a str, Box<dyn Fn() -> Result<()> + 'a>);
+    let checks: [Check<'_>; 4] = [
+        (
+            "a row out of range",
+            Box::new(|| {
+                let mut table = backend.zeros(&[5, 2, 4], dtype)?;
+                let index = Tensor::from_slice(&[4u32, 5, 2], &[3])?;
+                backend.write_rows(&mut table, &upload(&index), &upload(&rows))
+            }),
+        ),
+        (
+            "a row written twice",
+            Box::new(|| {
+                let mut table = backend.zeros(&[5, 2, 4], dtype)?;
+                let index = Tensor::from_slice(&[1u32, 3, 1], &[3])?;
+                backend.write_rows(&mut table, &upload(&index), &upload(&rows))
+            }),
+        ),
+        (
+            "a shared table",
+            Box::new(|| {
+                let mut table = backend.zeros(&[5, 2, 4], dtype)?;
+                let _view = table.clone();
+                backend.write_rows(&mut table, &upload(&index), &upload(&rows))
+            }),
+        ),
+        (
+            "rows of another width",
+            Box::new(|| {
+                let mut table = backend.zeros(&[5, 2, 3], dtype)?;
+                backend.write_rows(&mut table, &upload(&index), &upload(&rows))
+            }),
+        ),
+    ];
+    for (what, call) in &checks {
+        if let Some(message) = refused(what, call.as_ref()) {
+            fail(what, message);
+        }
+    }
+    failures
 }

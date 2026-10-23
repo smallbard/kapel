@@ -19,10 +19,16 @@
 //! # Ok::<(), kapel_infer::InferError>(())
 //! ```
 //!
+//! [`Pipeline::batch`] generates for many requests together: a [`Batch`]
+//! computes one token of every unfinished request at each step, their prompts
+//! first, in one cache by pages. On the card, each step is a recorded pass
+//! replayed, and greedy choices are made on the device.
+//!
 //! Choices follow `transformers`: greedy decoding gives the tokens it gives,
 //! and sampling applies the same filters in the same order ([`Sampling`]),
 //! with its own random generator, the same on every machine.
 
+mod batch;
 mod generate;
 mod gguf;
 mod sampling;
@@ -30,6 +36,7 @@ mod text;
 
 use std::fmt;
 
+pub use batch::Batch;
 pub use generate::{Finish, Generation, LoadOptions, Piece, Pipeline, Request};
 pub use sampling::Sampling;
 

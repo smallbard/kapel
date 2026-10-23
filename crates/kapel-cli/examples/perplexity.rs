@@ -6,7 +6,8 @@
 //!
 //! `cargo run --release -p kapel-cli --example perplexity -- MODEL TEXT
 //! [--ctx 512] [--chunks N] [--batch 16] [--byte-activations]
-//! [--quantize int8|int4|q8_0|q4_0] [--quantize-output]`
+//! [--quantize int8|int4|q8_0|q4_0] [--quantize-output]
+//! [--kv-cache f16|bf16|f8e4m3|f8e5m2]`
 //!
 //! `TEXT` is a text file, such as `wiki.test.raw` of wikitext-2 (see
 //! `tools/parity/README.md`).
@@ -20,7 +21,8 @@ use kapel_models::Cache;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let usage = "usage: perplexity MODEL TEXT [--ctx 512] [--chunks N] [--batch 16] \
-                 [--byte-activations] [--quantize int8|int4|q8_0|q4_0] [--quantize-output]";
+                 [--byte-activations] [--quantize int8|int4|q8_0|q4_0] [--quantize-output] \
+                 [--kv-cache f16|bf16|f8e4m3|f8e5m2]";
     let mut options = kapel_infer::LoadOptions {
         dtype: Some(DType::F32),
         ..Default::default()
@@ -42,6 +44,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         if arg == "--quantize-output" {
             options.quantize_output = true;
+            continue;
+        }
+        if arg == "--kv-cache" {
+            options.cache_dtype = Some(match args.next().as_deref() {
+                Some("f16") => DType::F16,
+                Some("bf16") => DType::BF16,
+                Some("f8e4m3") => DType::F8E4M3,
+                Some("f8e5m2") => DType::F8E5M2,
+                _ => return Err(usage.into()),
+            });
             continue;
         }
         let mut value =
@@ -77,7 +89,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(bos) = bos {
             ids[0] = bos;
         }
-        let mut cache = Cache::new();
+        let mut cache = match options.cache_dtype {
+            Some(dtype) => Cache::with_dtype(dtype),
+            None => Cache::new(),
+        };
         for (piece, part) in ids.chunks(batch).enumerate() {
             let logits = pipeline.model().extend(&cpu, part, &mut cache)?;
             let values = logits.to_f64_vec()?;

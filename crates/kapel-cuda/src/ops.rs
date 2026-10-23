@@ -16,12 +16,14 @@ use std::sync::Arc;
 use kapel_core::{DType, Error, HostStorage, Layout, Result, Tensor};
 use kapel_cuda_abi::{binary, unary};
 use kapel_ops::{
-    Affine, Attention, Binary, BinaryKind, Cast, Concat, Contiguous, GatherRows, LayerNorm,
-    LogSoftmax, Matmul, Max, Mean, Operation, QuantizedMatmul, RmsNorm, Rope, RopeLayout, Run,
-    ScatterAddRows, Softmax, Sum, Transfer, Unary, UnaryKind,
+    Affine, ArgMax, Attention, Binary, BinaryKind, Cast, Concat, Contiguous, GatherRows, Glu,
+    LayerNorm, LogSoftmax, Matmul, Max, Mean, Operation, QuantizedMatmul, RmsNorm, Rope,
+    RopeLayout, Run, ScatterAddRows, Softmax, Sum, Transfer, Unary, UnaryKind,
 };
 
-use crate::device::{Args, Cuda, CudaStorage, Flat, Table, small, smalls, view_of};
+use crate::device::{
+    Args, Cuda, CudaStorage, Flat, FloatArg, Table, float_code, small, smalls, view_of,
+};
 
 fn unary_code(op: &'static str, kind: UnaryKind) -> Result<u32> {
     Ok(match kind {
@@ -204,9 +206,22 @@ impl Cuda {
 
     /// Index values (`u32` or `i32`), read back to the host and each checked
     /// against `size`.
-    fn indices(&self, op: &'static str, tensor: &Tensor, size: usize) -> Result<Vec<usize>> {
-        self.download(tensor)?
-            .to_f64_vec()?
+    pub(crate) fn indices(
+        &self,
+        op: &'static str,
+        tensor: &Tensor,
+        size: usize,
+    ) -> Result<Vec<usize>> {
+        let host = match self.storage(op, tensor)?.host() {
+            // Uploaded from the host, and kept there: no need to wait.
+            Some(bytes) => Tensor::from_storage(
+                Arc::new(HostStorage::from_bytes(bytes)),
+                tensor.layout().clone(),
+                tensor.dtype(),
+            )?,
+            None => self.download(tensor)?,
+        };
+        host.to_f64_vec()?
             .into_iter()
             .map(|v| {
                 let index = v as i64;
@@ -216,6 +231,25 @@ impl Cuda {
                     .ok_or(Error::IndexOutOfRange { op, index, size })
             })
             .collect()
+    }
+
+    /// The rows of a gather on the device, as a pointer to `u32` values: those
+    /// of `index` in place when it holds them in row-major order (`u32`, or
+    /// `i32` checked non-negative: the same bits), otherwise `rows`
+    /// uploaded. The storage returned keeps them alive.
+    pub(crate) fn row_list(
+        &self,
+        op: &'static str,
+        index: &Tensor,
+        rows: &[usize],
+    ) -> Result<(u64, Arc<dyn kapel_core::Storage>)> {
+        if index.is_contiguous() && matches!(index.dtype(), DType::U32 | DType::I32) {
+            let storage = self.storage(op, index)?;
+            let pointer = storage.pointer() + index.layout().offset() as u64 * 4;
+            return Ok((pointer, Arc::clone(index.storage())));
+        }
+        let uploaded = self.upload_u32(&smalls(op, rows)?)?;
+        Ok((uploaded.pointer(), Arc::new(uploaded)))
     }
 
     /// A tensor's exact values, read back to the host.
@@ -290,24 +324,26 @@ impl Cuda {
         })
     }
 
-    /// `out[i] = src[rows[i]]`, rows of the given width.
+    /// `out[i] = src[rows[i]]`, rows of the given width; `rows` are the
+    /// values of `index`, checked.
     fn gather(
         &self,
         op: &'static str,
         src: &Tensor,
+        index: &Tensor,
         rows: &[usize],
         width: usize,
         shape: &[usize],
     ) -> Result<Tensor> {
         let src = self.flat(op, src)?;
-        let r = self.upload_u32(&smalls(op, rows)?)?;
+        let (r, _keep) = self.row_list(op, index, rows)?;
         self.output(shape, false, |out, n| {
             self.launch(
                 "gather_rows",
                 n,
                 Args::new()
                     .flat(&src)
-                    .list(&r, rows.len())
+                    .slice(r, rows.len())
                     .u32(small(op, width)?)
                     .slice(out, n),
             )
@@ -337,8 +373,12 @@ impl Cuda {
 
 /// [`Run`] for operations computed in `f32`: inputs widened, the output
 /// rounded to the type of its signature, and each gradient to its input's.
+/// The operations listed after `native:` compute their forward pass from
+/// inputs of any float type directly ([`Native`]), without widening them
+/// first: one kernel instead of three.
 macro_rules! in_f32 {
-    ($($op:ty),* $(,)?) => {$(
+    ($($op:ty),* $(,)?; native: $($native:ty),* $(,)?) => {
+        $(
         impl Run<$op> for Cuda {
             fn forward(&self, op: &$op, inputs: &[&Tensor]) -> Result<Tensor> {
                 let name = <$op>::NAME;
@@ -349,43 +389,188 @@ macro_rules! in_f32 {
                 self.narrowed(name, &y, dtype)
             }
 
-            fn backward(
-                &self,
-                op: &$op,
-                inputs: &[&Tensor],
-                grad: &Tensor,
-            ) -> Result<Vec<Option<Tensor>>> {
-                let name = <$op>::NAME;
-                op.infer_backward(inputs, grad)?;
-                let wide = self.widened_all(name, inputs)?;
-                let wide: Vec<&Tensor> = wide.iter().collect();
-                let g = self.widened(name, grad)?;
-                let grads = InF32::<$op>::backward_f32(self, op, &wide, &g)?;
-                grads
-                    .into_iter()
-                    .zip(inputs)
-                    .map(|(g, x)| g.map(|g| self.narrowed(name, &g, x.dtype())).transpose())
-                    .collect()
-            }
+            in_f32!(@backward $op);
         }
-    )*};
+        )*
+        $(
+        impl Run<$native> for Cuda {
+            fn forward(&self, op: &$native, inputs: &[&Tensor]) -> Result<Tensor> {
+                Native::<$native>::forward_native(self, op, inputs)
+            }
+
+            in_f32!(@backward $native);
+        }
+        )*
+    };
+    (@backward $op:ty) => {
+        fn backward(
+            &self,
+            op: &$op,
+            inputs: &[&Tensor],
+            grad: &Tensor,
+        ) -> Result<Vec<Option<Tensor>>> {
+            let name = <$op>::NAME;
+            op.infer_backward(inputs, grad)?;
+            let wide = self.widened_all(name, inputs)?;
+            let wide: Vec<&Tensor> = wide.iter().collect();
+            let g = self.widened(name, grad)?;
+            let grads = InF32::<$op>::backward_f32(self, op, &wide, &g)?;
+            grads
+                .into_iter()
+                .zip(inputs)
+                .map(|(g, x)| g.map(|g| self.narrowed(name, &g, x.dtype())).transpose())
+                .collect()
+        }
+    };
+}
+
+/// An operation whose forward pass reads and writes `f32`, `bf16` and `f16`
+/// directly, computing in `f32`: the same values as widening the inputs,
+/// computing in `f32` and rounding the result, in one kernel.
+trait Native<O> {
+    fn forward_native(&self, op: &O, inputs: &[&Tensor]) -> Result<Tensor>;
 }
 
 in_f32!(
-    Unary,
-    Affine,
-    Binary,
-    QuantizedMatmul,
     Sum,
     Mean,
     Max,
     Softmax,
     LogSoftmax,
+    ScatterAddRows;
+    native: Unary,
+    QuantizedMatmul,
+    Glu,
+    Affine,
+    Binary,
     LayerNorm,
     RmsNorm,
     Rope,
-    ScatterAddRows,
 );
+
+impl Native<Unary> for Cuda {
+    fn forward_native(&self, op: &Unary, inputs: &[&Tensor]) -> Result<Tensor> {
+        let name = Unary::NAME;
+        let signature = op.infer(inputs)?;
+        let code = unary_code(name, op.kind)?;
+        let x = self.float_arg(name, inputs[0], inputs[0].layout())?;
+        let ko = float_code(name, signature.dtype)?;
+        self.output_as(&signature.shape, signature.dtype, false, |out, n| {
+            self.launch(
+                "unary_any",
+                n,
+                Args::new()
+                    .u32(code)
+                    .float(&x)
+                    .u32(ko)
+                    .slice(out, signature.dtype.storage_bytes(n)?),
+            )
+        })
+    }
+}
+
+impl Native<Glu> for Cuda {
+    fn forward_native(&self, op: &Glu, inputs: &[&Tensor]) -> Result<Tensor> {
+        let name = Glu::NAME;
+        let signature = op.infer(inputs)?;
+        let code = unary_code(name, op.activation)?;
+        let x = self.contiguous_any(name, inputs[0])?;
+        let xa = self.float_arg(name, &x, x.layout())?;
+        let n = *signature.shape.last().expect("rank checked");
+        let ko = float_code(name, signature.dtype)?;
+        self.output_as(&signature.shape, signature.dtype, false, |out, count| {
+            self.launch(
+                "glu_any",
+                count,
+                Args::new()
+                    .u32(code)
+                    .u32(xa.code)
+                    .slice(xa.base, xa.bytes)
+                    .u32(small(name, n)?)
+                    .u32(ko)
+                    .slice(out, signature.dtype.storage_bytes(count)?),
+            )
+        })
+    }
+}
+
+impl InF32<Glu> for Cuda {
+    fn forward_f32(&self, op: &Glu, inputs: &[&Tensor]) -> Result<Tensor> {
+        self.forward_native(op, inputs)
+    }
+
+    fn backward_f32(
+        &self,
+        op: &Glu,
+        inputs: &[&Tensor],
+        grad: &Tensor,
+    ) -> Result<Vec<Option<Tensor>>> {
+        let name = Glu::NAME;
+        let signature = op.infer_backward(inputs, grad)?;
+        let code = unary_code(name, op.activation)?;
+        let x = self.flat(name, inputs[0])?;
+        let g = self.flat(name, grad)?;
+        let n = *signature.shape.last().expect("rank checked");
+        let out = self.output(inputs[0].shape(), false, |out, count| {
+            self.launch(
+                "glu_backward",
+                count,
+                Args::new()
+                    .u32(code)
+                    .flat(&x)
+                    .flat(&g)
+                    .u32(small(name, n)?)
+                    .slice(out, count),
+            )
+        })?;
+        Ok(vec![Some(out)])
+    }
+}
+
+impl Native<Affine> for Cuda {
+    fn forward_native(&self, op: &Affine, inputs: &[&Tensor]) -> Result<Tensor> {
+        let name = Affine::NAME;
+        let signature = op.infer(inputs)?;
+        let x = self.float_arg(name, inputs[0], inputs[0].layout())?;
+        let ko = float_code(name, signature.dtype)?;
+        self.output_as(&signature.shape, signature.dtype, false, |out, n| {
+            self.launch(
+                "affine_any",
+                n,
+                Args::new()
+                    .f32(op.scale as f32)
+                    .f32(op.bias as f32)
+                    .float(&x)
+                    .u32(ko)
+                    .slice(out, signature.dtype.storage_bytes(n)?),
+            )
+        })
+    }
+}
+
+impl Native<Binary> for Cuda {
+    fn forward_native(&self, op: &Binary, inputs: &[&Tensor]) -> Result<Tensor> {
+        let name = Binary::NAME;
+        let signature = op.infer(inputs)?;
+        let code = binary_code(name, op.kind)?;
+        let shape = &signature.shape;
+        let a = self.float_arg(name, inputs[0], &inputs[0].layout().broadcast_to(shape)?)?;
+        let b = self.float_arg(name, inputs[1], &inputs[1].layout().broadcast_to(shape)?)?;
+        let ko = float_code(name, signature.dtype)?;
+        self.output_as(shape, signature.dtype, false, |out, n| {
+            self.launch(
+                "binary_any",
+                n,
+                Args::new()
+                    .u32(code)
+                    .float(&a)
+                    .float(&b)
+                    .u32(ko)
+                    .slice(out, signature.dtype.storage_bytes(n)?),
+            )
+        })
+    }
+}
 
 impl InF32<Unary> for Cuda {
     fn forward_f32(&self, op: &Unary, inputs: &[&Tensor]) -> Result<Tensor> {
@@ -703,6 +888,24 @@ fn leading(shape: &[usize]) -> usize {
     shape[..shape.len().saturating_sub(1)].iter().product()
 }
 
+impl Native<QuantizedMatmul> for Cuda {
+    /// On the device for the formats with kernels; through the host (the
+    /// weights dequantized there) for the others.
+    fn forward_native(&self, op: &QuantizedMatmul, inputs: &[&Tensor]) -> Result<Tensor> {
+        let name = QuantizedMatmul::NAME;
+        let signature = op.infer(inputs)?;
+        if let Some(y) =
+            self.quantized_product(inputs[0], &inputs[1..], &signature.shape, signature.dtype)?
+        {
+            return Ok(y);
+        }
+        let wide = self.widened_all(name, inputs)?;
+        let wide: Vec<&Tensor> = wide.iter().collect();
+        let y = InF32::<QuantizedMatmul>::forward_f32(self, op, &wide)?;
+        self.narrowed(name, &y, signature.dtype)
+    }
+}
+
 impl InF32<QuantizedMatmul> for Cuda {
     /// The weights are dequantized on the host, then multiplied. Kernels that
     /// read the codes directly come with the inference engine.
@@ -997,6 +1200,105 @@ impl Cuda {
         }
     }
 
+    /// A normalization's weight or bias, of any float type, as a kernel
+    /// argument; `default` everywhere (an `f32` table) without one.
+    fn norm_vector_any(
+        &self,
+        op: &'static str,
+        vector: Option<&Tensor>,
+        width: usize,
+        default: f32,
+    ) -> Result<(FloatArg, Tensor)> {
+        let tensor = match vector {
+            Some(v) => self.contiguous_any(op, v)?,
+            None => self.filled(op, default, &[width])?,
+        };
+        let arg = self.float_arg(op, &tensor, &Layout::contiguous(tensor.shape())?)?;
+        Ok((arg, tensor))
+    }
+
+    /// A tensor of this backend, of any type, with its elements in row-major
+    /// order from the start of its storage: itself if it already is,
+    /// otherwise a copy.
+    fn contiguous_any(&self, op: &'static str, x: &Tensor) -> Result<Tensor> {
+        if x.is_contiguous() && x.layout().offset() == 0 {
+            self.storage(op, x)?;
+            return Ok(x.clone());
+        }
+        self.materialize(op, x, x.layout())
+    }
+
+    /// The forward pass of a normalization, its operands of any float types,
+    /// its output of `dtype`: one warp per row, or one block of 256 threads
+    /// per row when rows are wide.
+    fn norm_native(&self, norm: &Norm<'_>, x: &Tensor, dtype: DType) -> Result<Tensor> {
+        let op = norm.op;
+        let shape = x.shape().to_vec();
+        let width = *shape.last().expect("checked by infer");
+        let rows = x.numel() / width.max(1);
+        let x = self.contiguous_any(op, x)?;
+        let xa = self.float_arg(op, &x, &Layout::contiguous(x.shape())?)?;
+        let (w, _keep_w) = self.norm_vector_any(op, norm.weight, width, norm.default_weight)?;
+        let (b, _keep_b) = self.norm_vector_any(op, norm.bias, width, 0.0)?;
+        let ko = float_code(op, dtype)?;
+        // Wide rows whose operands share one type: one block per row.
+        let block = (512..=8192).contains(&width)
+            && norm.weight.is_some()
+            && w.code == xa.code
+            && ko == xa.code
+            && norm.bias.is_none_or(|_| b.code == xa.code);
+        let half = matches!(dtype, DType::BF16 | DType::F16) && width.is_multiple_of(8);
+        let (kernel, threads, first, types) = if block && half {
+            // 16-byte pieces of 16-bit values, in pairs.
+            let flags = norm.rms | u32::from(norm.bias.is_some()) << 1;
+            let kind = if dtype == DType::BF16 {
+                kapel_cuda_abi::half::BF16
+            } else {
+                kapel_cuda_abi::half::F16
+            };
+            let threads = rows.checked_mul(256).ok_or(Error::Overflow { op })?;
+            return self.output_as(&shape, dtype, false, |out, n| {
+                self.launch(
+                    "norm_16",
+                    threads,
+                    Args::new()
+                        .u32(flags)
+                        .u32(kind)
+                        .slice(xa.base, xa.bytes / 4)
+                        .slice(w.base, w.bytes / 4)
+                        .slice(b.base, b.bytes / 4)
+                        .f32(norm.offset)
+                        .f32(norm.eps)
+                        .u32(small(op, width)?)
+                        .slice(out, dtype.storage_bytes(n)? / 4),
+                )
+            });
+        } else if block {
+            let flags = norm.rms | u32::from(norm.bias.is_some()) << 1;
+            ("norm_block_any", rows.checked_mul(256), flags, xa.code)
+        } else {
+            let types = xa.code | w.code << 8 | b.code << 16 | ko << 24;
+            ("norm_any", rows.checked_mul(32), norm.rms, types)
+        };
+        let threads = threads.ok_or(Error::Overflow { op })?;
+        self.output_as(&shape, dtype, false, |out, n| {
+            self.launch(
+                kernel,
+                threads,
+                Args::new()
+                    .u32(first)
+                    .u32(types)
+                    .slice(xa.base, xa.bytes)
+                    .slice(w.base, w.bytes)
+                    .slice(b.base, b.bytes)
+                    .f32(norm.offset)
+                    .f32(norm.eps)
+                    .u32(small(op, width)?)
+                    .slice(out, dtype.storage_bytes(n)?),
+            )
+        })
+    }
+
     fn norm_forward(&self, norm: &Norm<'_>, x: &Tensor) -> Result<Tensor> {
         let op = norm.op;
         let shape = x.shape().to_vec();
@@ -1071,6 +1373,20 @@ impl Cuda {
     }
 }
 
+impl Native<LayerNorm> for Cuda {
+    fn forward_native(&self, op: &LayerNorm, inputs: &[&Tensor]) -> Result<Tensor> {
+        let dtype = op.infer(inputs)?.dtype;
+        self.norm_native(&layer_norm(op, inputs), inputs[0], dtype)
+    }
+}
+
+impl Native<RmsNorm> for Cuda {
+    fn forward_native(&self, op: &RmsNorm, inputs: &[&Tensor]) -> Result<Tensor> {
+        let dtype = op.infer(inputs)?.dtype;
+        self.norm_native(&rms_norm(op, inputs), inputs[0], dtype)
+    }
+}
+
 impl InF32<LayerNorm> for Cuda {
     fn forward_f32(&self, op: &LayerNorm, inputs: &[&Tensor]) -> Result<Tensor> {
         op.infer(inputs)?;
@@ -1142,6 +1458,78 @@ impl InF32<RmsNorm> for Cuda {
     }
 }
 
+impl Run<ArgMax> for Cuda {
+    /// Rows along the last dimension, one block each; another dimension is
+    /// first moved last.
+    fn forward(&self, op: &ArgMax, inputs: &[&Tensor]) -> Result<Tensor> {
+        let name = ArgMax::NAME;
+        let signature = op.infer(inputs)?;
+        let x = inputs[0];
+        let last = x.rank() - 1;
+        let moved = if op.dim == last {
+            x.clone()
+        } else {
+            x.transpose(op.dim, last)?
+        };
+        let rows = self.contiguous_any(name, &moved)?;
+        let width = rows.shape()[last];
+        let xa = self.float_arg(name, &rows, rows.layout())?;
+        let count = rows.numel() / width;
+        // Long rows (a vocabulary) in parts, merged after: few rows would
+        // otherwise leave the device to a few blocks.
+        let parts = (width / 4096).clamp(1, 128);
+        if parts > 1 {
+            let values = self.alloc(count * parts * 4, false)?;
+            let at = self.alloc(count * parts * 4, false)?;
+            self.launch(
+                "argmax_parts",
+                (count * parts)
+                    .checked_mul(256)
+                    .ok_or(Error::Overflow { op: name })?,
+                Args::new()
+                    .u32(xa.code)
+                    .slice(xa.base, xa.bytes)
+                    .u32(small(name, width)?)
+                    .u32(small(name, parts)?)
+                    .list(&values, count * parts)
+                    .list(&at, count * parts),
+            )?;
+            return self.output_as(&signature.shape, DType::U32, false, |out, n| {
+                self.launch(
+                    "argmax_merge",
+                    n,
+                    Args::new()
+                        .u32(small(name, parts)?)
+                        .list(&values, count * parts)
+                        .list(&at, count * parts)
+                        .slice(out, n),
+                )
+            });
+        }
+        self.output_as(&signature.shape, DType::U32, false, |out, n| {
+            self.launch(
+                "argmax_rows",
+                count.checked_mul(256).ok_or(Error::Overflow { op: name })?,
+                Args::new()
+                    .u32(xa.code)
+                    .slice(xa.base, xa.bytes)
+                    .u32(small(name, width)?)
+                    .slice(out, n),
+            )
+        })
+    }
+
+    fn backward(
+        &self,
+        op: &ArgMax,
+        inputs: &[&Tensor],
+        grad: &Tensor,
+    ) -> Result<Vec<Option<Tensor>>> {
+        op.infer_backward(inputs, grad)?;
+        Ok(vec![None])
+    }
+}
+
 impl Run<Attention> for Cuda {
     fn forward(&self, op: &Attention, inputs: &[&Tensor]) -> Result<Tensor> {
         op.infer(inputs)?;
@@ -1171,7 +1559,17 @@ impl Cuda {
     /// The angles are computed in `f64` (`rope_table`), once per position
     /// entry: positions in the hundreds of thousands times a frequency near 1
     /// would lose their phase in `f32`.
-    fn rope(&self, op: &Rope, x: &Tensor, positions: &Tensor, direction: f64) -> Result<Tensor> {
+    /// Rotary embeddings of `x`, of any float type read through its layout,
+    /// as a row-major tensor of `dtype`; `direction` −1 turns back (the
+    /// gradient).
+    fn rope(
+        &self,
+        op: &Rope,
+        x: &Tensor,
+        positions: &Tensor,
+        direction: f64,
+        dtype: DType,
+    ) -> Result<Tensor> {
         let name = Rope::NAME;
         let shape = x.shape().to_vec();
         let d = *shape.last().expect("checked by infer");
@@ -1182,6 +1580,7 @@ impl Cuda {
             .map(f64::to_bits)
             .collect();
         let key: Vec<usize> = constants.iter().map(|&c| c as usize).collect();
+        let key_constants = constants.clone();
         let constants = self.table("rope constants", &key, || {
             Ok(constants
                 .iter()
@@ -1189,22 +1588,55 @@ impl Cuda {
                 .collect())
         })?;
         let signed = u32::from(positions.dtype() == DType::I32);
-        let positions = self.materialize(name, positions, positions.layout())?;
+        let positions = if positions.is_contiguous() {
+            positions.clone()
+        } else {
+            self.materialize(name, positions, positions.layout())?
+        };
         let entries = positions.numel();
-        let p = self.storage(name, &positions)?;
+        let storage = self.storage(name, &positions)?;
+        let p = storage.pointer() + positions.layout().offset() as u64 * 4;
         let half = r / 2;
-        let table = self.output(&[entries * half * 2], false, |out, n| {
-            self.launch(
-                "rope_table",
-                entries * half,
-                Args::new()
-                    .list(p, entries)
-                    .u32(signed)
-                    .slice(constants.storage.pointer(), half + 1)
-                    .f32(direction as f32)
-                    .slice(out, n),
-            )
-        })?;
+        let compute = || {
+            self.output(&[entries * half * 2], false, |out, n| {
+                self.launch(
+                    "rope_table",
+                    entries * half,
+                    Args::new()
+                        .slice(p, entries)
+                        .u32(signed)
+                        .slice(constants.storage.pointer(), half + 1)
+                        .f32(direction as f32)
+                        .slice(out, n),
+                )
+            })
+        };
+        // The positions known on the host (an upload): the angles of the
+        // same positions and constants are computed once, for every layer.
+        let mut recorded_key = (storage.pointer() + positions.layout().offset() as u64 * 4)
+            .to_le_bytes()
+            .to_vec();
+        recorded_key.extend((entries as u64).to_le_bytes());
+        recorded_key.extend(direction.to_bits().to_le_bytes());
+        for &c in &key_constants {
+            recorded_key.extend(c.to_le_bytes());
+        }
+        let table = match storage.host() {
+            // While recording, the same positions' storage gives the same
+            // angles at every replay: computed once per pass.
+            _ if self.arena().is_some() => self.recorded_angles(recorded_key, compute)?,
+            Some(bytes) => {
+                let start = positions.layout().offset() * 4;
+                let mut key: Vec<u8> = bytes[start..start + entries * 4].to_vec();
+                key.extend(direction.to_bits().to_le_bytes());
+                key.push(signed as u8);
+                for &c in &key_constants {
+                    key.extend(c.to_le_bytes());
+                }
+                self.angles(key, compute)?
+            }
+            None => compute()?,
+        };
         let vectors = &shape[..shape.len() - 1];
         let entry = self.table(
             "rope entries",
@@ -1217,30 +1649,39 @@ impl Cuda {
                 smalls(name, &entry_of)
             },
         )?;
-        let x = self.flat(name, x)?;
+        let x = self.float_arg(name, x, x.layout())?;
         let table = self.flat(name, &table)?;
         let half_pairs = u32::from(op.layout == RopeLayout::Half);
-        self.output(&shape, false, |out, n| {
+        let ko = float_code(name, dtype)?;
+        self.output_as(&shape, dtype, false, |out, n| {
             self.launch(
-                "rope",
+                "rope_any",
                 n,
                 Args::new()
-                    .flat(&x)
+                    .float(&x)
                     .flat(&table)
                     .table(&entry)
                     .u32(small(name, d)?)
                     .u32(small(name, r)?)
                     .u32(half_pairs)
-                    .slice(out, n),
+                    .u32(ko)
+                    .slice(out, dtype.storage_bytes(n)?),
             )
         })
+    }
+}
+
+impl Native<Rope> for Cuda {
+    fn forward_native(&self, op: &Rope, inputs: &[&Tensor]) -> Result<Tensor> {
+        let dtype = op.infer(inputs)?.dtype;
+        self.rope(op, inputs[0], inputs[1], 1.0, dtype)
     }
 }
 
 impl InF32<Rope> for Cuda {
     fn forward_f32(&self, op: &Rope, inputs: &[&Tensor]) -> Result<Tensor> {
         op.infer(inputs)?;
-        self.rope(op, inputs[0], inputs[1], 1.0)
+        self.rope(op, inputs[0], inputs[1], 1.0, DType::F32)
     }
 
     fn backward_f32(
@@ -1250,7 +1691,10 @@ impl InF32<Rope> for Cuda {
         grad: &Tensor,
     ) -> Result<Vec<Option<Tensor>>> {
         op.infer_backward(inputs, grad)?;
-        Ok(vec![Some(self.rope(op, grad, inputs[1], -1.0)?), None])
+        Ok(vec![
+            Some(self.rope(op, grad, inputs[1], -1.0, DType::F32)?),
+            None,
+        ])
     }
 }
 
@@ -1263,14 +1707,21 @@ impl Run<GatherRows> for Cuda {
         let rows = self.indices(name, inputs[1], shape[0])?;
         let width = shape[1..].iter().product();
         match inputs[0].dtype() {
-            DType::BF16 | DType::F16 => self.gather_16(inputs[0], &rows, width, &signature),
+            DType::BF16 | DType::F16 => {
+                self.gather_16(inputs[0], inputs[1], &rows, width, &signature)
+            }
             // A quantized table is dequantized on the host, whole: kernels
             // that read the codes come with the products by quantized weights.
             dtype if dtype.is_quantized() => {
+                if let Some(y) =
+                    self.quantized_rows(inputs[0], inputs[1], &rows, &signature.shape)?
+                {
+                    return Ok(y);
+                }
                 let table = self.dequantized(inputs[0])?;
-                self.gather(name, &table, &rows, width, &signature.shape)
+                self.gather(name, &table, inputs[1], &rows, width, &signature.shape)
             }
-            _ => self.gather(name, inputs[0], &rows, width, &signature.shape),
+            _ => self.gather(name, inputs[0], inputs[1], &rows, width, &signature.shape),
         }
     }
 
@@ -1301,6 +1752,7 @@ impl Cuda {
     fn gather_16(
         &self,
         src: &Tensor,
+        index: &Tensor,
         rows: &[usize],
         width: usize,
         signature: &kapel_ops::Signature,
@@ -1314,14 +1766,14 @@ impl Cuda {
         let storage = self.storage(op, &src)?;
         let start = src.layout().offset();
         let pointer = storage.pointer() + start as u64 * 2;
-        let r = self.upload_u32(&smalls(op, rows)?)?;
+        let (r, _keep) = self.row_list(op, index, rows)?;
         self.output_as(&signature.shape, signature.dtype, false, |out, n| {
             self.launch(
                 "gather_rows_16",
                 n,
                 Args::new()
                     .slice(pointer, src.numel())
-                    .list(&r, rows.len())
+                    .slice(r, rows.len())
                     .u32(small(op, width)?)
                     .slice(out, n),
             )
@@ -1351,7 +1803,14 @@ impl InF32<ScatterAddRows> for Cuda {
         let signature = op.infer_backward(inputs, grad)?;
         let rows = self.indices(ScatterAddRows::NAME, inputs[1], op.rows)?;
         let width = signature.shape[1..].iter().product();
-        let out = self.gather(ScatterAddRows::NAME, grad, &rows, width, inputs[0].shape())?;
+        let out = self.gather(
+            ScatterAddRows::NAME,
+            grad,
+            inputs[1],
+            &rows,
+            width,
+            inputs[0].shape(),
+        )?;
         Ok(vec![Some(out), None])
     }
 }

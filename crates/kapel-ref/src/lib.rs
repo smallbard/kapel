@@ -32,6 +32,7 @@ mod golden;
 mod index;
 mod matmul;
 mod norm;
+pub(crate) mod paged;
 mod reduce;
 mod rng;
 mod rope;
@@ -151,6 +152,7 @@ mod tests {
     }
 
     delegate!(
+        kapel_ops::Glu,
         kapel_ops::Binary,
         kapel_ops::Affine,
         kapel_ops::Cast,
@@ -161,15 +163,44 @@ mod tests {
         kapel_ops::Sum,
         kapel_ops::Mean,
         kapel_ops::Max,
+        kapel_ops::ArgMax,
         Softmax,
         kapel_ops::LogSoftmax,
         kapel_ops::LayerNorm,
         kapel_ops::RmsNorm,
         Attention,
+        kapel_ops::PagedAttention,
         Rope,
         kapel_ops::GatherRows,
         kapel_ops::ScatterAddRows
     );
+
+    impl kapel_ops::Write for Typed {
+        fn zeros(&self, shape: &[usize], dtype: DType) -> Result<Tensor> {
+            kapel_ops::Write::zeros(&Reference, shape, dtype)
+        }
+
+        fn write_rows(&self, table: &mut Tensor, index: &Tensor, rows: &Tensor) -> Result<()> {
+            Reference.write_rows(table, index, rows)
+        }
+
+        fn copy_from_host(&self, target: &mut Tensor, values: &Tensor) -> Result<()> {
+            Reference.copy_from_host(target, values)
+        }
+    }
+
+    impl kapel_ops::Record for Typed {
+        fn records(&self) -> bool {
+            false
+        }
+
+        fn record(
+            &self,
+            pass: &mut dyn FnMut() -> Result<Tensor>,
+        ) -> Result<Option<kapel_ops::Recording>> {
+            Reference.record(pass)
+        }
+    }
 
     impl Run<kapel_ops::Unary> for Typed {
         fn forward(&self, op: &kapel_ops::Unary, inputs: &[&Tensor]) -> Result<Tensor> {

@@ -68,6 +68,31 @@ llama-perplexity -m Llama-3.2-1B-Instruct-Q4_K_M.gguf \
     -f wikitext-2-raw/wiki.test.raw -c 512 --chunks 20
 ```
 
+The cache's type changes the score a little (`--kv-cache f16|f8e4m3|f8e5m2`). Over 20
+chunks with Llama 3.2 1B in Q4_K_M: 16.206 in `f16`, as in `f32`, 16.264 in `f8e4m3`
+and 16.586 in `f8e5m2`.
+
+## Throughput against vLLM
+
+The example `throughput` of kapel-cli measures generation by batches as
+`vllm bench throughput` does with random prompts: every prompt has the same length,
+every answer as many tokens, the end tokens ignored. Both read the same model
+directory in `bf16`.
+
+```
+cargo run --release -p kapel-cli --features cuda --example throughput -- \
+    MODEL_DIR --device cuda --sequences 64 --input 128 --output 256
+vllm bench throughput --model MODEL_DIR --dtype bfloat16 --dataset-name random \
+    --random-input-len 128 --random-output-len 256 --random-range-ratio 0 \
+    --num-prompts 64 --max-num-seqs 64 --max-model-len 2048 \
+    --gpu-memory-utilization 0.85
+```
+
+Compare Kapel's "generated tokens/s overall" with vLLM's output tokens per second,
+each the best of three runs on a card that nothing else uses. With Llama 3.2 3B on
+an RTX 3090 (vLLM 0.32): 3328 against 3710 for 64 sequences, 105 against 108.5 for
+one.
+
 ## Commands
 
 ```

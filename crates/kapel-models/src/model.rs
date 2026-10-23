@@ -5,11 +5,13 @@ use std::collections::BTreeMap;
 use kapel_core::{DType, Tensor};
 use kapel_hub::Checkpoint;
 use kapel_ops::{
-    Affine, Attention, Backend, Binary, BinaryKind, Cast, Concat, Contiguous, GatherRows,
-    LayerNorm, Matmul, QuantizedMatmul, RmsNorm, Rope, Transfer, Unary, UnaryKind,
+    Affine, Attention, Backend, Binary, BinaryKind, Cast, Concat, Contiguous, GatherRows, Glu,
+    LayerNorm, Matmul, PagedAttention, QuantizedMatmul, Recording, RmsNorm, Rope, Transfer, Unary,
+    UnaryKind,
 };
 
 use crate::ModelError;
+use crate::cache::{KvCache, PAGE, SequenceId, Step};
 use crate::config::{Block, Config, Norm};
 
 /// A model: its configuration and its weights, by their names in the checkpoint.
@@ -22,38 +24,135 @@ pub struct Model {
 
 type Result<T> = std::result::Result<T, ModelError>;
 
-/// The keys and values of the positions a model has already seen, layer by
-/// layer, on the backend of the steps that filled them: what lets
-/// [`Model::step`] compute only the new positions.
-#[derive(Clone, Debug, Default)]
+/// The keys and values of the positions a model has already seen, for one
+/// sequence: what lets [`Model::step`] compute only the new positions. A
+/// [`KvCache`] that holds one sequence, and grows with it.
+#[derive(Debug)]
 pub struct Cache {
-    /// Per layer, the keys and values `[1, kv_heads, len, head_dim]`.
-    layers: Vec<Option<(Tensor, Tensor)>>,
-    len: usize,
+    inner: KvCache,
+    id: SequenceId,
 }
 
 impl Cache {
     /// An empty cache.
     pub fn new() -> Self {
-        Self::default()
+        let mut inner = KvCache::new();
+        let id = inner.add_sequence();
+        Self { inner, id }
+    }
+
+    /// An empty cache whose tables are of type `dtype` (see
+    /// [`KvCache::with_dtype`]).
+    pub fn with_dtype(dtype: DType) -> Self {
+        let mut inner = KvCache::new().with_dtype(dtype);
+        let id = inner.add_sequence();
+        Self { inner, id }
     }
 
     /// The number of positions it holds.
     pub fn len(&self) -> usize {
-        self.len
+        self.inner.len(self.id)
     }
 
     /// Whether it holds no position.
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.len() == 0
+    }
+
+    /// The next token after `token`, the last one given, through a recorded
+    /// pass ([`Model::record_step`], [`Model::replay_step`]): `recorded`
+    /// holds the recording, made or made again when needed. The logits `[1,
+    /// vocab]`, or `None` for a backend that does not record; nothing is
+    /// computed then.
+    ///
+    /// # Errors
+    ///
+    /// As [`Model::step`].
+    pub fn recorded_step<B: Backend + Transfer>(
+        &mut self,
+        model: &Model,
+        backend: &B,
+        recorded: &mut Option<RecordedStep>,
+        token: u32,
+    ) -> Result<Option<Tensor>> {
+        if let Some(step) = recorded
+            && let Some(logits) = model.replay_step(backend, &mut self.inner, step, &[token])?
+        {
+            return Ok(Some(logits));
+        }
+        let made = model.record_step(backend, &mut self.inner, &[(self.id, token)], ROOM)?;
+        let (step, logits) = match made {
+            Some((step, logits)) => (Some(step), Some(logits)),
+            None => (None, None),
+        };
+        *recorded = step;
+        Ok(logits)
+    }
+
+    /// Brings it back to its first `len` positions (see
+    /// [`KvCache::truncate`]).
+    ///
+    /// # Panics
+    ///
+    /// If it holds fewer than `len` positions.
+    pub fn truncate(&mut self, len: usize) {
+        self.inner.truncate(self.id, len);
+    }
+}
+
+impl Default for Cache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The positions a recorded step has room for, beyond the one it computes,
+/// before it is recorded again.
+pub const ROOM: usize = 256;
+
+/// The inputs of a recorded step, rewritten before each replay.
+#[derive(Debug)]
+struct Inputs {
+    ids: Tensor,
+    positions: Tensor,
+    lines: Tensor,
+    pages: Tensor,
+    rows: Tensor,
+}
+
+/// A decoding pass recorded once ([`Model::record_step`]) and replayed for
+/// the next tokens of the same sequences ([`Model::replay_step`]).
+#[derive(Debug)]
+pub struct RecordedStep {
+    /// The cache, and its tables, the recording writes into.
+    identity: (u64, u64),
+    sequences: Vec<SequenceId>,
+    /// Pages per sequence of the table of pages: the room of the recording.
+    widest: usize,
+    inputs: Inputs,
+    recording: Recording,
+}
+
+impl RecordedStep {
+    /// The sequences, in the order of the tokens and of the logits.
+    pub fn sequences(&self) -> &[SequenceId] {
+        &self.sequences
+    }
+
+    /// The logits `[S, vocab]` the recording writes: those of its last run.
+    pub fn logits(&self) -> &Tensor {
+        self.recording.output()
     }
 }
 
 /// Which positions get logits.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 enum Logits {
     All,
+    /// The last of each sequence of a batch.
     Last,
+    /// These rows.
+    Rows(Vec<usize>),
 }
 
 /// The operations of the forward pass, on one backend.
@@ -170,6 +269,74 @@ impl Model {
                 w.clone()
             })
         })
+    }
+
+    /// The model with the query, key and value projections of each layer
+    /// stacked into one weight (`qkv_proj`), and the gate and up projections
+    /// into another (`gate_up_proj`), on `backend`: one product instead of
+    /// three, and one instead of two followed by a gated unit. The rows of
+    /// the products are the same; a card reads larger weights faster, and
+    /// launches fewer kernels.
+    ///
+    /// Only the blocks that have them (Llama, Mistral, Qwen, Gemma), and only
+    /// float weights of one type: quantized ones keep their projections.
+    ///
+    /// # Errors
+    ///
+    /// If the backend cannot stack the weights.
+    pub fn fused<B: Backend>(&self, backend: &B) -> Result<Self> {
+        let mut model = self.map(|w| Ok(w.clone()))?;
+        if !matches!(self.config.block, Block::Sequential | Block::Sandwich) {
+            return Ok(model);
+        }
+        // Whether the weights `names` exist, float, of one type and width.
+        let stackable = |names: &[String]| {
+            let parts: Option<Vec<&Tensor>> = names.iter().map(|n| self.weights.get(n)).collect();
+            parts.is_some_and(|parts| {
+                let (dtype, width) = (parts[0].dtype(), parts[0].shape().get(1));
+                dtype.is_float()
+                    && parts
+                        .iter()
+                        .all(|w| w.dtype() == dtype && w.shape().get(1) == width)
+            })
+        };
+        let mut stack = |names: &[String], into: String| -> Result<()> {
+            let parts: Vec<&Tensor> = names.iter().map(|n| &self.weights[n]).collect();
+            let stacked = backend.forward(&Concat { dim: 0 }, &parts)?;
+            for name in names {
+                model.weights.remove(name);
+            }
+            model.weights.insert(into, stacked);
+            Ok(())
+        };
+        for layer in 0..self.config.layers {
+            let p = format!("model.layers.{layer}");
+            let attn = |m: &str| format!("{p}.self_attn.{m}");
+            let names: Vec<String> = ["q_proj", "k_proj", "v_proj"]
+                .iter()
+                .map(|m| attn(&format!("{m}.weight")))
+                .collect();
+            let biases: Vec<String> = ["q_proj", "k_proj", "v_proj"]
+                .iter()
+                .map(|m| attn(&format!("{m}.bias")))
+                .collect();
+            // With biases, the weights and the biases are stacked together.
+            let with_biases = self.config.qkv_bias;
+            if stackable(&names) && (!with_biases || stackable(&biases)) {
+                stack(&names, attn("qkv_proj.weight"))?;
+                if with_biases {
+                    stack(&biases, attn("qkv_proj.bias"))?;
+                }
+            }
+            let mlp: Vec<String> = ["gate_proj", "up_proj"]
+                .iter()
+                .map(|m| format!("{p}.mlp.{m}.weight"))
+                .collect();
+            if stackable(&mlp) {
+                stack(&mlp, format!("{p}.mlp.gate_up_proj.weight"))?;
+            }
+        }
+        Ok(model)
     }
 
     /// The model with `f` applied to each weight.
@@ -304,13 +471,17 @@ impl Model {
     }
 
     /// The logits `[T, vocab]` of the token ids `ids`, one sequence, without a
-    /// cache: every position sees the ones before it.
+    /// cache: every position sees the ones before it. Every operation has a
+    /// gradient: the pass of training.
     ///
     /// # Errors
     ///
     /// If a weight is missing, or an operation fails on the backend.
     pub fn forward<B: Backend + Transfer>(&self, backend: &B, ids: &[u32]) -> Result<Tensor> {
-        self.run(backend, ids, &mut Cache::new(), Logits::All)
+        let positions: Vec<u32> = (0..ids.len() as u32).collect();
+        let positions = backend.upload(&Tensor::from_slice(&positions, &[ids.len()])?)?;
+        let ids = backend.upload(&Tensor::from_slice(ids, &[ids.len()])?)?;
+        self.run(backend, &ids, &positions, None, Logits::All)
     }
 
     /// The logits `[1, vocab]` of the last of `ids`, which follow the positions
@@ -329,13 +500,7 @@ impl Model {
         ids: &[u32],
         cache: &mut Cache,
     ) -> Result<Tensor> {
-        if ids.is_empty() {
-            return Err(ModelError::Tensor(kapel_core::Error::InvalidArgument {
-                op: "step",
-                message: "no token to compute".into(),
-            }));
-        }
-        self.run(backend, ids, cache, Logits::Last)
+        self.step_batch(backend, &mut cache.inner, &[(cache.id, ids)])
     }
 
     /// Like [`Model::step`], with the logits `[T, vocab]` of every one of
@@ -350,38 +515,288 @@ impl Model {
         ids: &[u32],
         cache: &mut Cache,
     ) -> Result<Tensor> {
-        if ids.is_empty() {
+        self.extend_batch(backend, &mut cache.inner, &[(cache.id, ids)])
+    }
+
+    /// One pass over several sequences of `cache` at once: each entry of
+    /// `batch` gives a sequence and its new tokens, which follow its cached
+    /// positions and whose keys and values are added to it. The logits `[S,
+    /// vocab]` of each entry's last token, in the order of `batch`.
+    ///
+    /// The products then have one row per new token of every sequence: the
+    /// weights are read once for the whole batch, which is what makes a batch
+    /// cheaper than its sequences one at a time.
+    ///
+    /// # Errors
+    ///
+    /// If an entry has no token, a sequence appears twice, `cache` is full
+    /// ([`ModelError::CacheFull`]), a weight is missing, or an operation
+    /// fails on the backend. On an error, the sequences of the batch may hold
+    /// part of the failed pass: remove them.
+    pub fn step_batch<B: Backend + Transfer>(
+        &self,
+        backend: &B,
+        cache: &mut KvCache,
+        batch: &[(SequenceId, &[u32])],
+    ) -> Result<Tensor> {
+        self.run_batch(backend, cache, batch, Logits::Last)
+    }
+
+    /// Like [`Model::step_batch`], with the logits `[R, vocab]` of every new
+    /// token, the entries one after the other.
+    ///
+    /// # Errors
+    ///
+    /// As [`Model::step_batch`].
+    pub fn extend_batch<B: Backend + Transfer>(
+        &self,
+        backend: &B,
+        cache: &mut KvCache,
+        batch: &[(SequenceId, &[u32])],
+    ) -> Result<Tensor> {
+        self.run_batch(backend, cache, batch, Logits::All)
+    }
+
+    fn run_batch<B: Backend + Transfer>(
+        &self,
+        backend: &B,
+        cache: &mut KvCache,
+        batch: &[(SequenceId, &[u32])],
+        logits: Logits,
+    ) -> Result<Tensor> {
+        if batch.is_empty() || batch.iter().any(|(_, ids)| ids.is_empty()) {
             return Err(ModelError::Tensor(kapel_core::Error::InvalidArgument {
-                op: "extend",
+                op: "step",
                 message: "no token to compute".into(),
             }));
         }
-        self.run(backend, ids, cache, Logits::All)
+        let counts: Vec<(SequenceId, usize)> =
+            batch.iter().map(|&(id, ids)| (id, ids.len())).collect();
+        let step = cache.begin(backend, &counts)?;
+        let ids: Vec<u32> = batch
+            .iter()
+            .flat_map(|(_, ids)| ids.iter().copied())
+            .collect();
+        let logits = match logits {
+            Logits::All => Logits::All,
+            // One token each: every row is a last one.
+            _ if batch.iter().all(|(_, ids)| ids.len() == 1) => Logits::All,
+            _ => {
+                let mut end = 0;
+                Logits::Rows(
+                    batch
+                        .iter()
+                        .map(|(_, ids)| {
+                            end += ids.len();
+                            end - 1
+                        })
+                        .collect(),
+                )
+            }
+        };
+        let positions = step.positions.clone();
+        let ids = backend.upload(&Tensor::from_slice(&ids, &[ids.len()])?)?;
+        self.run(backend, &ids, &positions, Some((cache, &step)), logits)
+    }
+
+    /// One token of each sequence of `batch`, computed as
+    /// [`Model::step_batch`] computes it (the logits `[S, vocab]`), and its
+    /// pass recorded ([`kapel_ops::Record`]: a CUDA graph on a card) for
+    /// [`Model::replay_step`] to run again for the next tokens of the same
+    /// sequences, `room` of them at least: the pass is then launched in one
+    /// call instead of one per kernel. `None` for a backend that does not
+    /// record, and for a cache of fixed size without the room; nothing is
+    /// computed then.
+    ///
+    /// The recording reads the tables of the cache as they are: it is
+    /// recorded again once the cache grows them, or a sequence needs more
+    /// positions than the room ([`Model::replay_step`] says so).
+    ///
+    /// # Errors
+    ///
+    /// As [`Model::step_batch`], and if the backend fails to record.
+    pub fn record_step<B: Backend + Transfer>(
+        &self,
+        backend: &B,
+        cache: &mut KvCache,
+        batch: &[(SequenceId, u32)],
+        room: usize,
+    ) -> Result<Option<(RecordedStep, Tensor)>> {
+        // The tables are made by a first pass, as it comes: never while
+        // recording.
+        if !backend.records() || batch.is_empty() || !cache.has_tables(self.config.layers) {
+            return Ok(None);
+        }
+        let ahead: Vec<(SequenceId, usize)> = batch.iter().map(|&(id, _)| (id, room + 1)).collect();
+        match cache.reserve(backend, &ahead) {
+            Err(ModelError::CacheFull { .. }) => return Ok(None),
+            other => other?,
+        }
+        let widest = batch
+            .iter()
+            .map(|&(id, _)| (cache.len(id) + room + 1).div_ceil(PAGE))
+            .max()
+            .unwrap_or(1);
+        let counts: Vec<(SequenceId, usize)> = batch.iter().map(|&(id, _)| (id, 1)).collect();
+        let plan = cache.plan(&counts, Some(widest))?;
+        let s = batch.len();
+        let upload = |values: &[u32], shape: &[usize]| -> Result<Tensor> {
+            Ok(backend.upload(&Tensor::from_slice(values, shape)?)?)
+        };
+        let tokens: Vec<u32> = batch.iter().map(|&(_, token)| token).collect();
+        let inputs = Inputs {
+            ids: upload(&tokens, &[s])?,
+            positions: upload(&plan.positions, &[s])?,
+            lines: upload(&plan.lines, &[s])?,
+            pages: upload(&plan.pages, &[s, widest])?,
+            rows: upload(&plan.rows, &[s, 2])?,
+        };
+        let lines_needed = cache.lines();
+        let identity = cache.identity();
+        // This token as it comes: what the recording needs is then made (the
+        // backend's tables for these shapes, its compiled kernels), and the
+        // recording, which runs nothing, need not be replayed for it.
+        let logits = {
+            let step = Step {
+                positions: inputs.positions.clone(),
+                lines: inputs.lines.clone(),
+                pages: inputs.pages.clone(),
+                rows: inputs.rows.clone(),
+                lines_needed,
+            };
+            self.run(
+                backend,
+                &inputs.ids,
+                &step.positions,
+                Some((&mut *cache, &step)),
+                Logits::All,
+            )?
+        };
+        let recording = backend.record(&mut || {
+            let step = Step {
+                positions: inputs.positions.clone(),
+                lines: inputs.lines.clone(),
+                pages: inputs.pages.clone(),
+                rows: inputs.rows.clone(),
+                lines_needed,
+            };
+            let logits = self.run(
+                backend,
+                &inputs.ids,
+                &step.positions,
+                Some((&mut *cache, &step)),
+                Logits::All,
+            );
+            logits.map_err(|e| match e {
+                ModelError::Tensor(e) => e,
+                other => kapel_core::Error::InvalidArgument {
+                    op: "record_step",
+                    message: other.to_string(),
+                },
+            })
+        })?;
+        let Some(recording) = recording else {
+            return Ok(None);
+        };
+        if cache.identity() != identity {
+            return Err(ModelError::Tensor(kapel_core::Error::InvalidArgument {
+                op: "record_step",
+                message: "the tables of the cache changed while recording".into(),
+            }));
+        }
+        let recorded = RecordedStep {
+            identity,
+            sequences: batch.iter().map(|&(id, _)| id).collect(),
+            widest,
+            inputs,
+            recording,
+        };
+        Ok(Some((recorded, logits)))
+    }
+
+    /// The next token of each sequence of `recorded`, `tokens` in the same
+    /// order, through its recording: the logits `[S, vocab]`, or `None` if
+    /// the recording no longer fits (the cache grew its tables, or a
+    /// sequence needs more pages than the recording has room for); nothing
+    /// is computed then, and [`Model::record_step`] records again.
+    ///
+    /// # Errors
+    ///
+    /// If `tokens` has another length, or the backend fails.
+    pub fn replay_step<B: Backend + Transfer>(
+        &self,
+        backend: &B,
+        cache: &mut KvCache,
+        recorded: &mut RecordedStep,
+        tokens: &[u32],
+    ) -> Result<Option<Tensor>> {
+        if tokens.len() != recorded.sequences.len() {
+            return Err(ModelError::Tensor(kapel_core::Error::InvalidArgument {
+                op: "replay_step",
+                message: format!(
+                    "{} tokens for a recording of {} sequences",
+                    tokens.len(),
+                    recorded.sequences.len()
+                ),
+            }));
+        }
+        let counts: Vec<(SequenceId, usize)> =
+            recorded.sequences.iter().map(|&id| (id, 1)).collect();
+        if cache.identity() != recorded.identity || !cache.fits(&counts, recorded.widest) {
+            return Ok(None);
+        }
+        let plan = cache.plan(&counts, Some(recorded.widest))?;
+        let s = tokens.len();
+        let host = |values: &[u32], shape: &[usize]| Tensor::from_slice(values, shape);
+        let inputs = &mut recorded.inputs;
+        backend.copy_from_host(&mut inputs.ids, &host(tokens, &[s])?)?;
+        backend.copy_from_host(&mut inputs.positions, &host(&plan.positions, &[s])?)?;
+        backend.copy_from_host(&mut inputs.lines, &host(&plan.lines, &[s])?)?;
+        backend.copy_from_host(
+            &mut inputs.pages,
+            &host(&plan.pages, &[s, recorded.widest])?,
+        )?;
+        backend.copy_from_host(&mut inputs.rows, &host(&plan.rows, &[s, 2])?)?;
+        recorded.recording.replay()?;
+        Ok(Some(recorded.recording.output().clone()))
     }
 
     fn run<B: Backend + Transfer>(
         &self,
         backend: &B,
-        ids: &[u32],
-        cache: &mut Cache,
+        ids_tensor: &Tensor,
+        positions: &Tensor,
+        mut paged: Option<(&mut KvCache, &Step)>,
         logits: Logits,
     ) -> Result<Tensor> {
         let c = &self.config;
         let ops = Ops(backend);
-        let t = ids.len();
-        let past = cache.len;
-        let ids_tensor = backend.upload(&Tensor::from_slice(ids, &[t])?)?;
-        let first = u32::try_from(past).map_err(|_| kapel_core::Error::Overflow { op: "step" })?;
-        let positions: Vec<u32> = (0..t as u32).map(|i| first + i).collect();
-        let positions = backend.upload(&Tensor::from_slice(&positions, &[t])?)?;
-        cache.layers.resize(c.layers, None);
 
         let (embed_name, prefix) = match c.block {
             Block::Gpt2 => ("transformer.wte.weight", "transformer.h"),
             _ => ("model.embed_tokens.weight", "model.layers"),
         };
         let embed = self.weight(embed_name)?;
-        let mut x = backend.forward(&GatherRows, &[embed, &ids_tensor])?;
+        let mut x = backend.forward(&GatherRows, &[embed, ids_tensor])?;
+        // The rows of a quantized table come in `f32`: the hidden states take
+        // the type of the float weights (the norms'), `bf16` on a card.
+        let final_norm = match c.block {
+            Block::Gpt2 => "transformer.ln_f.weight",
+            Block::Parallel => "model.final_layernorm.weight",
+            _ => "model.norm.weight",
+        };
+        if embed.dtype().is_quantized()
+            && let Some(norm) = self.optional(final_norm)
+            && norm.dtype() != x.dtype()
+            && norm.dtype().is_float()
+        {
+            x = backend.forward(
+                &Cast {
+                    dtype: norm.dtype(),
+                },
+                &[&x],
+            )?;
+        }
         if let Some(scale) = c.embed_scale {
             // Gemma rounds the factor to the type of the hidden states.
             x = ops.affine(&x, rounded(x.dtype(), scale)?)?;
@@ -389,7 +804,7 @@ impl Model {
         if c.block == Block::Gpt2 {
             let wpe = backend.forward(
                 &GatherRows,
-                &[self.weight("transformer.wpe.weight")?, &positions],
+                &[self.weight("transformer.wpe.weight")?, positions],
             )?;
             x = ops.binary(BinaryKind::Add, &x, &wpe)?;
         }
@@ -399,8 +814,7 @@ impl Model {
             x = match c.block {
                 Block::Sequential | Block::Sandwich => {
                     let h = self.norm(&ops, &x, &format!("{p}.input_layernorm"))?;
-                    let mut a =
-                        self.attention(&ops, &h, &positions, &mut cache.layers[layer], layer, &p)?;
+                    let mut a = self.attention(&ops, &h, positions, &mut paged, layer, &p)?;
                     if c.block == Block::Sandwich {
                         a = self.norm(&ops, &a, &format!("{p}.post_attention_layernorm"))?;
                     }
@@ -411,12 +825,28 @@ impl Model {
                         "post_attention_layernorm"
                     };
                     let h = self.norm(&ops, &x, &format!("{p}.{before}"))?;
-                    let gate =
-                        ops.linear(&h, self.weight(&format!("{p}.mlp.gate_proj.weight"))?, None)?;
-                    let up =
-                        ops.linear(&h, self.weight(&format!("{p}.mlp.up_proj.weight"))?, None)?;
-                    let inner =
-                        ops.binary(BinaryKind::Mul, &ops.unary(c.activation, &gate)?, &up)?;
+                    let inner = match self.optional(&format!("{p}.mlp.gate_up_proj.weight")) {
+                        // Stacked by `Model::fused`: one product, one gated unit.
+                        Some(w) => backend.forward(
+                            &Glu {
+                                activation: c.activation,
+                            },
+                            &[&ops.linear(&h, w, None)?],
+                        )?,
+                        None => {
+                            let gate = ops.linear(
+                                &h,
+                                self.weight(&format!("{p}.mlp.gate_proj.weight"))?,
+                                None,
+                            )?;
+                            let up = ops.linear(
+                                &h,
+                                self.weight(&format!("{p}.mlp.up_proj.weight"))?,
+                                None,
+                            )?;
+                            ops.binary(BinaryKind::Mul, &ops.unary(c.activation, &gate)?, &up)?
+                        }
+                    };
                     let mut m = ops.linear(
                         &inner,
                         self.weight(&format!("{p}.mlp.down_proj.weight"))?,
@@ -429,8 +859,7 @@ impl Model {
                 }
                 Block::Parallel => {
                     let h = self.norm(&ops, &x, &format!("{p}.input_layernorm"))?;
-                    let a =
-                        self.attention(&ops, &h, &positions, &mut cache.layers[layer], layer, &p)?;
+                    let a = self.attention(&ops, &h, positions, &mut paged, layer, &p)?;
                     let fc1 = ops.linear(
                         &h,
                         self.weight(&format!("{p}.mlp.fc1.weight"))?,
@@ -445,8 +874,7 @@ impl Model {
                 }
                 Block::Gpt2 => {
                     let h = self.norm(&ops, &x, &format!("{p}.ln_1"))?;
-                    let a =
-                        self.attention(&ops, &h, &positions, &mut cache.layers[layer], layer, &p)?;
+                    let a = self.attention(&ops, &h, positions, &mut paged, layer, &p)?;
                     let x = ops.binary(BinaryKind::Add, &x, &a)?;
                     let h = self.norm(&ops, &x, &format!("{p}.ln_2"))?;
                     // GPT-2's `Conv1D` stores `[in, out]`: `y = x · w`.
@@ -477,10 +905,16 @@ impl Model {
             Block::Parallel => "model.final_layernorm",
             _ => "model.norm",
         };
-        cache.len = past + t;
         // The norm and the head act row by row: only the rows wanted.
-        if logits == Logits::Last {
-            x = x.narrow(0, t - 1, 1)?;
+        match logits {
+            Logits::All => {}
+            Logits::Rows(rows) if rows.len() == 1 => x = x.narrow(0, rows[0], 1)?,
+            Logits::Rows(rows) => {
+                let rows: Vec<u32> = rows.iter().map(|&r| r as u32).collect();
+                let index = backend.upload(&Tensor::from_slice(&rows, &[rows.len()])?)?;
+                x = backend.forward(&GatherRows, &[&x, &index])?;
+            }
+            Logits::Last => unreachable!("turned into rows by run_batch"),
         }
         let h = self.norm(&ops, &x, final_norm)?;
         let head = match self.optional("lm_head.weight") {
@@ -500,12 +934,12 @@ impl Model {
 
     /// The attention of one block: `[T, hidden]` to `[T, hidden]`, after the
     /// keys and values of `cached`, to which the new ones are added.
-    fn attention<B: Backend>(
+    fn attention<B: Backend + Transfer>(
         &self,
         ops: &Ops<'_, B>,
         h: &Tensor,
         positions: &Tensor,
-        cached: &mut Option<(Tensor, Tensor)>,
+        paged: &mut Option<(&mut KvCache, &Step)>,
         layer: usize,
         p: &str,
     ) -> Result<Tensor> {
@@ -542,11 +976,26 @@ impl Model {
                 let (w, b) = proj(name)?;
                 ops.linear(h, w, b)
             };
-            (linear("q_proj")?, linear("k_proj")?, linear("v_proj")?)
+            match self.optional(&format!("{p}.self_attn.qkv_proj.weight")) {
+                // Stacked by `Model::fused`: one product, its columns cut.
+                Some(w) => {
+                    let qkv = ops.linear(h, w, bias(&format!("{p}.self_attn.qkv_proj.bias")))?;
+                    let (wq, wk) = (hq * d, hkv * d);
+                    (
+                        qkv.narrow(1, 0, wq)?,
+                        qkv.narrow(1, wq, wk)?,
+                        qkv.narrow(1, wq + wk, wk)?,
+                    )
+                }
+                None => (linear("q_proj")?, linear("k_proj")?, linear("v_proj")?),
+            }
         };
-        // [T, H·D] → [T, H, D] → [1, H, T, D], as views.
+        // [T, H·D] → [T, H, D], a view when it can be one.
         let heads = |x: Tensor, n: usize, norm: Option<&str>| -> Result<Tensor> {
-            let mut x = ops.contiguous(&x)?.reshape(&[t, n, d])?;
+            let mut x = match x.reshape(&[t, n, d]) {
+                Ok(view) => view,
+                Err(_) => ops.contiguous(&x)?.reshape(&[t, n, d])?,
+            };
             if let Some(name) = norm {
                 let w = self.weight(&format!("{p}.self_attn.{name}.weight"))?;
                 x = ops.0.forward(
@@ -557,7 +1006,7 @@ impl Model {
                     &[&x, w],
                 )?;
             }
-            Ok(x.reshape(&[1, t, n, d])?.transpose(1, 2)?)
+            Ok(x)
         };
         let mut q = heads(q, hq, c.qk_norm.then_some("q_norm"))?;
         let mut k = heads(k, hkv, c.qk_norm.then_some("k_norm"))?;
@@ -569,26 +1018,47 @@ impl Model {
                 rotary_dim: Some(rotary_dim),
                 scaling,
             };
-            q = ops.0.forward(&rope, &[&q, positions])?;
-            k = ops.0.forward(&rope, &[&k, positions])?;
+            // One position per token, the same for all its heads.
+            let positions = positions.reshape(&[t, 1])?;
+            q = ops.0.forward(&rope, &[&q, &positions])?;
+            k = ops.0.forward(&rope, &[&k, &positions])?;
         }
-        let (k, v) = match cached.take() {
-            Some((k0, v0)) => (
-                ops.0.forward(&Concat { dim: 2 }, &[&k0, &k])?,
-                ops.0.forward(&Concat { dim: 2 }, &[&v0, &v])?,
-            ),
-            None => (k, v),
+        let y = match paged {
+            Some((cache, step)) => {
+                // The new keys and values go into the tables in place, then
+                // each query reads its sequence's positions through its pages.
+                let tables = cache.tables(ops.0, layer, step.lines_needed, &k, &v)?;
+                ops.0.write_rows(&mut tables.0, &step.lines, &k)?;
+                ops.0.write_rows(&mut tables.1, &step.lines, &v)?;
+                let attention = PagedAttention {
+                    page: PAGE,
+                    window: c.windows[layer],
+                    scale: c.query_scale,
+                    softcap: c.attn_softcap,
+                };
+                let (keys, values) = (&tables.0, &tables.1);
+                let y = ops
+                    .0
+                    .forward(&attention, &[&q, keys, values, &step.pages, &step.rows])?;
+                y.reshape(&[t, hq * d])?
+            }
+            None => {
+                // [T, H, D] → [1, H, T, D], as views.
+                let batch = |x: &Tensor, n: usize| x.reshape(&[1, t, n, d])?.transpose(1, 2);
+                let attention = Attention {
+                    causal: true,
+                    window: c.windows[layer],
+                    scale: c.query_scale,
+                    softcap: c.attn_softcap,
+                };
+                let y = ops.0.forward(
+                    &attention,
+                    &[&batch(&q, hq)?, &batch(&k, hkv)?, &batch(&v, hkv)?],
+                )?;
+                // [1, H, T, D] → [T, H·D].
+                ops.contiguous(&y.transpose(1, 2)?)?.reshape(&[t, hq * d])?
+            }
         };
-        *cached = Some((k.clone(), v.clone()));
-        let attention = Attention {
-            causal: true,
-            window: c.windows[layer],
-            scale: c.query_scale,
-            softcap: c.attn_softcap,
-        };
-        let y = ops.0.forward(&attention, &[&q, &k, &v])?;
-        // [1, H, T, D] → [T, H·D].
-        let y = ops.contiguous(&y.transpose(1, 2)?)?.reshape(&[t, hq * d])?;
         Ok(if c.block == Block::Gpt2 {
             ops.bias(
                 ops.0.forward(

@@ -44,6 +44,29 @@ mod kernels {
         let out: Tile<E, { [BM, BN] }> = convert_tile(acc);
         z.store(out.reshape(shape![1, BM, BN]));
     }
+
+    /// `z[t] = x[t] · y[t]ᵀ`, `y[t]` given as `[N, K]`: the weights of a
+    /// linear layer as stored. Each tile of `y` is loaded along `K`, its
+    /// contiguous dimension, then transposed in registers: reading it through
+    /// swapped strides is several times slower.
+    #[cutile::entry()]
+    fn batched_matmul_nt<E: ElementType, const BM: i32, const BN: i32, const BK: i32>(
+        z: &mut Tensor<E, { [1, BM, BN] }>,
+        x: &Tensor<E, { [-1, -1, -1] }>,
+        y: &Tensor<E, { [-1, -1, -1] }>,
+    ) {
+        let part_x = x.partition(shape![1, BM, BK]);
+        let part_y = y.partition(shape![1, BN, BK]);
+        let pid: (i32, i32, i32) = get_tile_block_id();
+        let mut acc: Tile<f32, { [BM, BN] }> = constant(0.0f32, shape![BM, BN]);
+        for i in 0i32..num_tiles(&part_x, 2) {
+            let tx: Tile<E, { [BM, BK] }> = part_x.load([pid.0, pid.1, i]).reshape(shape![BM, BK]);
+            let ty: Tile<E, { [BN, BK] }> = part_y.load([pid.0, pid.2, i]).reshape(shape![BN, BK]);
+            acc = mma(tx, ty.transpose(), acc);
+        }
+        let out: Tile<E, { [BM, BN] }> = convert_tile(acc);
+        z.store(out.reshape(shape![1, BM, BN]));
+    }
 }
 
 /// The tile runtime's handles on the backend's device and stream.
@@ -76,6 +99,13 @@ impl Tiles {
     }
 }
 
+/// The second operand of a product: as it is (`Nn`), or transposed (`Nt`).
+#[derive(Clone, Copy)]
+enum Kernel {
+    Nn,
+    Nt,
+}
+
 /// A batch of matrices in device memory: `[batch, rows, columns]` with any
 /// strides, the batch stride possibly 0 (broadcast).
 struct Matrices {
@@ -104,16 +134,25 @@ fn batch_stride(shape: &[usize], strides: &[usize]) -> Option<usize> {
 }
 
 /// The tile sizes for an `m × n` output of `dtype`, and the tile blocks asked
-/// for per multiprocessor. Larger tiles reuse more of what they load, but leave
-/// blocks idle on small outputs. In 16 bits, two blocks of `128 × 64 × 32`
-/// reach 70 Top/s on an RTX 3090 at `4096³`, against 53 for one of
-/// `128 × 64 × 64`: the best of a sweep, whose neighbours can be 3 times
-/// slower.
-fn tiles_for(dtype: DType, m: usize) -> ([usize; 3], Option<i32>) {
+/// for per multiprocessor: the best of sweeps on an RTX 3090, whose neighbours
+/// can be 3 times slower. Larger tiles reuse more of what they load, but leave
+/// multiprocessors idle on small outputs.
+///
+/// With few rows, as in decoding, the product reads its weights once and is
+/// bound by memory: thin tiles of 16 rows, long along `K`, keep every
+/// multiprocessor reading. One row times the weights of Llama 3.2 3B reads
+/// them at 650 to 880 GB/s, against 100 with the tiles of large products.
+/// With many rows, as in a prefill, it is bound by the tensor cores: tiles of
+/// `64 × 128 × 32`, two per multiprocessor, reach 60 to 70 Top/s on the
+/// shapes of Llama 3.2 3B from 1024 rows on.
+fn tiles_for(dtype: DType, m: usize, n: usize) -> ([usize; 3], Option<i32>) {
     match dtype {
         DType::F32 => ([64, 64, 32], None),
-        _ if m >= 128 => ([128, 64, 32], Some(2)),
-        _ => ([64, 64, 64], None),
+        _ if m <= 16 && n <= 1024 => ([16, 32, 256], Some(4)),
+        _ if m <= 16 => ([16, 64, 128], None),
+        _ if m <= 32 => ([32, 64, 128], Some(2)),
+        _ if m <= 256 => ([64, 64, 64], Some(2)),
+        _ => ([64, 128, 32], Some(2)),
     }
 }
 
@@ -181,17 +220,26 @@ impl Cuda {
         if numel > 0 && k > 0 {
             let batch = &shape[..rank - 2];
             let (x, _keep_a) = self.matrices(op, a, batch)?;
-            let (y, _keep_b) = self.matrices(op, b, batch)?;
+            // `b` read as the transpose of row-major `[N, K]` matrices (the
+            // weights of a linear layer): loaded along `K`.
+            let rb = b.rank();
+            let transposed = b.layout().strides()[rb - 2] == 1 && n > 1;
+            let (y, _keep_b) = if transposed {
+                self.matrices(op, &b.transpose(rb - 2, rb - 1)?, batch)?
+            } else {
+                self.matrices(op, b, batch)?
+            };
             let z = Matrices {
                 pointer: storage.pointer(),
                 shape: [numel / (m * n), m, n],
                 strides: [m * n, n, 1],
             };
-            let launch = tiles_for(dtype, m);
+            let launch = tiles_for(dtype, m, n);
+            let kernel = if transposed { Kernel::Nt } else { Kernel::Nn };
             match dtype {
-                DType::F32 => self.batched_matmul::<f32>("f32", &z, &x, &y, launch)?,
-                DType::BF16 => self.batched_matmul::<bf16>("bf16", &z, &x, &y, launch)?,
-                _ => self.batched_matmul::<f16>("f16", &z, &x, &y, launch)?,
+                DType::F32 => self.batched_matmul::<f32>("f32", kernel, &z, &x, &y, launch)?,
+                DType::BF16 => self.batched_matmul::<bf16>("bf16", kernel, &z, &x, &y, launch)?,
+                _ => self.batched_matmul::<f16>("f16", kernel, &z, &x, &y, launch)?,
             }
         }
         Tensor::from_storage(Arc::new(storage), layout, dtype)
@@ -205,6 +253,7 @@ impl Cuda {
     fn batched_matmul<T: cutile::DType>(
         &self,
         name: &str,
+        kernel: Kernel,
         z: &Matrices,
         x: &Matrices,
         y: &Matrices,
@@ -229,20 +278,36 @@ impl Cuda {
             bn.to_string(),
             bk.to_string(),
         ];
-        let launch = kernels::batched_matmul(out, Arc::new(tensor(x)?), Arc::new(tensor(y)?))
-            .generics(generics)
-            .compile_options(match occupancy {
-                Some(blocks) => CompileOptions::new().occupancy(blocks),
-                None => CompileOptions::new(),
-            });
-        // SAFETY: as above; the outputs returned are views of borrowed memory,
-        // dropped without freeing it.
-        unsafe { launch.async_on(self.tile_stream()) }
+        let options = match occupancy {
+            Some(blocks) => CompileOptions::new().occupancy(blocks),
+            None => CompileOptions::new(),
+        };
+        let (x, y) = (Arc::new(tensor(x)?), Arc::new(tensor(y)?));
+        let error = |e: cutile::prelude::DeviceError| Error::Device {
+            op,
+            message: e.to_string(),
+        };
+        match kernel {
+            // SAFETY: as above; the outputs returned are views of borrowed
+            // memory, dropped without freeing it.
+            Kernel::Nn => unsafe {
+                kernels::batched_matmul(out, x, y)
+                    .generics(generics)
+                    .compile_options(options)
+                    .async_on(self.tile_stream())
+            }
             .map(drop)
-            .map_err(|e| Error::Device {
-                op,
-                message: e.to_string(),
-            })
+            .map_err(error),
+            // SAFETY: as for `Kernel::Nn`.
+            Kernel::Nt => unsafe {
+                kernels::batched_matmul_nt(out, x, y)
+                    .generics(generics)
+                    .compile_options(options)
+                    .async_on(self.tile_stream())
+            }
+            .map(drop)
+            .map_err(error),
+        }
     }
 }
 

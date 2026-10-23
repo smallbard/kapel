@@ -19,19 +19,30 @@
 //! its weights quantized or not, and [`Model::quantize`] quantizes the linear
 //! projections of a model of the Hub: the products then read the codes.
 //!
+//! Generation goes through a cache of keys and values. [`KvCache`] keeps them
+//! by pages of [`PAGE`] positions, shared by the sequences it holds, in any
+//! float type down to `f8`; [`Model::step_batch`] computes one new position of
+//! many sequences at once, and [`Model::extend_batch`] several. On a backend
+//! that records ([`kapel_ops::Record`]), [`Model::record_step`] captures a
+//! step and [`Model::replay_step`] runs it again on new inputs.
+//! [`Model::fused`] stacks the projections that read the same input into one
+//! product. [`Cache`] is the cache of a single sequence.
+//!
 //! The parity tool (`tools/parity`) checks the logits against `transformers`.
 
+mod cache;
 mod config;
 mod gguf;
 mod model;
 
 use std::fmt;
 
+pub use cache::{KvCache, PAGE, SequenceId};
 pub use config::{
     Block, Config, MAX_HEAD_DIM, MAX_HEADS, MAX_HIDDEN, MAX_INTERMEDIATE, MAX_LAYERS, MAX_VOCAB,
     Norm,
 };
-pub use model::{Cache, Model};
+pub use model::{Cache, Model, ROOM, RecordedStep};
 
 /// What can go wrong with a model.
 #[derive(Debug)]
@@ -45,6 +56,14 @@ pub enum ModelError {
     Hub(kapel_hub::HubError),
     /// An operation failed.
     Tensor(kapel_core::Error),
+    /// A cache of fixed size ([`KvCache::with_pages`]) has fewer free pages
+    /// than a pass needs.
+    CacheFull {
+        /// The pages the pass needs.
+        needed: usize,
+        /// The pages left.
+        free: usize,
+    },
 }
 
 impl fmt::Display for ModelError {
@@ -54,6 +73,9 @@ impl fmt::Display for ModelError {
             Self::MissingWeight(name) => write!(f, "the checkpoint has no weight {name:?}"),
             Self::Hub(error) => error.fmt(f),
             Self::Tensor(error) => error.fmt(f),
+            Self::CacheFull { needed, free } => {
+                write!(f, "the cache is full: {needed} pages needed, {free} free")
+            }
         }
     }
 }
