@@ -452,6 +452,213 @@ pub fn dequantize(dtype: DType, bytes: &[u8]) -> Result<Vec<f64>> {
     Ok(out)
 }
 
+/// What turns the codes of one block of a quantized format into values: the
+/// step between two codes and the value of code zero, as the block stores
+/// them, and what the codes are chosen with.
+///
+/// [`block_scale`] gives the reference one of some values;
+/// [`block_code`] then gives the code of any value, [`block_value`] the value
+/// of a code, and [`encode_block`] writes the block. [`quantize`] is these
+/// four, block by block. A method that chooses codes otherwise (GPTQ, say)
+/// keeps the scale and the codes, and the block holds exactly
+/// `block_value` of each.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BlockScale {
+    /// The step between two codes, as stored: an `f16` for GGUF's formats.
+    pub step: f64,
+    /// The value of the code 0 (Q4_1's minimum); for the symmetric formats,
+    /// minus the step times the code of zero.
+    pub origin: f64,
+    /// The inverse of the step the codes are chosen with: llama.cpp chooses
+    /// them before the step is rounded to `f16`.
+    inverse: f64,
+    /// The minimum the codes of Q4_1 are chosen from, before rounding.
+    minimum: f64,
+}
+
+/// The formats [`quantize`] and [`block_scale`] write.
+fn written(format: QuantFormat) -> bool {
+    matches!(
+        format,
+        QuantFormat::Int8 { .. }
+            | QuantFormat::Int4 { .. }
+            | QuantFormat::Q8_0
+            | QuantFormat::Q4_0
+            | QuantFormat::Q4_1
+    )
+}
+
+/// The reference scale of a block of `dtype` holding `block`: see
+/// [`quantize`] for each format's rule.
+///
+/// # Errors
+///
+/// [`Error::UnsupportedDType`] for a format not written here,
+/// [`Error::BlockMisaligned`] if `block` is not one block long.
+pub fn block_scale(dtype: DType, block: &[f32]) -> Result<BlockScale> {
+    let DType::Quantized(format) = dtype else {
+        return Err(Error::UnsupportedDType {
+            op: "block_scale",
+            dtype,
+        });
+    };
+    if !written(format) {
+        return Err(Error::UnsupportedDType {
+            op: "block_scale",
+            dtype,
+        });
+    }
+    if block.len() != dtype.block_len() {
+        return Err(Error::BlockMisaligned {
+            dtype,
+            elements: block.len(),
+        });
+    }
+    let f16 = |x: f64| float::F16.decode(float::F16.encode(x));
+    let largest = block.iter().fold(0.0f64, |m, &v| m.max(f64::from(v).abs()));
+    let inverse = |d: f64| if d != 0.0 { 1.0 / d } else { 0.0 };
+    let single_inverse = |d: f32| f64::from(if d != 0.0 { 1.0 / d } else { 0.0 });
+    Ok(match format {
+        QuantFormat::Int8 { .. } => {
+            let step = f64::from((largest / 127.0) as f32);
+            BlockScale {
+                step,
+                origin: 0.0,
+                inverse: inverse(step),
+                minimum: 0.0,
+            }
+        }
+        QuantFormat::Int4 { .. } => {
+            let step = f64::from(int4_codes(block).0);
+            BlockScale {
+                step,
+                origin: -8.0 * step,
+                inverse: inverse(step),
+                minimum: 0.0,
+            }
+        }
+        // llama.cpp computes in `f32`: so does Kapel, for the same bytes.
+        QuantFormat::Q8_0 => {
+            let d = largest as f32 / 127.0;
+            BlockScale {
+                step: f16(f64::from(d)),
+                origin: 0.0,
+                inverse: single_inverse(d),
+                minimum: 0.0,
+            }
+        }
+        QuantFormat::Q4_0 => {
+            // The value of largest magnitude, with its sign.
+            let m = block
+                .iter()
+                .fold(0.0f32, |m, &v| if v.abs() > m.abs() { v } else { m });
+            let d = m / -8.0;
+            BlockScale {
+                step: f16(f64::from(d)),
+                origin: -8.0 * f16(f64::from(d)),
+                inverse: single_inverse(d),
+                minimum: 0.0,
+            }
+        }
+        _ => {
+            // Q4_1: from the minimum to the maximum in 15 steps.
+            let low = block.iter().fold(f32::INFINITY, |m, &v| m.min(v));
+            let high = block.iter().fold(f32::NEG_INFINITY, |m, &v| m.max(v));
+            let d = (high - low) / 15.0;
+            BlockScale {
+                step: f16(f64::from(d)),
+                origin: f16(f64::from(low)),
+                inverse: single_inverse(d),
+                minimum: f64::from(low),
+            }
+        }
+    })
+}
+
+/// The code of `x` in a block of `dtype` of scale `scale`, as the block
+/// stores it (a signed byte for Kapel's int8 and Q8_0, 0 to 15 for the
+/// 4-bit formats): the nearest, by llama.cpp's reference rounding for its
+/// formats, clamped to the codes there are.
+///
+/// # Panics
+///
+/// For a format [`block_scale`] does not give.
+pub fn block_code(dtype: DType, scale: &BlockScale, x: f32) -> u8 {
+    // GGUF's formats in `f32`, as llama.cpp.
+    let inverse = scale.inverse as f32;
+    match dtype {
+        DType::Quantized(QuantFormat::Int8 { .. }) => {
+            (f64::from(x) * scale.inverse).round().clamp(-127.0, 127.0) as i8 as u8
+        }
+        DType::Quantized(QuantFormat::Q8_0) => {
+            (x * inverse).round().clamp(-127.0, 127.0) as i8 as u8
+        }
+        DType::Quantized(QuantFormat::Int4 { .. }) => {
+            if scale.step == 0.0 {
+                8
+            } else {
+                ((f64::from(x) / scale.step).round().clamp(-8.0, 7.0) + 8.0) as u8
+            }
+        }
+        // llama.cpp truncates after adding a half: the floor, for the
+        // values of the block; beyond them, the nearest end.
+        DType::Quantized(QuantFormat::Q4_0) => (x * inverse + 8.5).floor().clamp(0.0, 15.0) as u8,
+        DType::Quantized(QuantFormat::Q4_1) => ((x - scale.minimum as f32) * inverse + 0.5)
+            .floor()
+            .clamp(0.0, 15.0) as u8,
+        _ => panic!("block_code: {dtype} is not written"),
+    }
+}
+
+/// The value of the code `code` in a block of `dtype` of scale `scale`:
+/// what [`dequantize`] reads back.
+pub fn block_value(dtype: DType, scale: &BlockScale, code: u8) -> f64 {
+    match dtype {
+        DType::Quantized(QuantFormat::Int8 { .. } | QuantFormat::Q8_0) => {
+            scale.step * f64::from(code as i8)
+        }
+        _ => scale.step * f64::from(code) + scale.origin,
+    }
+}
+
+/// Appends to `out` the bytes of a block of `dtype`: its scale, then its
+/// codes (from [`block_code`]) in the format's order.
+///
+/// # Panics
+///
+/// For a format [`block_scale`] does not give, or codes that are not one
+/// block.
+pub fn encode_block(dtype: DType, scale: &BlockScale, codes: &[u8], out: &mut Vec<u8>) {
+    assert_eq!(codes.len(), dtype.block_len(), "encode_block: one block");
+    let half = |x: f64| float::F16.encode(x).to_le_bytes();
+    match dtype {
+        DType::Quantized(QuantFormat::Int8 { .. }) => {
+            out.extend((scale.step as f32).to_le_bytes());
+            out.extend(codes);
+        }
+        DType::Quantized(QuantFormat::Int4 { .. }) => {
+            out.extend((scale.step as f32).to_le_bytes());
+            for pair in codes.as_chunks::<2>().0 {
+                out.push(pair[0] | (pair[1] << 4));
+            }
+        }
+        DType::Quantized(QuantFormat::Q8_0) => {
+            out.extend(&half(scale.step)[..2]);
+            out.extend(codes);
+        }
+        DType::Quantized(QuantFormat::Q4_0 | QuantFormat::Q4_1) => {
+            out.extend(&half(scale.step)[..2]);
+            if dtype == DType::Quantized(QuantFormat::Q4_1) {
+                out.extend(&half(scale.origin)[..2]);
+            }
+            for j in 0..16 {
+                out.push(codes[j] | (codes[j + 16] << 4));
+            }
+        }
+        _ => panic!("encode_block: {dtype} is not written"),
+    }
+}
+
 /// Quantizes `values`, a whole number of blocks, to `dtype` by rounding to
 /// the nearest code, block by block: the reference quantization.
 ///
@@ -460,10 +667,13 @@ pub fn dequantize(dtype: DType, bytes: &[u8]) -> Result<Vec<f64>> {
 /// - Kapel's int4: the scale of each group that, with codes rounded to the
 ///   nearest between −8 and 7, makes the smallest squared error, among the
 ///   scales that put the largest magnitude at either end and those between.
-/// - GGUF's Q8_0 and Q4_0, as llama.cpp's reference (`quantize_row_q8_0_ref`,
-///   `quantize_row_q4_0_ref`) does: Q8_0 like int8 with an `f16` scale; Q4_0
+/// - GGUF's Q8_0, Q4_0 and Q4_1, as llama.cpp's reference
+///   (`quantize_row_q8_0_ref`, `quantize_row_q4_0_ref`,
+///   `quantize_row_q4_1_ref`) does: Q8_0 like int8 with an `f16` scale; Q4_0
 ///   with the scale `m / −8`, `m` the value of largest magnitude, and codes
-///   `x / scale + 8`, truncated after adding a half, at most 15.
+///   `x / scale + 8`, truncated after adding a half, at most 15; Q4_1 from
+///   the minimum to the maximum in 15 steps, codes `(x − min) / scale`
+///   truncated after adding a half.
 ///
 /// A block of zeros has a scale of zero.
 ///
@@ -472,64 +682,14 @@ pub fn dequantize(dtype: DType, bytes: &[u8]) -> Result<Vec<f64>> {
 /// [`Error::UnsupportedDType`] for another type, [`Error::BlockMisaligned`] if
 /// `values` is not a whole number of blocks.
 pub fn quantize(dtype: DType, values: &[f32]) -> Result<Vec<u8>> {
-    let unsupported = Err(Error::UnsupportedDType {
-        op: "quantize",
-        dtype,
-    });
-    let DType::Quantized(format) = dtype else {
-        return unsupported;
-    };
     let len = dtype.block_len();
-    let mut out = Vec::with_capacity(dtype.storage_bytes(values.len())?);
-    let half = |x: f64| float::F16.encode(x).to_le_bytes();
-    let largest = |block: &[f32]| block.iter().fold(0.0f64, |m, &v| m.max(f64::from(v).abs()));
-    for block in values.chunks_exact(len) {
-        match format {
-            QuantFormat::Int8 { .. } => {
-                let scale = (largest(block) / 127.0) as f32;
-                let inverse = if scale > 0.0 {
-                    1.0 / f64::from(scale)
-                } else {
-                    0.0
-                };
-                out.extend(scale.to_le_bytes());
-                out.extend(
-                    block.iter().map(|&x| {
-                        (f64::from(x) * inverse).round().clamp(-127.0, 127.0) as i8 as u8
-                    }),
-                );
-            }
-            QuantFormat::Int4 { .. } => {
-                let (scale, codes) = int4_codes(block);
-                out.extend(scale.to_le_bytes());
-                for pair in codes.as_chunks::<2>().0 {
-                    out.push(pair[0] | (pair[1] << 4));
-                }
-            }
-            QuantFormat::Q8_0 => {
-                let d = largest(block) / 127.0;
-                let inverse = if d > 0.0 { 1.0 / d } else { 0.0 };
-                out.extend(half(d)[..2].iter());
-                out.extend(
-                    block.iter().map(|&x| {
-                        (f64::from(x) * inverse).round().clamp(-127.0, 127.0) as i8 as u8
-                    }),
-                );
-            }
-            QuantFormat::Q4_0 => {
-                // The value of largest magnitude, with its sign.
-                let m = block
-                    .iter()
-                    .fold(0.0f32, |m, &v| if v.abs() > m.abs() { v } else { m });
-                let d = f64::from(m) / -8.0;
-                let inverse = if d != 0.0 { 1.0 / d } else { 0.0 };
-                let code = |x: f32| ((f64::from(x) * inverse + 8.5) as i32).min(15) as u8;
-                out.extend(half(d)[..2].iter());
-                for j in 0..16 {
-                    out.push(code(block[j]) | (code(block[j + 16]) << 4));
-                }
-            }
-            _ => return unsupported,
+    match dtype {
+        DType::Quantized(format) if written(format) => {}
+        _ => {
+            return Err(Error::UnsupportedDType {
+                op: "quantize",
+                dtype,
+            });
         }
     }
     if !values.len().is_multiple_of(len) {
@@ -537,6 +697,19 @@ pub fn quantize(dtype: DType, values: &[f32]) -> Result<Vec<u8>> {
             dtype,
             elements: values.len(),
         });
+    }
+    let mut out = Vec::with_capacity(dtype.storage_bytes(values.len())?);
+    for block in values.chunks_exact(len) {
+        let scale = block_scale(dtype, block)?;
+        let codes: Vec<u8> = match dtype {
+            // The codes the scale was chosen with.
+            DType::Quantized(QuantFormat::Int4 { .. }) => int4_codes(block).1,
+            _ => block
+                .iter()
+                .map(|&x| block_code(dtype, &scale, x))
+                .collect(),
+        };
+        encode_block(dtype, &scale, &codes, &mut out);
     }
     Ok(out)
 }
@@ -712,6 +885,7 @@ mod tests {
             DType::int4(64).unwrap(),
             DType::Quantized(QuantFormat::Q8_0),
             DType::Quantized(QuantFormat::Q4_0),
+            DType::Quantized(QuantFormat::Q4_1),
         ] {
             let bytes = quantize(dtype, &values).unwrap();
             assert_eq!(bytes.len(), dtype.storage_bytes(64).unwrap());
@@ -719,6 +893,8 @@ mod tests {
             // Within half a step of the largest code of each block.
             let top = match dtype {
                 DType::Quantized(QuantFormat::Q4_0) => 8.0,
+                // Half the range of the block.
+                DType::Quantized(QuantFormat::Q4_1) => 7.5,
                 _ => 127.0,
             };
             let len = dtype.block_len();
@@ -747,13 +923,24 @@ mod tests {
                 continue;
             }
             for (block, back) in values.chunks(len).zip(back.chunks(len)) {
-                let step = block.iter().fold(0.0f64, |m, &x| m.max(f64::from(x).abs())) / top;
+                let step = if dtype == DType::Quantized(QuantFormat::Q4_1) {
+                    let (low, high) = block
+                        .iter()
+                        .fold((f64::INFINITY, f64::NEG_INFINITY), |(l, h), &x| {
+                            (l.min(f64::from(x)), h.max(f64::from(x)))
+                        });
+                    (high - low) / 2.0 / top
+                } else {
+                    block.iter().fold(0.0f64, |m, &x| m.max(f64::from(x).abs())) / top
+                };
                 for (&x, &y) in block.iter().zip(back) {
                     // GGUF's codes are those of the scale before its
                     // rounding to `f16`, as in llama.cpp: up to 127 times
                     // that rounding more.
                     let slack = match dtype {
-                        DType::Quantized(QuantFormat::Q8_0 | QuantFormat::Q4_0) => 0.07,
+                        DType::Quantized(
+                            QuantFormat::Q8_0 | QuantFormat::Q4_0 | QuantFormat::Q4_1,
+                        ) => 0.07,
                         _ => 0.001,
                     };
                     let error = (f64::from(x) - y).abs();
@@ -770,6 +957,46 @@ mod tests {
                 .all(|&v| v == 0.0)
         );
         assert!(quantize(DType::int8(32).unwrap(), &[1.0; 31]).is_err());
+    }
+
+    /// The pieces of [`quantize`] give its blocks, and every code reads back
+    /// as [`block_value`] says.
+    #[test]
+    fn blocks_are_their_scale_and_codes() {
+        let values: Vec<f32> = (0..128)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) / 13.0)
+            .collect();
+        for dtype in [
+            DType::int8(32).unwrap(),
+            DType::int4(32).unwrap(),
+            DType::Quantized(QuantFormat::Q8_0),
+            DType::Quantized(QuantFormat::Q4_0),
+            DType::Quantized(QuantFormat::Q4_1),
+        ] {
+            let len = dtype.block_len();
+            let codes_of = |code: u8| -> Vec<u8> { vec![code; len] };
+            for block in values.chunks(len) {
+                let scale = block_scale(dtype, block).unwrap();
+                // Any code, as the block stores it: each reads back.
+                let range: Vec<u8> = match dtype {
+                    DType::Quantized(QuantFormat::Int8 { .. } | QuantFormat::Q8_0) => {
+                        (-127i8..=127).map(|c| c as u8).collect()
+                    }
+                    _ => (0..16).collect(),
+                };
+                for code in range {
+                    let mut bytes = Vec::new();
+                    encode_block(dtype, &scale, &codes_of(code), &mut bytes);
+                    let back = dequantize(dtype, &bytes).unwrap();
+                    let want = block_value(dtype, &scale, code);
+                    assert!(
+                        back.iter().all(|&v| v == want),
+                        "{dtype} {code}: {} ≠ {want}",
+                        back[0]
+                    );
+                }
+            }
+        }
     }
 
     #[test]

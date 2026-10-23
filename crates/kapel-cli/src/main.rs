@@ -1,6 +1,8 @@
 //! The `kapel` command line.
 
 mod args;
+mod eval;
+mod quantize;
 
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
@@ -17,6 +19,8 @@ use crate::args::{Device, Load, Run, Serve};
 const USAGE: &str = "\
 usage: kapel run MODEL [options]
        kapel serve MODEL [options]
+       kapel quantize MODEL --output PATH [options]   (kapel quantize --help)
+       kapel eval MODEL --tasks FILE [options]        (kapel eval --help)
 
 Generates text with MODEL: a model directory, a GGUF file, or a repository of the
 Hugging Face Hub (owner/name, downloaded once into ~/.cache/kapel/hub, or
@@ -81,6 +85,16 @@ fn main() -> ExitCode {
         Some("serve") => {
             exit(args::parse_serve(&args[1..]).and_then(|serve| execute_serve(&serve)))
         }
+        Some("quantize") if args.get(1).is_some_and(|a| a == "--help" || a == "-h") => {
+            print!("{}", quantize::USAGE);
+            ExitCode::SUCCESS
+        }
+        Some("quantize") => exit(quantize::execute(&args[1..])),
+        Some("eval") if args.get(1).is_some_and(|a| a == "--help" || a == "-h") => {
+            print!("{}", eval::USAGE);
+            ExitCode::SUCCESS
+        }
+        Some("eval") => exit(eval::execute(&args[1..])),
         Some("--version" | "-V") => {
             println!("kapel {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS

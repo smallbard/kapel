@@ -306,3 +306,50 @@ fn the_multi_token_layer_predicts_as_the_reference() {
         }
     }
 }
+
+/// The blocks one at a time ([`Model::block`]) give the hidden states of the
+/// whole pass, and show the input of every group of projections once per
+/// block, with the width of the weights that read it.
+#[test]
+fn blocks_one_at_a_time_give_the_whole_pass() {
+    use kapel_models::{Block, Site};
+    let cpu = kapel_cpu::Cpu::new();
+    let mut checked = 0;
+    for (name, model, reference) in models() {
+        let c = model.config();
+        if !matches!(c.block, Block::Sequential | Block::Sandwich) || c.multi_token_layers > 0 {
+            continue;
+        }
+        let ids = &texts(&reference)[0];
+        let (_, want) = model
+            .extend_hidden(&cpu, ids, &mut Cache::new(), ids.len())
+            .unwrap();
+        let mut x = model.embed(&cpu, ids).unwrap();
+        for layer in 0..c.layers {
+            let mut seen = Vec::new();
+            x = model
+                .block(&cpu, layer, &x, &mut |site, input| {
+                    let w = model
+                        .tensor(&format!(
+                            "model.layers.{layer}.{}.weight",
+                            site.projections()[0]
+                        ))
+                        .unwrap();
+                    assert_eq!(input.shape(), [ids.len(), w.shape()[1]], "{name} {site:?}");
+                    seen.push(site);
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(seen, Site::ALL, "{name}");
+        }
+        let got = x.to_vec::<f32>().unwrap();
+        let want = want.to_vec::<f32>().unwrap();
+        assert!(
+            relative(&got, &want) < 1e-5,
+            "{name}: {}",
+            relative(&got, &want)
+        );
+        checked += 1;
+    }
+    let _ = writeln!(std::io::stderr(), "{checked} models checked block by block");
+}

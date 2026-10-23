@@ -37,6 +37,9 @@
 //! proposals are checked by the exact rule of speculative sampling: greedy
 //! answers do not change, and sampled ones keep their distribution.
 //!
+//! A [`Scorer`] gives the log-likelihood of continuations after contexts,
+//! what evaluations by choice and perplexities are made of.
+//!
 //! An answer may be held to a form ([`Constraint`]: a JSON schema, any JSON
 //! object, a regular expression, a Lark grammar, a list of texts): the
 //! tokens that cannot continue it get no chance, by llguidance's parser.
@@ -53,6 +56,7 @@ mod generate;
 mod gguf;
 mod multi_token;
 mod sampling;
+mod score;
 mod speculative;
 mod text;
 
@@ -62,7 +66,9 @@ pub use batch::Batch;
 pub use constraint::Constraint;
 pub use engine::{Engine, EngineOptions, EngineStats, Event, Prepared, RequestId, StepError};
 pub use generate::{Finish, Generation, LoadOptions, Piece, Pipeline, Request};
+pub use gguf::save_gguf;
 pub use sampling::Sampling;
+pub use score::{Score, Scorer};
 pub use speculative::{Draft, SpeculationStats, Speculative};
 
 /// What can go wrong when generating.

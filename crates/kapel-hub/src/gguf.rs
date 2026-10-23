@@ -356,6 +356,218 @@ impl Gguf {
     }
 }
 
+/// A metadata value to write, with its GGUF type: llama.cpp reads each key
+/// as one type (`block_count` as `u32`, `rope.freq_base` as `f32`, …).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Entry {
+    /// `u8`.
+    U8(u8),
+    /// `i8`.
+    I8(i8),
+    /// `u16`.
+    U16(u16),
+    /// `i16`.
+    I16(i16),
+    /// `u32`.
+    U32(u32),
+    /// `i32`.
+    I32(i32),
+    /// `f32`.
+    F32(f32),
+    /// A boolean.
+    Bool(bool),
+    /// A UTF-8 string.
+    String(String),
+    /// An array of values of one type, that of its first. An empty array is
+    /// one of strings.
+    Array(Vec<Entry>),
+    /// `u64`.
+    U64(u64),
+    /// `i64`.
+    I64(i64),
+    /// `f64`.
+    F64(f64),
+}
+
+impl Entry {
+    /// An array of strings.
+    pub fn strings<S: Into<String>>(values: impl IntoIterator<Item = S>) -> Self {
+        Self::Array(values.into_iter().map(|s| Self::String(s.into())).collect())
+    }
+
+    /// The GGUF type number.
+    fn kind(&self) -> u32 {
+        match self {
+            Self::U8(_) => 0,
+            Self::I8(_) => 1,
+            Self::U16(_) => 2,
+            Self::I16(_) => 3,
+            Self::U32(_) => 4,
+            Self::I32(_) => 5,
+            Self::F32(_) => 6,
+            Self::Bool(_) => 7,
+            Self::String(_) => 8,
+            Self::Array(_) => 9,
+            Self::U64(_) => 10,
+            Self::I64(_) => 11,
+            Self::F64(_) => 12,
+        }
+    }
+
+    fn write(&self, out: &mut Vec<u8>) -> std::result::Result<(), String> {
+        match self {
+            Self::U8(v) => out.push(*v),
+            Self::I8(v) => out.extend(v.to_le_bytes()),
+            Self::U16(v) => out.extend(v.to_le_bytes()),
+            Self::I16(v) => out.extend(v.to_le_bytes()),
+            Self::U32(v) => out.extend(v.to_le_bytes()),
+            Self::I32(v) => out.extend(v.to_le_bytes()),
+            Self::F32(v) => out.extend(v.to_le_bytes()),
+            Self::Bool(v) => out.push(u8::from(*v)),
+            Self::String(s) => {
+                out.extend((s.len() as u64).to_le_bytes());
+                out.extend(s.as_bytes());
+            }
+            Self::Array(values) => {
+                let kind = values.first().map_or(8, Self::kind);
+                if values.iter().any(|v| v.kind() != kind) {
+                    return Err("an array mixes types".into());
+                }
+                out.extend(kind.to_le_bytes());
+                out.extend((values.len() as u64).to_le_bytes());
+                for v in values {
+                    v.write(out)?;
+                }
+            }
+            Self::U64(v) => out.extend(v.to_le_bytes()),
+            Self::I64(v) => out.extend(v.to_le_bytes()),
+            Self::F64(v) => out.extend(v.to_le_bytes()),
+        }
+        Ok(())
+    }
+}
+
+/// The ggml type number of a Kapel type, if GGUF holds it.
+pub fn ggml_type(dtype: DType) -> Option<u32> {
+    (0..=30).find(|&t| dtype_of(t) == Some(dtype))
+}
+
+/// The bytes of a tensor in host memory, in row-major order: borrowed when
+/// it is contiguous, copied otherwise. A quantized tensor must be
+/// contiguous, from a whole block.
+pub(crate) fn host_bytes(tensor: &Tensor) -> Result<std::borrow::Cow<'_, [u8]>> {
+    let dtype = tensor.dtype();
+    if !tensor.is_contiguous() {
+        if dtype.is_quantized() {
+            return Err(HubError::Tensor(kapel_core::Error::BlockMisaligned {
+                dtype,
+                elements: tensor.numel(),
+            }));
+        }
+        let copy = tensor.contiguous()?;
+        return Ok(std::borrow::Cow::Owned(host_bytes(&copy)?.into_owned()));
+    }
+    let bytes = tensor
+        .storage()
+        .host_bytes()
+        .ok_or(kapel_core::Error::WrongDevice {
+            op: "host_bytes",
+            expected: kapel_core::Device::Cpu,
+            got: tensor.device(),
+        })?;
+    let from = dtype.storage_bytes(tensor.layout().offset())?;
+    let len = dtype.storage_bytes(tensor.numel())?;
+    Ok(std::borrow::Cow::Borrowed(&bytes[from..from + len]))
+}
+
+/// Writes a GGUF file (version 3): `metadata` in its order, then the
+/// descriptions of `tensors` and their data, each aligned on 32 bytes. The
+/// tensors must be in host memory; views are written in row-major order,
+/// quantized tensors as their blocks. The file is written under a temporary
+/// name and renamed into place ([`crate::write_atomic`]), the data streamed
+/// tensor by tensor.
+///
+/// # Errors
+///
+/// [`HubError::Format`] for a type GGUF does not hold, an array that mixes
+/// types or a key given twice; [`HubError::Io`] if the file cannot be
+/// written; a tensor error for a tensor outside host memory.
+pub fn write(
+    path: impl AsRef<Path>,
+    metadata: &[(&str, Entry)],
+    tensors: &[(&str, &Tensor)],
+) -> Result<()> {
+    let path = path.as_ref();
+    let string = |out: &mut Vec<u8>, s: &str| {
+        out.extend((s.len() as u64).to_le_bytes());
+        out.extend(s.as_bytes());
+    };
+    let mut header = b"GGUF".to_vec();
+    header.extend(3u32.to_le_bytes());
+    header.extend((tensors.len() as u64).to_le_bytes());
+    header.extend((metadata.len() as u64).to_le_bytes());
+    let mut keys = std::collections::BTreeSet::new();
+    for (key, value) in metadata {
+        if !keys.insert(*key) {
+            return Err(HubError::format(path, format!("key {key:?} given twice")));
+        }
+        if *key == "general.alignment" && *value != Entry::U32(DEFAULT_ALIGNMENT as u32) {
+            return Err(HubError::format(
+                path,
+                "only the default alignment (32) is written",
+            ));
+        }
+        string(&mut header, key);
+        header.extend(value.kind().to_le_bytes());
+        value
+            .write(&mut header)
+            .map_err(|e| HubError::format(path, format!("{key}: {e}")))?;
+    }
+    let mut offset = 0usize;
+    let mut sizes = Vec::with_capacity(tensors.len());
+    for (name, tensor) in tensors {
+        let kind = ggml_type(tensor.dtype()).ok_or_else(|| {
+            HubError::format(
+                path,
+                format!("tensor {name:?}: GGUF cannot hold {}", tensor.dtype()),
+            )
+        })?;
+        string(&mut header, name);
+        header.extend((tensor.rank() as u32).to_le_bytes());
+        for &d in tensor.shape().iter().rev() {
+            header.extend((d as u64).to_le_bytes());
+        }
+        header.extend(kind.to_le_bytes());
+        header.extend((offset as u64).to_le_bytes());
+        let size = tensor.dtype().storage_bytes(tensor.numel())?;
+        sizes.push(size);
+        offset = (offset + size).next_multiple_of(DEFAULT_ALIGNMENT);
+    }
+    header.resize(header.len().next_multiple_of(DEFAULT_ALIGNMENT), 0);
+    // The bytes of every tensor, checked before the file is opened.
+    for (_, tensor) in tensors {
+        host_bytes(tensor)?;
+    }
+    let mut failure = None;
+    crate::write_atomic(path, |file| {
+        file.write_all(&header)?;
+        let padding = [0u8; DEFAULT_ALIGNMENT];
+        for ((_, tensor), &size) in tensors.iter().zip(&sizes) {
+            let bytes = match host_bytes(tensor) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    failure = Some(e);
+                    return Err(std::io::Error::other("a tensor cannot be read"));
+                }
+            };
+            file.write_all(&bytes)?;
+            file.write_all(&padding[..size.next_multiple_of(DEFAULT_ALIGNMENT) - size])?;
+        }
+        Ok(())
+    })
+    .map_err(|e| failure.take().unwrap_or(e))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -504,6 +716,93 @@ mod tests {
         // Its start must still lie in the file.
         let error = error_of(gguf(&[], &[("iq", &[32], 16, 9)], &data));
         assert!(error.contains("starts beyond the file"), "{error}");
+    }
+
+    #[test]
+    fn a_written_file_reads_back() {
+        use crate::gguf::Entry as W;
+        let dir = std::env::temp_dir().join(format!("kapel-gguf-write-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.gguf");
+        let a = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]).unwrap();
+        let t = a.transpose(0, 1).unwrap();
+        let values: Vec<f32> = (0..64).map(|i| (i as f32 - 30.0) / 7.0).collect();
+        let q4 = DType::Quantized(QuantFormat::Q4_0);
+        let codes = kapel_core::quantize(q4, &values).unwrap();
+        let q = Tensor::from_bytes(q4, &[2, 32], &codes).unwrap();
+        let metadata = [
+            ("general.architecture", W::String("llama".into())),
+            ("llama.block_count", W::U32(2)),
+            ("llama.rope.freq_base", W::F32(500_000.0)),
+            ("x.i8", W::I8(-3)),
+            ("x.u64", W::U64(1 << 40)),
+            ("x.bool", W::Bool(true)),
+            ("x.f64", W::F64(0.25)),
+            ("x.list", W::Array(vec![W::I32(1), W::I32(-2)])),
+            ("x.words", W::strings(["a", "b c"])),
+        ];
+        write(&path, &metadata, &[("a", &a), ("t", &t), ("q", &q)]).unwrap();
+        let file = Gguf::open(&path).unwrap();
+        assert_eq!(file.metadata["llama.block_count"], Value::Uint(2));
+        assert_eq!(
+            file.metadata["llama.rope.freq_base"],
+            Value::Float(500_000.0)
+        );
+        assert_eq!(file.metadata["x.i8"], Value::Int(-3));
+        assert_eq!(file.metadata["x.u64"], Value::Uint(1 << 40));
+        assert_eq!(file.metadata["x.bool"], Value::Bool(true));
+        assert_eq!(file.metadata["x.f64"], Value::Float(0.25));
+        assert_eq!(
+            file.metadata["x.list"],
+            Value::Array(vec![Value::Int(1), Value::Int(-2)])
+        );
+        assert_eq!(
+            file.metadata["x.words"],
+            Value::Array(vec![Value::String("a".into()), Value::String("b c".into())])
+        );
+        assert_eq!(
+            file.tensor("a").unwrap().to_vec::<f32>().unwrap(),
+            a.to_vec::<f32>().unwrap()
+        );
+        let t_read = file.tensor("t").unwrap();
+        assert_eq!(t_read.shape(), [3, 2]);
+        assert_eq!(
+            t_read.to_vec::<f32>().unwrap(),
+            [1.0, 4.0, 2.0, 5.0, 3.0, 6.0]
+        );
+        let q_read = file.tensor("q").unwrap();
+        assert_eq!(q_read.dtype(), q4);
+        assert_eq!(q_read.to_f64_vec().unwrap(), q.to_f64_vec().unwrap());
+        // A key given twice, or an array of two types, is refused.
+        let twice = [("k", W::U8(1)), ("k", W::U8(2))];
+        assert!(write(&path, &twice, &[]).is_err());
+        let mixed = [("k", W::Array(vec![W::U8(1), W::I8(2)]))];
+        assert!(write(&path, &mixed, &[]).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Kapel's quantization gives the bytes of llama.cpp's (`gguf-py`'s) for
+    /// the GGUF formats it writes.
+    #[test]
+    fn quantization_gives_the_bytes_of_llama_cpp() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/parity/gguf");
+        let Ok(gguf) = Gguf::open(dir.join("quants.gguf")) else {
+            crate::parity_skipped("data/parity/gguf/quants.gguf");
+            return;
+        };
+        let Ok(source) = gguf.tensor("source") else {
+            crate::parity_skipped("data/parity/gguf/quants.gguf of the current gguf_reference.py");
+            return;
+        };
+        let source = source.to_vec::<f32>().unwrap();
+        for name in ["q8_0", "q4_0", "q4_1"] {
+            let want = gguf.tensor(&format!("quantized_{name}")).unwrap();
+            let bytes = host_bytes(&want).unwrap();
+            let got = kapel_core::quantize(want.dtype(), &source).unwrap();
+            assert_eq!(got.len(), bytes.len(), "{name}");
+            let differ = got.iter().zip(bytes.iter()).filter(|(a, b)| a != b).count();
+            assert_eq!(differ, 0, "{name}: {differ} bytes differ");
+        }
     }
 
     /// The file written by `tools/parity/gguf_reference.py`; without it (in

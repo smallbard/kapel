@@ -206,8 +206,9 @@ impl<B: Backend + Transfer> Pipeline<B> {
     /// Loads a GGUF file onto `backend`: the model, its tokenizer, its chat
     /// template and its end tokens, all from the file. The weights stay in
     /// their types (quantized ones included), except those that `dtype`
-    /// converts, as in [`Pipeline::load`]. A GGUF file has no
-    /// `generation_config.json`: the default sampling is greedy.
+    /// converts, as in [`Pipeline::load`]. The default sampling is that of
+    /// the file's `general.sampling.*`, which llama.cpp's converter copies
+    /// from `generation_config.json`; without them, greedy.
     ///
     /// # Errors
     ///
@@ -231,7 +232,7 @@ impl<B: Backend + Transfer> Pipeline<B> {
             tokenizer: vocabulary.tokenizer,
             template: vocabulary.template,
             eos: vocabulary.eos,
-            sampling: Sampling::default(),
+            sampling: crate::gguf::sampling(&gguf),
             cache_dtype: options.cache_dtype,
             grammars: OnceLock::new(),
         })

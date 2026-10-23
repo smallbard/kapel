@@ -1,0 +1,26 @@
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "kapel"
+description = "Kapel, an inference engine for small language models: load, generate, serve."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+dynamic = ["version"]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.maturin]
+module-name = "kapel"
+features = ["extension-module"]

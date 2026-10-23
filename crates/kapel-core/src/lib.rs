@@ -28,7 +28,10 @@ mod storage;
 mod tensor;
 
 pub use device::Device;
-pub use dtype::{DType, QuantFormat, dequantize, quantize};
+pub use dtype::{
+    BlockScale, DType, QuantFormat, block_code, block_scale, block_value, dequantize, encode_block,
+    quantize,
+};
 pub use error::{Error, Result};
 pub use layout::{Layout, Offsets};
 pub use scalar::{BF16, Element, F8E4M3, F8E5M2, F16};

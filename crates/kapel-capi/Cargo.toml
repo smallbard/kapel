@@ -1,0 +1,28 @@
+[package]
+name = "kapel-capi"
+description = "The C API of Kapel: libkapel and include/kapel.h."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[lib]
+name = "kapel"
+# A shared and a static library for C programs; the Rust library for the
+# tests of this crate.
+crate-type = ["cdylib", "staticlib", "rlib"]
+# Its documentation is the header; rustdoc's page would take the place of
+# that of the `kapel` command.
+doc = false
+
+[lints]
+workspace = true
+
+[features]
+# Runs models on an NVIDIA card (`cuda`, `cuda:N`): needs the CUDA toolkit.
+cuda = ["kapel-runtime/cuda"]
+
+[dependencies]
+kapel-runtime.workspace = true

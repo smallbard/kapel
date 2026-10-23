@@ -174,6 +174,29 @@ changelog says how.
 - `kapel-cuda`: `Cuda::memory`, the free and total memory of the device.
 - `tools/serve/openai_client.py`: the server through OpenAI's official Python
   client. A `Dockerfile` for the server on NVIDIA cards.
+- `kapel-quant`: quantizing models from calibration texts: rounding to the nearest,
+  GPTQ, AWQ, and AWQ then GPTQ, to Kapel's int8 and int4 and to GGUF's Q8_0, Q4_0 and
+  Q4_1, block by block on the processor or the card.
+- `kapel-core`: `block_scale`, `block_code`, `block_value` and `encode_block`, the
+  quantization of a block with a scale chosen elsewhere (by GPTQ or AWQ), giving the
+  bytes llama.cpp gives.
+- `kapel-hub`: writing GGUF files (`gguf::write`, `Entry`, `ggml_type`).
+- `kapel-models`: `Model::to_gguf`, a model with llama.cpp's names and layout;
+  `Model::embed`, `Model::block`, `Model::tensor`, `Model::names`,
+  `Model::replace` and `Site`, to compute and change a model one block at a time.
+- `kapel-infer`: `save_gguf`, a model and its tokenizer written to a GGUF file that
+  llama.cpp reads; `Scorer`, the log-likelihood of continuations after contexts,
+  sharing the cache between sequences that begin alike.
+- `kapel-cli`: `kapel quantize`, to GGUF or to a model directory; `kapel eval`, the
+  tasks of lm-evaluation-harness (perplexity, HellaSwag, ARC, MMLU) replayed by Kapel,
+  tokenized and scored as lm-evaluation-harness does.
+- `tools/eval/export_tasks.py`: the requests of lm-evaluation-harness's tasks,
+  written once for `kapel eval`.
+- `kapel-runtime`: a model loaded on whichever device, behind one type, for the
+  bindings.
+- `kapel-capi`: the C API, `libkapel` and `include/kapel.h`, with an example in C.
+- `kapel-python`: the Python module `kapel` (PyO3, stable ABI from Python 3.9): load,
+  generate, chat, serve. CI builds both and tests them on Linux, macOS and Windows.
 
 ### Changed
 

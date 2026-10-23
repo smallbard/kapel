@@ -1,4 +1,5 @@
-//! The arguments of `kapel run` and `kapel serve`.
+//! The arguments of `kapel run` and `kapel serve`, and the options of
+//! loading that `kapel eval` shares.
 
 use kapel_core::DType;
 use kapel_infer::Sampling;
@@ -133,7 +134,7 @@ fn format(value: &str) -> Result<DType, String> {
     }
 }
 
-fn number<T: std::str::FromStr>(option: &str, value: &str) -> Result<T, String> {
+pub(crate) fn number<T: std::str::FromStr>(option: &str, value: &str) -> Result<T, String> {
     value
         .parse()
         .map_err(|_| format!("{option}: {value:?} is not a valid number"))
@@ -192,7 +193,7 @@ fn load_option(
 
 /// Walks `args`: each option with `option` (which reads its value with the
 /// closure it is given), the model's name aside.
-fn walk(
+pub(crate) fn walk(
     command: &str,
     args: &[String],
     load: &mut Load,

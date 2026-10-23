@@ -1,5 +1,6 @@
 """A GGUF test file with one tensor per quantization format, and the values
-`gguf-py` (llama.cpp's reference) dequantizes them to.
+`gguf-py` (llama.cpp's reference) dequantizes them to; and values quantized
+by `gguf-py` to the formats Kapel writes (`quantized_q8_0`, … of `source`).
 
 Writes data/parity/gguf/quants.gguf and data/parity/gguf/expected.safetensors.
 Usage: python tools/parity/gguf_reference.py
@@ -9,7 +10,7 @@ from pathlib import Path
 
 import numpy as np
 from gguf import GGMLQuantizationType as T, GGUFWriter, GGML_QUANT_SIZES
-from gguf.quants import dequantize
+from gguf.quants import dequantize, quantize
 from safetensors.numpy import save_file
 
 # The byte ranges of the f16 scales in each block, to keep them finite.
@@ -39,6 +40,15 @@ def main():
         raw = blocks.reshape(rows, cols // block * size)
         writer.add_tensor(qtype.name.lower(), raw, raw_dtype=qtype)
         expected[qtype.name.lower()] = dequantize(raw, qtype).astype(np.float32).reshape(rows, cols)
+    # Normal values, with a few large ones, and a block of zeros.
+    source = rng.standard_normal((4, 256)).astype(np.float32) * 0.02
+    source[1, 7] = 0.9
+    source[2, 100] = -1.3
+    source[3, :32] = 0.0
+    writer.add_tensor("source", source)
+    for qtype in [T.Q8_0, T.Q4_0, T.Q4_1]:
+        raw = quantize(source, qtype)
+        writer.add_tensor(f"quantized_{qtype.name.lower()}", raw, raw_dtype=qtype)
     plain = rng.standard_normal((2, 3, 4)).astype(np.float32)
     writer.add_tensor("f32", plain)
     expected["f32"] = plain

@@ -23,6 +23,8 @@ kapel-models = { path = "crates/kapel-models" }
 kapel-infer = { path = "crates/kapel-infer" }
 kapel-train = { path = "crates/kapel-train" }
 kapel-serve = { path = "crates/kapel-serve" }
+kapel-quant = { path = "crates/kapel-quant" }
+kapel-runtime = { path = "crates/kapel-runtime" }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query"] }
 fancy-regex = "0.16"
 futures-util = { version = "0.3", default-features = false }

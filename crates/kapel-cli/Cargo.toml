@@ -26,6 +26,7 @@ kapel-cpu.workspace = true
 kapel-hub.workspace = true
 kapel-infer.workspace = true
 kapel-models.workspace = true
+kapel-quant.workspace = true
 kapel-serve.workspace = true
 kapel-tokenizers.workspace = true
 kapel-cuda = { workspace = true, optional = true }

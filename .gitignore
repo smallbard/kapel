@@ -11,3 +11,6 @@
 /kernels/*.ll
 /kernels/*.ptx
 /.venv
+__pycache__/
+.pytest_cache/
+/dist

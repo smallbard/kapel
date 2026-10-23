@@ -17,16 +17,22 @@
 //! - The RoPE scaling of Llama 3 is stored as its per-frequency factors
 //!   (`rope_freqs.weight`); the parameters that give them are recovered and
 //!   checked against them.
+//!
+//! [`Model::to_gguf`] goes the other way, as llama.cpp's converter
+//! (`convert_hf_to_gguf.py`) does: the same names and metadata, the query
+//! and key rows of Llama reordered, the norms in `f32`, the factors of Llama
+//! 3's scaling computed. The tokenizer's metadata is `kapel-infer`'s part.
 
 use std::collections::BTreeMap;
 
+use kapel_core::{DType, QuantFormat, Tensor};
 use kapel_hub::Gguf;
-use kapel_hub::gguf::Value as Meta;
-use kapel_ops::RopeLayout;
+use kapel_hub::gguf::{Entry, Value as Meta};
+use kapel_ops::{Backend, Cast, RopeLayout, RopeScaling};
 use serde_json::{Value, json};
 
 use crate::ModelError;
-use crate::config::Config;
+use crate::config::{Block, Config};
 use crate::model::Model;
 
 type Result<T> = std::result::Result<T, ModelError>;
@@ -231,9 +237,263 @@ impl Model {
     }
 }
 
+/// The GGUF name of a weight of `transformers`, if llama.cpp has one.
+fn gguf_name(name: &str) -> Option<String> {
+    match name {
+        "model.embed_tokens.weight" => return Some("token_embd.weight".into()),
+        "model.norm.weight" => return Some("output_norm.weight".into()),
+        "lm_head.weight" => return Some("output.weight".into()),
+        _ => {}
+    }
+    let rest = name.strip_prefix("model.layers.")?;
+    let (layer, rest) = rest.split_once('.')?;
+    let layer: usize = layer.parse().ok()?;
+    let (base, kind) = rest.rsplit_once('.')?;
+    // `post_attention_layernorm` is the norm of the MLP in a Llama block.
+    let (gguf, _) = BLOCK_NAMES.iter().find(|(_, hf)| *hf == base)?;
+    Some(format!("blk.{layer}.{gguf}.{kind}"))
+}
+
+/// The metadata and tensors of a GGUF file of llama.cpp: what
+/// [`Model::to_gguf`] gives, before the tokenizer's metadata is added.
+#[derive(Debug)]
+pub struct GgufModel {
+    /// The metadata of the architecture, in llama.cpp's order.
+    pub metadata: Vec<(String, Entry)>,
+    /// The tensors, under llama.cpp's names.
+    pub tensors: Vec<(String, Tensor)>,
+}
+
+/// llama.cpp's `general.file_type` of a model whose projections are mostly
+/// of type `dtype`.
+fn file_type(dtype: DType) -> Option<u32> {
+    Some(match dtype {
+        DType::F32 => 0,
+        DType::F16 => 1,
+        DType::Quantized(QuantFormat::Q4_0) => 2,
+        DType::Quantized(QuantFormat::Q4_1) => 3,
+        DType::Quantized(QuantFormat::Q8_0) => 7,
+        DType::Quantized(QuantFormat::Q5_0) => 8,
+        DType::Quantized(QuantFormat::Q5_1) => 9,
+        DType::Quantized(QuantFormat::Q2K) => 10,
+        DType::Quantized(QuantFormat::Q4K) => 15,
+        DType::Quantized(QuantFormat::Q5K) => 17,
+        DType::Quantized(QuantFormat::Q6K) => 18,
+        DType::BF16 => 32,
+        _ => return None,
+    })
+}
+
+/// The rows of `w` `[N, K]` reordered: row `i` of the result is row
+/// `order[i]` of `w`. Quantized rows move as their blocks.
+fn reorder_rows(w: &Tensor, order: &[usize]) -> Result<Tensor> {
+    let w = w.contiguous()?;
+    let (n, k) = (w.shape()[0], w.shape()[1]);
+    let row = w.dtype().storage_bytes(k)?;
+    let bytes = w
+        .storage()
+        .host_bytes()
+        .ok_or_else(|| ModelError::Config("the weights must be in host memory".into()))?;
+    let from = w.dtype().storage_bytes(w.layout().offset())?;
+    let mut out = Vec::with_capacity(n * row);
+    for &r in order {
+        out.extend_from_slice(&bytes[from + r * row..from + (r + 1) * row]);
+    }
+    Ok(Tensor::from_bytes(w.dtype(), &[n, k], &out)?)
+}
+
+/// The order of llama.cpp's converter for the query or key rows of Llama,
+/// `heads` heads of `d` components: within each head, the two halves
+/// interleaved, so that RoPE pairs neighbours.
+fn interleaved(heads: usize, d: usize) -> Vec<usize> {
+    (0..heads * d)
+        .map(|r| {
+            let (h, j) = (r / d, r % d);
+            h * d + (j % 2) * (d / 2) + j / 2
+        })
+        .collect()
+}
+
+impl Model {
+    /// The model as llama.cpp's converter writes it to GGUF: Llama (and
+    /// Mistral, which GGUF files as Llama), Qwen 2 and Qwen 3, under
+    /// llama.cpp's names, with its metadata. Weights keep their types,
+    /// quantized or not; one-dimensional ones (norms, biases) are converted
+    /// to `f32` on `backend`, as llama.cpp keeps them. The weights must be in
+    /// host memory, and not [fused](Model::fused).
+    ///
+    /// # Errors
+    ///
+    /// For another architecture, a weight llama.cpp has no name for, a RoPE
+    /// scaling other than Llama 3's, or a weight outside host memory.
+    pub fn to_gguf<B: Backend>(&self, backend: &B) -> Result<GgufModel> {
+        let c = &self.config;
+        let arch = match c.model_type.as_str() {
+            "llama" | "mistral" => "llama",
+            "qwen2" => "qwen2",
+            "qwen3" => "qwen3",
+            other => {
+                return Err(ModelError::Config(format!(
+                    "{other:?} is not written to GGUF: Llama, Mistral, Qwen 2 and Qwen 3 are"
+                )));
+            }
+        };
+        if c.block != Block::Sequential {
+            return Err(ModelError::Config(
+                "only blocks of Llama's kind are written to GGUF".into(),
+            ));
+        }
+        let Some((theta, scaling, rotary)) = c.rope else {
+            return Err(ModelError::Config("a model without RoPE".into()));
+        };
+        // Llama's queries and keys pair halves in `transformers`, neighbours
+        // in llama.cpp. A model read from GGUF already pairs neighbours.
+        let reorder = arch == "llama" && c.rope_layout == RopeLayout::Half;
+        let mut tensors = Vec::new();
+        let mut projections: Vec<(DType, usize)> = Vec::new();
+        if let RopeScaling::Llama3 {
+            factor,
+            low_freq_factor,
+            high_freq_factor,
+            original_max_position,
+        } = scaling
+        {
+            let original = original_max_position as f64;
+            let factors: Vec<f32> = (0..rotary / 2)
+                .map(|j| {
+                    // In `f32`, as llama.cpp's converter computes them.
+                    let exponent = (2 * j) as f32 / rotary as f32;
+                    let frequency = 1.0 / (theta as f32).powf(exponent);
+                    let wavelength = std::f32::consts::TAU / frequency;
+                    let (factor, low, high) = (
+                        factor as f32,
+                        low_freq_factor as f32,
+                        high_freq_factor as f32,
+                    );
+                    let original = original as f32;
+                    if wavelength < original / high {
+                        1.0
+                    } else if wavelength > original / low {
+                        factor
+                    } else {
+                        let smooth = (original / wavelength - low) / (high - low);
+                        1.0 / ((1.0 - smooth) / factor + smooth)
+                    }
+                })
+                .collect();
+            tensors.push((
+                "rope_freqs.weight".to_string(),
+                Tensor::from_slice(&factors, &[rotary / 2])?,
+            ));
+        } else if scaling != RopeScaling::None {
+            return Err(ModelError::Config(format!(
+                "RoPE scaling {scaling:?} is not written to GGUF"
+            )));
+        }
+        for (name, w) in &self.weights {
+            if name.contains(".qkv_proj.") || name.contains(".gate_up_proj.") {
+                return Err(ModelError::Config(
+                    "a fused model is not written to GGUF: write it before fusing".into(),
+                ));
+            }
+            let gguf = gguf_name(name).ok_or_else(|| {
+                ModelError::Config(format!("weight {name:?} has no name in llama.cpp"))
+            })?;
+            let mut w = w.clone();
+            if w.rank() == 1 {
+                if w.dtype() != DType::F32 {
+                    w = backend.forward(&Cast { dtype: DType::F32 }, &[&w])?;
+                }
+            } else if name.ends_with("_proj.weight") {
+                match projections.iter_mut().find(|(d, _)| *d == w.dtype()) {
+                    Some((_, n)) => *n += w.numel(),
+                    None => projections.push((w.dtype(), w.numel())),
+                }
+            }
+            if reorder {
+                if name.ends_with("self_attn.q_proj.weight") {
+                    w = reorder_rows(&w, &interleaved(c.heads, c.head_dim))?;
+                } else if name.ends_with("self_attn.k_proj.weight") {
+                    w = reorder_rows(&w, &interleaved(c.kv_heads, c.head_dim))?;
+                }
+            }
+            tensors.push((gguf, w));
+        }
+        let mostly = projections
+            .iter()
+            .max_by_key(|(_, n)| *n)
+            .map_or(DType::F32, |(d, _)| *d);
+        let u32_of = |v: usize| Entry::U32(u32::try_from(v).unwrap_or(u32::MAX));
+        let key = |k: &str| format!("{arch}.{k}");
+        let mut metadata = vec![
+            (
+                "general.architecture".to_string(),
+                Entry::String(arch.into()),
+            ),
+            ("general.type".to_string(), Entry::String("model".into())),
+        ];
+        if let Some(name) = self.raw_config.get("_name_or_path").and_then(Value::as_str) {
+            let name = name.rsplit('/').next().unwrap_or(name);
+            metadata.push(("general.name".into(), Entry::String(name.into())));
+        }
+        metadata.extend([
+            (key("block_count"), u32_of(c.layers)),
+            (
+                key("context_length"),
+                u32_of(c.max_positions.unwrap_or(4096)),
+            ),
+            (key("embedding_length"), u32_of(c.hidden)),
+            (key("feed_forward_length"), u32_of(c.intermediate)),
+            (key("attention.head_count"), u32_of(c.heads)),
+            (key("attention.head_count_kv"), u32_of(c.kv_heads)),
+            (key("rope.freq_base"), Entry::F32(theta as f32)),
+            (
+                key("attention.layer_norm_rms_epsilon"),
+                Entry::F32(c.eps as f32),
+            ),
+            (key("attention.key_length"), u32_of(c.head_dim)),
+            (key("attention.value_length"), u32_of(c.head_dim)),
+        ]);
+        if let Some(t) = file_type(mostly) {
+            metadata.push(("general.file_type".into(), Entry::U32(t)));
+        }
+        if arch == "llama" {
+            metadata.push((key("vocab_size"), u32_of(c.vocab)));
+            metadata.push((key("rope.dimension_count"), u32_of(rotary)));
+        }
+        metadata.push(("general.quantization_version".into(), Entry::U32(2)));
+        Ok(GgufModel { metadata, tensors })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn names_go_back_to_llama_cpp() {
+        for gguf in [
+            "blk.3.attn_q.weight",
+            "blk.0.attn_k.bias",
+            "blk.11.ffn_down.weight",
+            "blk.2.ffn_norm.weight",
+            "blk.5.attn_q_norm.weight",
+            "token_embd.weight",
+            "output.weight",
+            "output_norm.weight",
+        ] {
+            assert_eq!(gguf_name(&hf_name(gguf).unwrap()).as_deref(), Some(gguf));
+        }
+        assert_eq!(gguf_name("model.mtp_layers.0.input_proj.weight"), None);
+    }
+
+    #[test]
+    fn interleaving_pairs_neighbours() {
+        // One head of 4 components: [0, 1, 2, 3] → [0, 2, 1, 3], so that
+        // components 0 and 2 (paired by halves) become neighbours.
+        assert_eq!(interleaved(1, 4), [0, 2, 1, 3]);
+        assert_eq!(interleaved(2, 4), [0, 2, 1, 3, 4, 6, 5, 7]);
+    }
 
     #[test]
     fn names_follow_transformers() {

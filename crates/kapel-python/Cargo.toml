@@ -1,0 +1,29 @@
+[package]
+name = "kapel-python"
+description = "The Python module of Kapel: load, generate, serve."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[lib]
+# The module is `kapel` (pyproject.toml); the library has its own name, so
+# that it does not collide with libkapel of kapel-capi.
+name = "kapel_python"
+crate-type = ["cdylib"]
+
+[lints]
+workspace = true
+
+[features]
+# Set by maturin (pyproject.toml): the module does not link to libpython,
+# the interpreter that imports it provides the symbols.
+extension-module = ["pyo3/extension-module"]
+# Runs models on an NVIDIA card (`device="cuda"`): needs the CUDA toolkit.
+cuda = ["kapel-runtime/cuda"]
+
+[dependencies]
+kapel-runtime.workspace = true
+pyo3 = { version = "0.30", default-features = false, features = ["macros", "abi3-py39"] }

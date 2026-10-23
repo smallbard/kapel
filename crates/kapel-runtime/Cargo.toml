@@ -1,0 +1,27 @@
+[package]
+name = "kapel-runtime"
+description = "A model loaded on its device, whichever it is: what Kapel's bindings to other languages share."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# Runs models on an NVIDIA card (`cuda`, `cuda:N`): needs the CUDA toolkit.
+cuda = ["dep:kapel-cuda", "kapel-cuda/cuda"]
+
+[dependencies]
+kapel-core.workspace = true
+kapel-cpu.workspace = true
+kapel-hub.workspace = true
+kapel-infer.workspace = true
+kapel-models.workspace = true
+kapel-ops.workspace = true
+kapel-serve.workspace = true
+kapel-tokenizers.workspace = true
+kapel-cuda = { workspace = true, optional = true }

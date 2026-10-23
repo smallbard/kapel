@@ -15,11 +15,13 @@ use crate::cache::{KvCache, PAGE, SequenceId, Step};
 use crate::config::{Block, Config, Norm};
 
 /// A model: its configuration and its weights, by their names in the checkpoint.
+/// A clone shares the weights.
+#[derive(Clone)]
 pub struct Model {
-    config: Config,
+    pub(crate) config: Config,
     /// `config.json` as read, written back unchanged by [`Model::save`].
-    raw_config: serde_json::Value,
-    weights: BTreeMap<String, Tensor>,
+    pub(crate) raw_config: serde_json::Value,
+    pub(crate) weights: BTreeMap<String, Tensor>,
 }
 
 type Result<T> = std::result::Result<T, ModelError>;
@@ -174,10 +176,54 @@ enum Logits {
     Rows(Vec<usize>),
 }
 
-/// The operations of the forward pass, on one backend.
-struct Ops<'a, B>(&'a B);
+/// The input of linear projections of a block, as [`Model::block`] shows
+/// them: what the projections that read it multiply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Site {
+    /// The normed hidden states, read by the query, key and value
+    /// projections.
+    Attention,
+    /// The attention's output, read by the output projection.
+    Output,
+    /// The normed hidden states after the attention, read by the gate and up
+    /// projections.
+    Mlp,
+    /// The gated unit's output, read by the down projection.
+    Down,
+}
+
+impl Site {
+    /// The four, in the order a block reads them.
+    pub const ALL: [Site; 4] = [Site::Attention, Site::Output, Site::Mlp, Site::Down];
+
+    /// The projections that read it, by their names in a block of Llama's
+    /// kind (after `model.layers.{i}.`).
+    pub fn projections(self) -> &'static [&'static str] {
+        match self {
+            Site::Attention => &["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"],
+            Site::Output => &["self_attn.o_proj"],
+            Site::Mlp => &["mlp.gate_proj", "mlp.up_proj"],
+            Site::Down => &["mlp.down_proj"],
+        }
+    }
+}
+
+/// What [`Model::block`] calls with each input of projections.
+pub type Observer<'a> = dyn FnMut(Site, &Tensor) -> Result<()> + 'a;
+
+/// The operations of the forward pass, on one backend, and who watches the
+/// inputs of the projections.
+struct Ops<'a, B>(&'a B, Option<std::cell::RefCell<&'a mut Observer<'a>>>);
 
 impl<B: Backend> Ops<'_, B> {
+    /// Shows `x`, the input of the projections at `site`, to the observer.
+    fn see(&self, site: Site, x: &Tensor) -> Result<()> {
+        match &self.1 {
+            Some(observer) => (observer.borrow_mut())(site, x),
+            None => Ok(()),
+        }
+    }
+
     fn linear(&self, x: &Tensor, w: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
         // `transformers` stores `[out, in]`: `y = x · wᵀ`, a view. Quantized
         // weights keep that layout, their blocks along `in`.
@@ -503,6 +549,140 @@ impl Model {
         })
     }
 
+    /// The name of the embedding table.
+    fn embed_name(&self) -> &'static str {
+        match self.config.block {
+            Block::Gpt2 => "transformer.wte.weight",
+            _ => "model.embed_tokens.weight",
+        }
+    }
+
+    /// The hidden states of `ids_tensor` before the first block: their rows
+    /// of the embedding table, scaled or with their positions added as the
+    /// architecture says.
+    fn embedded<B: Backend + Transfer>(
+        &self,
+        backend: &B,
+        ids_tensor: &Tensor,
+        positions: &Tensor,
+    ) -> Result<Tensor> {
+        let c = &self.config;
+        let ops = Ops(backend, None);
+        let embed = self.weight(self.embed_name())?;
+        let mut x = backend.forward(&GatherRows, &[embed, ids_tensor])?;
+        // The rows of a quantized table come in `f32`: the hidden states take
+        // the type of the float weights (the norms'), `bf16` on a card.
+        let final_norm = match c.block {
+            Block::Gpt2 => "transformer.ln_f.weight",
+            Block::Parallel => "model.final_layernorm.weight",
+            _ => "model.norm.weight",
+        };
+        if embed.dtype().is_quantized()
+            && let Some(norm) = self.optional(final_norm)
+            && norm.dtype() != x.dtype()
+            && norm.dtype().is_float()
+        {
+            x = backend.forward(
+                &Cast {
+                    dtype: norm.dtype(),
+                },
+                &[&x],
+            )?;
+        }
+        if let Some(scale) = c.embed_scale {
+            // Gemma rounds the factor to the type of the hidden states.
+            x = ops.affine(&x, rounded(x.dtype(), scale)?)?;
+        }
+        if c.block == Block::Gpt2 {
+            let wpe = backend.forward(
+                &GatherRows,
+                &[self.weight("transformer.wpe.weight")?, positions],
+            )?;
+            x = ops.binary(BinaryKind::Add, &x, &wpe)?;
+        }
+
+        Ok(x)
+    }
+
+    /// The hidden states `[T, hidden]` of the token ids `ids`, one sequence,
+    /// before the first block: what [`Model::block`] takes.
+    ///
+    /// # Errors
+    ///
+    /// If a weight is missing, or an operation fails on the backend.
+    pub fn embed<B: Backend + Transfer>(&self, backend: &B, ids: &[u32]) -> Result<Tensor> {
+        let positions: Vec<u32> = (0..ids.len() as u32).collect();
+        let positions = backend.upload(&Tensor::from_slice(&positions, &[ids.len()])?)?;
+        let ids = backend.upload(&Tensor::from_slice(ids, &[ids.len()])?)?;
+        self.embedded(backend, &ids, &positions)
+    }
+
+    /// The hidden states `x` `[T, hidden]` of one sequence through block
+    /// `layer`, without a cache, every position seeing the ones before it:
+    /// the forward pass one block at a time. `observe` sees the input of
+    /// each group of projections ([`Site`]) as it is computed; an error it
+    /// returns stops the pass.
+    ///
+    /// Blocks of Llama's kind only (Llama, Mistral, Qwen, Gemma), not
+    /// [fused](Model::fused).
+    ///
+    /// # Errors
+    ///
+    /// For another kind of block, a missing weight, an operation that fails
+    /// on the backend, or an error of `observe`.
+    pub fn block<B: Backend + Transfer>(
+        &self,
+        backend: &B,
+        layer: usize,
+        x: &Tensor,
+        observe: &mut Observer<'_>,
+    ) -> Result<Tensor> {
+        let c = &self.config;
+        if !matches!(c.block, Block::Sequential | Block::Sandwich) {
+            return Err(ModelError::Config(
+                "Model::block computes blocks of Llama's kind only".into(),
+            ));
+        }
+        if layer >= c.layers {
+            return Err(ModelError::Config(format!(
+                "block {layer} of a model of {} layers",
+                c.layers
+            )));
+        }
+        let t = x.shape()[0];
+        let positions: Vec<u32> = (0..t as u32).collect();
+        let positions = backend.upload(&Tensor::from_slice(&positions, &[t])?)?;
+        // The observer's lifetime is shortened to this call.
+        let observe: &mut Observer<'_> = observe;
+        let ops = Ops(backend, Some(std::cell::RefCell::new(observe)));
+        self.sequential(
+            &ops,
+            x,
+            &positions,
+            &mut None,
+            layer,
+            &format!("model.layers.{layer}"),
+            c.windows[layer],
+        )
+    }
+
+    /// A weight, by its name in the checkpoint.
+    pub fn tensor(&self, name: &str) -> Option<&Tensor> {
+        self.weights.get(name)
+    }
+
+    /// The names of the weights, sorted.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.weights.keys().map(String::as_str)
+    }
+
+    /// Puts `tensor` in place of the weight `name`, or adds it: the weight
+    /// it replaces, if any. Its shape is not checked against the
+    /// configuration.
+    pub fn replace(&mut self, name: &str, tensor: Tensor) -> Option<Tensor> {
+        self.weights.insert(name.to_string(), tensor)
+    }
+
     /// The logits `[T, vocab]` of the token ids `ids`, one sequence, without a
     /// cache: every position sees the ones before it. Every operation has a
     /// gradient: the pass of training.
@@ -630,7 +810,7 @@ impl Model {
         tokens: &[u32],
     ) -> Result<Tensor> {
         let c = &self.config;
-        let ops = Ops(backend);
+        let ops = Ops(backend, None);
         let n = tokens.len();
         if c.multi_token_layers == 0 || n == 0 || hidden.shape()[0] != n {
             return Err(ModelError::Tensor(kapel_core::Error::InvalidArgument {
@@ -1022,44 +1202,13 @@ impl Model {
         hidden: bool,
     ) -> Result<(Tensor, Option<Tensor>)> {
         let c = &self.config;
-        let ops = Ops(backend);
-
-        let (embed_name, prefix) = match c.block {
-            Block::Gpt2 => ("transformer.wte.weight", "transformer.h"),
-            _ => ("model.embed_tokens.weight", "model.layers"),
+        let ops = Ops(backend, None);
+        let prefix = match c.block {
+            Block::Gpt2 => "transformer.h",
+            _ => "model.layers",
         };
-        let embed = self.weight(embed_name)?;
-        let mut x = backend.forward(&GatherRows, &[embed, ids_tensor])?;
-        // The rows of a quantized table come in `f32`: the hidden states take
-        // the type of the float weights (the norms'), `bf16` on a card.
-        let final_norm = match c.block {
-            Block::Gpt2 => "transformer.ln_f.weight",
-            Block::Parallel => "model.final_layernorm.weight",
-            _ => "model.norm.weight",
-        };
-        if embed.dtype().is_quantized()
-            && let Some(norm) = self.optional(final_norm)
-            && norm.dtype() != x.dtype()
-            && norm.dtype().is_float()
-        {
-            x = backend.forward(
-                &Cast {
-                    dtype: norm.dtype(),
-                },
-                &[&x],
-            )?;
-        }
-        if let Some(scale) = c.embed_scale {
-            // Gemma rounds the factor to the type of the hidden states.
-            x = ops.affine(&x, rounded(x.dtype(), scale)?)?;
-        }
-        if c.block == Block::Gpt2 {
-            let wpe = backend.forward(
-                &GatherRows,
-                &[self.weight("transformer.wpe.weight")?, positions],
-            )?;
-            x = ops.binary(BinaryKind::Add, &x, &wpe)?;
-        }
+        let embed = self.weight(self.embed_name())?;
+        let mut x = self.embedded(backend, ids_tensor, positions)?;
 
         for layer in 0..c.layers {
             let p = format!("{prefix}.{layer}");
@@ -1180,6 +1329,7 @@ impl Model {
         let c = &self.config;
         let backend = ops.0;
         let h = self.norm(ops, x, &format!("{p}.input_layernorm"))?;
+        ops.see(Site::Attention, &h)?;
         let mut a = self.attention(ops, &h, positions, paged, layer, p, window)?;
         if c.block == Block::Sandwich {
             a = self.norm(ops, &a, &format!("{p}.post_attention_layernorm"))?;
@@ -1191,6 +1341,7 @@ impl Model {
             "post_attention_layernorm"
         };
         let h = self.norm(ops, &x, &format!("{p}.{before}"))?;
+        ops.see(Site::Mlp, &h)?;
         let inner = match self.optional(&format!("{p}.mlp.gate_up_proj.weight")) {
             // Stacked by `Model::fused`: one product, one gated unit.
             Some(w) => backend.forward(
@@ -1206,6 +1357,7 @@ impl Model {
                 ops.binary(BinaryKind::Mul, &ops.unary(c.activation, &gate)?, &up)?
             }
         };
+        ops.see(Site::Down, &inner)?;
         let mut m = ops.linear(
             &inner,
             self.weight(&format!("{p}.mlp.down_proj.weight"))?,
@@ -1360,6 +1512,7 @@ impl Model {
             } else {
                 "o_proj"
             };
+            ops.see(Site::Output, &y)?;
             let bias = if c.out_bias {
                 self.optional(&format!("{p}.self_attn.{out}.bias"))
             } else {
