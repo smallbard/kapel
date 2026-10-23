@@ -22,11 +22,13 @@ The whole backend sits behind the `cuda` feature, off by default, so the workspa
 
 Opening a backend creates a context and one stream, loads the PTX module, and prepares the tile-kernel runtime on the same stream.
 
-**The buffer pool.** Freeing device memory synchronizes the device, so a dropped tensor's buffer goes back to a pool keyed by exact size instead. Because there is one stream, a buffer can be handed out again even while kernels that used it are still queued. If an allocation fails, the backend empties the pool and its cached tables and tries once more.
+**The buffer pool.** Freeing device memory synchronizes the device, so a dropped tensor's buffer goes back to a pool keyed by exact size instead. Because there is one stream, a buffer can be handed out again even while kernels that used it are still queued. If an allocation fails, the backend empties the pool and tries again; only if that is not enough does it drop its cached tables too, and try a last time. A pass about to be recorded counts on finding the tables it just made.
 
-**Cached tables.** Reductions, softmax, max and RoPE need small index tables derived from shapes. Uploading from ordinary host memory waits for the stream, so these tables are cached on the device, up to 64 MiB, with oldest-first eviction.
+**Cached tables.** Reductions, softmax, max and RoPE need small index tables derived from shapes. Uploading from ordinary host memory waits for the stream, so these tables are cached on the device, up to 64 MiB; the least recently used goes first.
 
 **Host mirrors.** An upload of at most 1 MiB keeps a copy of its bytes on the host, next to the device buffer. Token ids, positions and page tables are such uploads, and an operation that needs their values on the host (the rows of a scatter, the prompts of a paged attention) reads the copy instead of waiting for the stream. A gather reads its row indices in place on the device when they are contiguous `u32` or `i32`. A kernel that writes into a storage drops its mirror.
+
+**Free memory.** `Cuda::memory()` gives the free and total bytes of the device, as the driver counts them (other processes included); `kapel serve` sizes its cache with it, after `clear_pool`.
 
 **What waits.** Most operations return as soon as their kernels are queued. The exceptions are `download` and `upload`, the first use of a shape by an operation that needs a table, index tensors made on the device and then needed on the host, and the operations that still go through the host: casts to or from non-float types, products and gathers by weights in Q2_K or Q3_K (dequantized on the host), and attention masks that are not `f32`.
 
@@ -145,7 +147,11 @@ A replay writes into the very buffers of the recorded pass, so these must not go
 
 A recorded pass must not wait for the device or copy from the host, since nothing runs during capture. The first pass of a shape is therefore run once before it is recorded: its tile kernels are compiled and its tables made. Rotary angle tables are cached by the bytes of their positions, and kept with the recording, so that the layers of a pass share one table, computed once per replay. Host mirrors (section 7.2) give index values without waiting.
 
-The stream is the device's only one, so while a pass records, no other thread may use the backend: its work would be recorded too. The tests of `tests/recorded.rs` take a lock for this, and check that replays give the bits of eager steps, that a recording changes nothing around it, and that a replay takes new inputs.
+A graph also reads the backend's cached tables at every replay, long after the operation that looked them up has dropped its handle. While recording, every table looked up (`Cuda::table`, found or made) is therefore kept in the arena (`Arena::tables`, through `retain_in_arena`): the cache may let the table go, but its memory is not reused while the recording lives.
+
+A capture that fails (the pass returned an error, or the driver refused to end the capture, for lack of memory say) ends the capture all the same, destroys the partial graph, empties the pool, so that a second attempt has the memory, and returns the error. The step itself was computed by the eager pass before the capture, so a caller loses only the recording (chapter 10, `Recorded::Unrecorded`).
+
+The stream is the device's only one, so while a pass records, no other thread may use the backend: its work would be recorded too. The tests of `tests/recorded.rs` take a lock for this, and check that replays give the bits of eager steps, that a recording changes nothing around it, that a replay takes new inputs, that a recording of eight rows serves three sequences then two of them (its padding rows writing lines of their own, `a_recording_serves_smaller_batches`), and that a recording keeps the tables it reads: after `clear_pool` and fresh uploads written over the freed memory, replays still give the logits of eager steps (`a_recording_keeps_the_tables_it_reads`, which crashes the card without the arena's tables).
 
 ## 7.9 Quantized products
 
@@ -164,6 +170,8 @@ Measured on an RTX 3090 with Llama 3.2 3B in bf16, 128 tokens of prompt and 256 
 | bandwidth, one sequence | 720 GB/s | 81 % of the 885 GB/s a copy reaches |
 | prompt of 4096 tokens | 0.76 s | |
 | f8 E4M3 cache, 64 sequences | 3331 tokens/s | same as bf16 |
+
+Served by `kapel serve` (chapter 12) with requests of 16 to 128 prompt tokens and 32 to 384 generated, the same 3B model sustains about 20 requests and 4300 generated tokens per second, 256 sequences at a time.
 
 Llama 3.2 1B decodes at 425 tokens per second in Q4_K_M, 412 in Q8_0 and 272 in bf16; Llama 3.2 3B at 166 in int8 and 179 in int4.
 

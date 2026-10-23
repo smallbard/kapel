@@ -1,8 +1,8 @@
-# 13. Working on Kapel
+# 14. Working on Kapel
 
 This chapter is the practical companion to the rest of the book: how to build and test Kapel, how correctness and speed are verified, what continuous integration checks, and where the project goes next.
 
-## 13.1 Building and testing
+## 14.1 Building and testing
 
 ```
 cargo fmt --all
@@ -19,7 +19,7 @@ cargo test -p kapel-cuda --features cuda
 
 Rebuilding the thread kernels after changing `kernels/src/lib.rs` needs the nightly toolchain pinned in `kernels/rust-toolchain.toml` and `cargo oxide`: run `kernels/build.sh`, and commit the regenerated `crates/kapel-cuda/kernels.ptx`.
 
-## 13.2 The layers of testing
+## 14.2 The layers of testing
 
 | Layer | What it proves | Where |
 | --- | --- | --- |
@@ -30,21 +30,25 @@ Rebuilding the thread kernels after changing `kernels/src/lib.rs` needs the nigh
 | Parity | the same tokens, renderings, logits and generations as `transformers`, `tokenizers` and llama.cpp | `tests/parity.rs`, `tools/parity/` |
 | Fuzzing | no panic, hang or out-of-bounds read on any input | `fuzz/` |
 
+The server has a check of its own: `tools/serve/openai_client.py` drives a running server with OpenAI's official Python client, unchanged, through every feature the server offers (chapter 12).
+
 Parity tests need reference data produced by the Python scripts in `tools/parity/` and stored in `data/parity/`, which is not in git. Without it they print that they were skipped; with `KAPEL_REQUIRE_PARITY=1` they fail instead, which is what a machine that has the data should set.
 
-## 13.3 Measuring performance
+## 14.3 Measuring performance
 
 The rule "every optimization comes with a measurement" is applied with example programs that live next to the code they measure:
 
 | Crate | Examples |
 | --- | --- |
 | `kapel-cpu` | `gemm`, `gemm_few_rows`, `gemm_bf16`, `attention`, `reduce`, `softmax` |
-| `kapel-cuda` | `gemm`, `attention`, `reductions`, `prefill` |
+| `kapel-cuda` | `gemm`, `attention`, `reductions`, `prefill`, `decode`, `quantized` |
 | `kapel-tokenizers` | `encode` |
+| `kapel-cli` | `throughput`, `perplexity`, `profile` |
+| `kapel-serve` | `load`: a Poisson load on a server, the latencies of the first token and between tokens |
 
 Run them with `cargo run --release -p <crate> --example <name>`, on an idle machine. They report the best of several runs after a warm-up, in Gop/s, GB/s or tokens per second. The CUDA examples count operations conventionally, for instance two operations per multiply-add, and only the visible half of causal attention scores.
 
-## 13.4 Continuous integration
+## 14.4 Continuous integration
 
 | Job | When | What |
 | --- | --- | --- |
@@ -57,7 +61,7 @@ Run them with `cargo run --release -p <crate> --example <name>`, on an idle mach
 
 The GPU job never runs code from forks, because anyone can open a pull request and the runner is a real machine; it also runs with read-only permissions and no stored credentials.
 
-## 13.5 Contributing
+## 14.5 Contributing
 
 The rules of chapter 1 are also the review checklist:
 
@@ -68,15 +72,15 @@ The rules of chapter 1 are also the review checklist:
 - Every `unsafe` block has a `// SAFETY:` comment.
 - Code, documentation and messages are in English, and `CHANGELOG.md` gets a line under *Unreleased*.
 
-## 13.6 The road ahead
+## 14.6 The road ahead
 
-The foundation plan is complete. The first inference step, correct generation, landed on 21 October 2026; the second, the CPU, on 22 October, but for its ARM kernels and a cache of keys and values in int8; and the third, the card, the same day. Its targets were 70 % of vLLM's throughput for batches, met at 90 %, and 90 % of the card's bandwidth for one sequence, missed at 81 %: the products alone reach 92 %, and the rest of a token goes to the small kernels between them. The rest of the inference plan and the whole training plan are ahead:
+The foundation plan is complete. The first inference step, correct generation, landed on 21 October 2026; the second, the CPU, on 22 October, but for its ARM kernels and a cache of keys and values in int8; and the third, the card, the same day. Its targets were 70 % of vLLM's throughput for batches, met at 90 %, and 90 % of the card's bandwidth for one sequence, missed at 81 %: the products alone reach 92 %, and the rest of a token goes to the small kernels between them. The fourth, the server, landed on 23 October 2026. Its targets were a first token within 500 ms for 99 % of the requests up to 80 % of the maximal throughput, met up to 90 % (83 ms there, 63 ms at 80 %), and OpenAI's official clients working unchanged, met. The validation needs no other server: the load is drawn as Smallem's simulator drew it, and the maximal throughput is the server's own. The rest of the inference plan and the whole training plan are ahead:
 
 | Step | Goal | Main pieces |
 | --- | --- | --- |
 | I1 | The best single-sequence generation on CPU, x86 and ARM | done on x86 (chapter 6); left: NEON kernels and `sdot`, a cache of keys and values in int8 |
 | I2 | Batched generation on a GPU | done (chapters 7, 10 and 11): a cache by pages of 16 positions, paged attention, CUDA graphs, products by quantized weights on the card, batches |
-| I3 | A production server | continuous batching, shared prefixes, an OpenAI-compatible API, constrained output |
+| I3 | A production server | done (chapters 10, 11 and 12): continuous batching, shared prefixes, an OpenAI-compatible API with streaming and cancellation, constrained output, metrics, logs, a container image |
 | I4 | Faster without changing the distribution | speculative decoding, tensor parallelism over two to four GPUs |
 | I5 | Quantizing one's own models | GPTQ and AWQ, quantized writing, perplexity and task evaluation |
 | I6 | Being used | a C API, a Python module, guides, published benchmarks |

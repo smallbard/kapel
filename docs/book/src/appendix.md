@@ -12,7 +12,9 @@
 | Cache (KV) | The keys and values of the positions already computed, per layer, so each new token only computes itself; in Kapel, kept by pages (`KvCache`) |
 | Cache by pages | A cache whose lines are handed out by pages of 16 positions from a common reserve, each sequence keeping the list of its pages: nothing is copied as a sequence grows, and its pages go back when it ends |
 | Conformity | Agreement of a backend with the reference within the tolerance of the data type, forward and backward |
+| Constraint | The form an answer must take: a JSON schema, any JSON object, a regular expression, a Lark grammar, a list of texts; the tokens that cannot continue it get a logit of −∞ (`kapel_infer::Constraint`); OpenAI calls it a structured output |
 | Contiguous | Stored in row-major order without gaps |
+| Continuous batching | Serving requests that come and go in the same passes: each pass computes a token of every request in progress and pieces of new prompts, a request entering as soon as there is room and leaving as soon as it ends (`kapel_infer::Engine`) |
 | CUDA graph | A pass recorded once and replayed in one launch, its kernels and buffers fixed; the `Record` trait, and `Model::record_step` |
 | Decoding | Generating one token at a time after the prompt, bound by memory bandwidth |
 | Determinism | The same bits whatever the number of threads, achieved by splitting work by shape |
@@ -22,19 +24,25 @@
 | GQA | Grouped-query attention: several query heads share one key and value head |
 | `infer` | The validation and shape computation shared by every backend for an operation |
 | `Isa` | A proof that the processor has the instructions a code path uses |
+| llguidance | The library of structured outputs that compiles constraints into a parser over the bytes of the tokens, and gives the set of tokens allowed next |
 | Micro-kernel | The innermost routine of the matrix product, holding a block of C in registers |
 | Packing | Copying a block of an operand into the contiguous order the micro-kernel reads |
+| Padding rows | Rows added to a smaller batch so that it fits a recorded pass of more rows; each writes a scratch line of its own and is read by no one |
 | Paged attention | Attention of new rows over a cache by pages, each row knowing its sequence and how many positions it sees (`PagedAttention`) |
 | Parity | Agreement with the Python libraries `transformers`, `tokenizers` or llama.cpp on real models and files |
 | Perplexity | The exponential of the mean negative log-likelihood of a text: how a quantization is judged |
 | Prefill | Computing the whole prompt at once, before decoding |
+| Prefix sharing | Sequences that begin with the same tokens sharing the cache pages of that beginning, indexed by the tokens they hold and counted by references (`KvCache::with_prefix_sharing`) |
 | PTX | NVIDIA's intermediate assembly; the thread kernels are checked in as PTX |
 | Reference | The `f64` backend that defines correct results |
 | RoPE | Rotary position embeddings: pairs of components rotated by an angle proportional to the position |
+| Server-sent events | The streaming format of OpenAI's API over HTTP: one `data:` line per chunk of the answer, then `data: [DONE]` |
 | Softcap | A smooth bound on scores or logits, `cap · tanh(x / cap)`, used by Gemma 2 |
 | Stride | The distance in the buffer between two consecutive elements of a dimension |
+| Suspension (preemption) | Taking the pages of the request admitted last when the cache runs out, to compute its tokens again later |
 | Thread kernel / tile kernel | A CUDA kernel with one thread per element, written for cuda-oxide / a kernel over tiles of a matrix, written for cutile-rs |
 | Throughput | Tokens generated per second for a batch of requests, compared with vLLM's `vllm bench throughput` |
+| Time to first token | From the arrival of a request at the server to its first token: what a user waits before the answer starts |
 | View | A tensor sharing another's storage with a different layout; on the GPU, the `View` struct passed to kernels |
 
 ## Where things are
@@ -61,7 +69,11 @@
 | Cache by pages | `crates/kapel-models/src/cache.rs` |
 | Models from GGUF | `crates/kapel-models/src/gguf.rs`, `crates/kapel-infer/src/gguf.rs` (tokenizer) |
 | Generation and the command | `crates/kapel-infer/src/`, `crates/kapel-cli/src/` |
-| Batches | `crates/kapel-infer/src/batch.rs` |
+| Batches and the engine of many requests | `crates/kapel-infer/src/{engine,batch}.rs`, `crates/kapel-infer/tests/engine.rs` |
+| Constraints | `crates/kapel-infer/src/constraint.rs` |
+| The server | `crates/kapel-serve/src/{lib,api,server,worker,metrics,log}.rs`, `crates/kapel-serve/tests/server.rs` |
+| Load on a server, OpenAI's client | `crates/kapel-serve/examples/load.rs`, `tools/serve/openai_client.py` |
+| Container image | `Dockerfile`, `.dockerignore` |
 | Profiling, perplexity and throughput | `crates/kapel-cli/examples/{profile,perplexity,throughput}.rs` |
 | Parity references | `tools/parity/*.py`, data in `data/parity/` |
 | Fuzzing | `fuzz/fuzz_targets/`, `fuzz/regressions/` |

@@ -75,15 +75,18 @@ impl Cache {
         recorded: &mut Option<RecordedStep>,
         token: u32,
     ) -> Result<Option<Tensor>> {
+        let batch = [(self.id, token)];
         if let Some(step) = recorded
-            && let Some(logits) = model.replay_step(backend, &mut self.inner, step, &[token])?
+            && let Some(logits) = model.replay_step(backend, &mut self.inner, step, &batch)?
         {
             return Ok(Some(logits));
         }
-        let made = model.record_step(backend, &mut self.inner, &[(self.id, token)], ROOM)?;
+        let pages = (self.len() + ROOM + 1).div_ceil(PAGE);
+        let made = model.record_step(backend, &mut self.inner, &batch, 1, pages)?;
         let (step, logits) = match made {
-            Some((step, logits)) => (Some(step), Some(logits)),
-            None => (None, None),
+            Recorded::Made(step, logits) => (Some(*step), Some(logits)),
+            Recorded::Unrecorded(logits, _) => (None, Some(logits)),
+            Recorded::Nothing => (None, None),
         };
         *recorded = step;
         Ok(logits)
@@ -106,8 +109,8 @@ impl Default for Cache {
     }
 }
 
-/// The positions a recorded step has room for, beyond the one it computes,
-/// before it is recorded again.
+/// The positions a recorded step of a [`Cache`] has room for, beyond the one
+/// it computes, before it is recorded again.
 pub const ROOM: usize = 256;
 
 /// The inputs of a recorded step, rewritten before each replay.
@@ -121,12 +124,14 @@ struct Inputs {
 }
 
 /// A decoding pass recorded once ([`Model::record_step`]) and replayed for
-/// the next tokens of the same sequences ([`Model::replay_step`]).
+/// the next tokens of any sequences of the same cache, as many as its rows
+/// or fewer ([`Model::replay_step`]).
 #[derive(Debug)]
 pub struct RecordedStep {
     /// The cache, and its tables, the recording writes into.
     identity: (u64, u64),
-    sequences: Vec<SequenceId>,
+    /// Its rows: one token of one sequence each.
+    rows: usize,
     /// Pages per sequence of the table of pages: the room of the recording.
     widest: usize,
     inputs: Inputs,
@@ -134,15 +139,29 @@ pub struct RecordedStep {
 }
 
 impl RecordedStep {
-    /// The sequences, in the order of the tokens and of the logits.
-    pub fn sequences(&self) -> &[SequenceId] {
-        &self.sequences
+    /// The most sequences it computes.
+    pub fn rows(&self) -> usize {
+        self.rows
     }
 
-    /// The logits `[S, vocab]` the recording writes: those of its last run.
-    pub fn logits(&self) -> &Tensor {
-        self.recording.output()
+    /// The pages per sequence it reads: a sequence that needs more is
+    /// recorded again.
+    pub fn pages(&self) -> usize {
+        self.widest
     }
+}
+
+/// What [`Model::record_step`] did.
+#[derive(Debug)]
+pub enum Recorded {
+    /// Nothing: the backend does not record, or the cache lacks the room.
+    /// Nothing was computed.
+    Nothing,
+    /// The step was computed (its logits `[S, vocab]`) and recorded.
+    Made(Box<RecordedStep>, Tensor),
+    /// The step was computed (its logits), but the backend failed to record
+    /// it: out of memory, say. The error says why.
+    Unrecorded(Tensor, ModelError),
 }
 
 /// Which positions get logits.
@@ -570,9 +589,7 @@ impl Model {
                 message: "no token to compute".into(),
             }));
         }
-        let counts: Vec<(SequenceId, usize)> =
-            batch.iter().map(|&(id, ids)| (id, ids.len())).collect();
-        let step = cache.begin(backend, &counts)?;
+        let step = cache.begin(backend, batch)?;
         let ids: Vec<u32> = batch
             .iter()
             .flat_map(|(_, ids)| ids.iter().copied())
@@ -602,68 +619,102 @@ impl Model {
     /// One token of each sequence of `batch`, computed as
     /// [`Model::step_batch`] computes it (the logits `[S, vocab]`), and its
     /// pass recorded ([`kapel_ops::Record`]: a CUDA graph on a card) for
-    /// [`Model::replay_step`] to run again for the next tokens of the same
-    /// sequences, `room` of them at least: the pass is then launched in one
-    /// call instead of one per kernel. `None` for a backend that does not
-    /// record, and for a cache of fixed size without the room; nothing is
-    /// computed then.
+    /// [`Model::replay_step`] to run again for the next tokens: the pass is
+    /// then launched in one call instead of one per kernel. The recording has
+    /// `rows` rows, `batch` and padding after it, and reads `pages` pages per
+    /// sequence; it serves any batch of this cache as large or smaller whose
+    /// sequences fit in those pages. A cache that grows makes room for them
+    /// first. `None` for a backend that does not record, and for a cache of
+    /// fixed size without the room: [`Recorded::Nothing`], nothing computed.
+    /// If the backend fails to record, the step is computed all the same
+    /// ([`Recorded::Unrecorded`]).
     ///
     /// The recording reads the tables of the cache as they are: it is
-    /// recorded again once the cache grows them, or a sequence needs more
-    /// positions than the room ([`Model::replay_step`] says so).
+    /// recorded again once the cache grows them ([`Model::replay_step`] says
+    /// so).
     ///
     /// # Errors
     ///
-    /// As [`Model::step_batch`], and if the backend fails to record.
+    /// As [`Model::step_batch`].
     pub fn record_step<B: Backend + Transfer>(
         &self,
         backend: &B,
         cache: &mut KvCache,
         batch: &[(SequenceId, u32)],
-        room: usize,
-    ) -> Result<Option<(RecordedStep, Tensor)>> {
+        rows: usize,
+        pages: usize,
+    ) -> Result<Recorded> {
         // The tables are made by a first pass, as it comes: never while
         // recording.
-        if !backend.records() || batch.is_empty() || !cache.has_tables(self.config.layers) {
-            return Ok(None);
-        }
-        let ahead: Vec<(SequenceId, usize)> = batch.iter().map(|&(id, _)| (id, room + 1)).collect();
-        match cache.reserve(backend, &ahead) {
-            Err(ModelError::CacheFull { .. }) => return Ok(None),
-            other => other?,
+        if !backend.records()
+            || batch.is_empty()
+            || batch.len() > rows
+            || !cache.has_tables(self.config.layers)
+        {
+            return Ok(Recorded::Nothing);
         }
         let widest = batch
             .iter()
-            .map(|&(id, _)| (cache.len(id) + room + 1).div_ceil(PAGE))
+            .map(|&(id, _)| (cache.len(id) + 1).div_ceil(PAGE))
             .max()
-            .unwrap_or(1);
-        let counts: Vec<(SequenceId, usize)> = batch.iter().map(|&(id, _)| (id, 1)).collect();
-        let plan = cache.plan(&counts, Some(widest))?;
-        let s = batch.len();
+            .unwrap_or(1)
+            .max(pages);
+        let ahead: Vec<(SequenceId, usize)> = batch
+            .iter()
+            .map(|&(id, _)| {
+                let room = if cache.is_fixed() {
+                    1
+                } else {
+                    widest * PAGE - cache.len(id)
+                };
+                (id, room)
+            })
+            .collect();
+        // Lines for the padding of the smallest batch it may serve, taken
+        // now: replays then never need more.
+        let scratch = match cache
+            .reserve(backend, &ahead)
+            .and_then(|()| cache.scratch_lines(rows - 1))
+        {
+            Err(ModelError::CacheFull { .. }) => return Ok(Recorded::Nothing),
+            other => other?,
+        };
+        // The scratch pages may have grown the cache: its tables too.
+        cache.reserve(backend, &[])?;
+        let tokens: Vec<u32> = batch.iter().map(|&(_, token)| token).collect();
+        let entries: Vec<(SequenceId, &[u32])> = batch
+            .iter()
+            .zip(&tokens)
+            .map(|(&(id, _), token)| (id, std::slice::from_ref(token)))
+            .collect();
+        let mut plan = cache.plan(&entries, Some(widest))?;
+        plan.pad(rows, &scratch[..rows - batch.len()]);
         let upload = |values: &[u32], shape: &[usize]| -> Result<Tensor> {
             Ok(backend.upload(&Tensor::from_slice(values, shape)?)?)
         };
-        let tokens: Vec<u32> = batch.iter().map(|&(_, token)| token).collect();
+        let mut ids = tokens.clone();
+        ids.resize(rows, 0);
         let inputs = Inputs {
-            ids: upload(&tokens, &[s])?,
-            positions: upload(&plan.positions, &[s])?,
-            lines: upload(&plan.lines, &[s])?,
-            pages: upload(&plan.pages, &[s, widest])?,
-            rows: upload(&plan.rows, &[s, 2])?,
+            ids: upload(&ids, &[rows])?,
+            positions: upload(&plan.positions, &[rows])?,
+            lines: upload(&plan.lines, &[rows])?,
+            pages: upload(&plan.pages, &[rows, widest])?,
+            rows: upload(&plan.rows, &[rows, 2])?,
         };
         let lines_needed = cache.lines();
         let identity = cache.identity();
+        let step = || Step {
+            positions: inputs.positions.clone(),
+            lines: inputs.lines.clone(),
+            pages: inputs.pages.clone(),
+            rows: inputs.rows.clone(),
+            lines_needed,
+        };
         // This token as it comes: what the recording needs is then made (the
         // backend's tables for these shapes, its compiled kernels), and the
         // recording, which runs nothing, need not be replayed for it.
         let logits = {
-            let step = Step {
-                positions: inputs.positions.clone(),
-                lines: inputs.lines.clone(),
-                pages: inputs.pages.clone(),
-                rows: inputs.rows.clone(),
-                lines_needed,
-            };
+            let step = step();
             self.run(
                 backend,
                 &inputs.ids,
@@ -672,14 +723,9 @@ impl Model {
                 Logits::All,
             )?
         };
+        let logits = logits.narrow(0, 0, batch.len())?;
         let recording = backend.record(&mut || {
-            let step = Step {
-                positions: inputs.positions.clone(),
-                lines: inputs.lines.clone(),
-                pages: inputs.pages.clone(),
-                rows: inputs.rows.clone(),
-                lines_needed,
-            };
+            let step = step();
             let logits = self.run(
                 backend,
                 &inputs.ids,
@@ -694,9 +740,19 @@ impl Model {
                     message: other.to_string(),
                 },
             })
-        })?;
-        let Some(recording) = recording else {
-            return Ok(None);
+        });
+        // The step is computed already: a recording that fails (the device
+        // out of memory, say) loses only the recording.
+        let recording = match recording {
+            Ok(Some(recording)) => recording,
+            Ok(None) => {
+                let error = kapel_core::Error::InvalidArgument {
+                    op: "record_step",
+                    message: "the backend recorded nothing".into(),
+                };
+                return Ok(Recorded::Unrecorded(logits, ModelError::Tensor(error)));
+            }
+            Err(e) => return Ok(Recorded::Unrecorded(logits, ModelError::Tensor(e))),
         };
         if cache.identity() != identity {
             return Err(ModelError::Tensor(kapel_core::Error::InvalidArgument {
@@ -706,59 +762,67 @@ impl Model {
         }
         let recorded = RecordedStep {
             identity,
-            sequences: batch.iter().map(|&(id, _)| id).collect(),
+            rows,
             widest,
             inputs,
             recording,
         };
-        Ok(Some((recorded, logits)))
+        Ok(Recorded::Made(Box::new(recorded), logits))
     }
 
-    /// The next token of each sequence of `recorded`, `tokens` in the same
-    /// order, through its recording: the logits `[S, vocab]`, or `None` if
-    /// the recording no longer fits (the cache grew its tables, or a
-    /// sequence needs more pages than the recording has room for); nothing
-    /// is computed then, and [`Model::record_step`] records again.
+    /// The next token of each sequence of `batch` through the recording
+    /// `recorded`: the logits `[S, vocab]`, or `None` if the recording does
+    /// not fit (more sequences than its rows, the cache grew its tables, a
+    /// sequence needs more pages than the recording reads, or the cache
+    /// has pages to copy first); nothing is computed then, and
+    /// [`Model::record_step`] records again.
     ///
     /// # Errors
     ///
-    /// If `tokens` has another length, or the backend fails.
+    /// If a sequence appears twice, or the backend fails.
     pub fn replay_step<B: Backend + Transfer>(
         &self,
         backend: &B,
         cache: &mut KvCache,
         recorded: &mut RecordedStep,
-        tokens: &[u32],
+        batch: &[(SequenceId, u32)],
     ) -> Result<Option<Tensor>> {
-        if tokens.len() != recorded.sequences.len() {
-            return Err(ModelError::Tensor(kapel_core::Error::InvalidArgument {
-                op: "replay_step",
-                message: format!(
-                    "{} tokens for a recording of {} sequences",
-                    tokens.len(),
-                    recorded.sequences.len()
-                ),
-            }));
-        }
-        let counts: Vec<(SequenceId, usize)> =
-            recorded.sequences.iter().map(|&id| (id, 1)).collect();
-        if cache.identity() != recorded.identity || !cache.fits(&counts, recorded.widest) {
+        let counts: Vec<(SequenceId, usize)> = batch.iter().map(|&(id, _)| (id, 1)).collect();
+        if batch.is_empty()
+            || batch.len() > recorded.rows
+            || cache.identity() != recorded.identity
+            || !cache.fits(&counts, recorded.widest)
+        {
             return Ok(None);
         }
-        let plan = cache.plan(&counts, Some(recorded.widest))?;
-        let s = tokens.len();
+        let scratch = cache.scratch_lines(recorded.rows - batch.len())?;
+        let tokens: Vec<u32> = batch.iter().map(|&(_, token)| token).collect();
+        let entries: Vec<(SequenceId, &[u32])> = batch
+            .iter()
+            .zip(&tokens)
+            .map(|(&(id, _), token)| (id, std::slice::from_ref(token)))
+            .collect();
+        let mut plan = cache.plan(&entries, Some(recorded.widest))?;
+        let rows = recorded.rows;
+        plan.pad(rows, &scratch);
+        let mut ids = tokens;
+        ids.resize(rows, 0);
         let host = |values: &[u32], shape: &[usize]| Tensor::from_slice(values, shape);
         let inputs = &mut recorded.inputs;
-        backend.copy_from_host(&mut inputs.ids, &host(tokens, &[s])?)?;
-        backend.copy_from_host(&mut inputs.positions, &host(&plan.positions, &[s])?)?;
-        backend.copy_from_host(&mut inputs.lines, &host(&plan.lines, &[s])?)?;
+        backend.copy_from_host(&mut inputs.ids, &host(&ids, &[rows])?)?;
+        backend.copy_from_host(&mut inputs.positions, &host(&plan.positions, &[rows])?)?;
+        backend.copy_from_host(&mut inputs.lines, &host(&plan.lines, &[rows])?)?;
         backend.copy_from_host(
             &mut inputs.pages,
-            &host(&plan.pages, &[s, recorded.widest])?,
+            &host(&plan.pages, &[rows, recorded.widest])?,
         )?;
-        backend.copy_from_host(&mut inputs.rows, &host(&plan.rows, &[s, 2])?)?;
+        backend.copy_from_host(&mut inputs.rows, &host(&plan.rows, &[rows, 2])?)?;
         recorded.recording.replay()?;
-        Ok(Some(recorded.recording.output().clone()))
+        Ok(Some(recorded.recording.output().narrow(
+            0,
+            0,
+            batch.len(),
+        )?))
     }
 
     fn run<B: Backend + Transfer>(

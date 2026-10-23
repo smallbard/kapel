@@ -25,12 +25,13 @@ kapel-ops.workspace = true
 kapel-cpu.workspace = true
 kapel-hub.workspace = true
 kapel-infer.workspace = true
+kapel-models.workspace = true
+kapel-serve.workspace = true
 kapel-tokenizers.workspace = true
 kapel-cuda = { workspace = true, optional = true }
 serde_json.workspace = true
 
 [dev-dependencies]
-kapel-models.workspace = true
 
 [[example]]
 name = "generation_parity"

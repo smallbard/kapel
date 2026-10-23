@@ -104,10 +104,23 @@ impl Record for Cuda {
         // SAFETY: the stream is capturing, begun above; ending it is
         // required even when the pass failed.
         let status = unsafe { cuda_bindings::cuStreamEndCapture(stream, &mut graph) };
-        let output = output?;
-        if status != cuda_bindings::cudaError_enum_CUDA_SUCCESS {
-            return Err(failed("end capture", status));
-        }
+        let output = match output {
+            Ok(output) if status == cuda_bindings::cudaError_enum_CUDA_SUCCESS => output,
+            other => {
+                if !graph.is_null() {
+                    // SAFETY: the graph was captured above and is not used.
+                    unsafe { cuda_bindings::cuGraphDestroy(graph) };
+                }
+                // A recording that failed for lack of memory may succeed
+                // once the buffers kept for reuse are freed.
+                drop(arena);
+                self.clear_pool();
+                return Err(match other {
+                    Err(e) => e,
+                    Ok(_) => failed("end capture", status),
+                });
+            }
+        };
         let mut exec: CUgraphExec = std::ptr::null_mut();
         // SAFETY: `graph` is the graph just captured.
         let status = unsafe { cuda_bindings::cuGraphInstantiateWithFlags(&mut exec, graph, 0) };

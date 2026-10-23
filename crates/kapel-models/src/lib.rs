@@ -22,9 +22,12 @@
 //! Generation goes through a cache of keys and values. [`KvCache`] keeps them
 //! by pages of [`PAGE`] positions, shared by the sequences it holds, in any
 //! float type down to `f8`; [`Model::step_batch`] computes one new position of
-//! many sequences at once, and [`Model::extend_batch`] several. On a backend
-//! that records ([`kapel_ops::Record`]), [`Model::record_step`] captures a
-//! step and [`Model::replay_step`] runs it again on new inputs.
+//! many sequences at once, and [`Model::extend_batch`] several. With
+//! [`KvCache::with_prefix_sharing`], sequences that begin alike share the
+//! pages of their common beginning. On a backend that records
+//! ([`kapel_ops::Record`]), [`Model::record_step`] captures a step of a given
+//! number of rows, and [`Model::replay_step`] runs it again for any batch of
+//! as many sequences or fewer, the rest padding.
 //! [`Model::fused`] stacks the projections that read the same input into one
 //! product. [`Cache`] is the cache of a single sequence.
 //!
@@ -42,7 +45,7 @@ pub use config::{
     Block, Config, MAX_HEAD_DIM, MAX_HEADS, MAX_HIDDEN, MAX_INTERMEDIATE, MAX_LAYERS, MAX_VOCAB,
     Norm,
 };
-pub use model::{Cache, Model, ROOM, RecordedStep};
+pub use model::{Cache, Model, ROOM, Recorded, RecordedStep};
 
 /// What can go wrong with a model.
 #[derive(Debug)]

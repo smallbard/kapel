@@ -281,6 +281,29 @@ impl Cuda {
             .map_err(driver("synchronize"))
     }
 
+    /// The free and total bytes of the device's memory, as the driver counts
+    /// them (other processes' use included). The buffers this backend keeps
+    /// for reuse count as used: [`Cuda::clear_pool`] first to count them free.
+    ///
+    /// # Errors
+    ///
+    /// If the driver fails.
+    pub fn memory(&self) -> Result<(usize, usize)> {
+        let op = "memory";
+        self.inner._context.bind_to_thread().map_err(driver(op))?;
+        let (mut free, mut total) = (0usize, 0usize);
+        // SAFETY: two out-pointers to live integers, with this backend's
+        // context current on the thread; the status is checked below.
+        let status = unsafe { cuda_bindings::cuMemGetInfo_v2(&mut free, &mut total) };
+        if status != cuda_bindings::cudaError_enum_CUDA_SUCCESS {
+            return Err(Error::Device {
+                op,
+                message: format!("cuMemGetInfo: error {status}"),
+            });
+        }
+        Ok((free, total))
+    }
+
     /// Frees the buffers kept for reuse, and the tables kept on the device.
     /// Freeing waits for the device.
     pub fn clear_pool(&self) {
@@ -339,17 +362,22 @@ impl Cuda {
         if let Some(arena) = self.arena() {
             return self.take_recorded(&arena, bytes);
         }
-        take_or_alloc(
-            &self.inner.shared.pool,
-            bytes,
-            || {
-                // SAFETY: the callers of `alloc` either zero the buffer or
-                // write all of it before anything reads it (a kernel with one
-                // thread per element, or a copy from the host).
-                unsafe { DeviceBuffer::<u8>::uninitialized_async(&self.inner.stream, bytes) }
-            },
-            || self.release(),
-        )
+        let alloc = || {
+            // SAFETY: the callers of `alloc` either zero the buffer or write
+            // all of it before anything reads it (a kernel with one thread
+            // per element, or a copy from the host).
+            unsafe { DeviceBuffer::<u8>::uninitialized_async(&self.inner.stream, bytes) }
+        };
+        // Short of memory, the buffers kept for reuse go first; the tables
+        // only if that is not enough (a pass about to be recorded counts on
+        // finding the tables it made).
+        take_or_alloc(&self.inner.shared.pool, bytes, alloc, || {
+            !lock(&self.inner.shared.pool).drain().is_empty()
+        })
+        .or_else(|_| {
+            self.release();
+            alloc()
+        })
         .map_err(driver("alloc"))
     }
 
@@ -421,8 +449,22 @@ impl Cuda {
         make: impl FnOnce() -> Result<Vec<u32>>,
     ) -> Result<Arc<Table>> {
         let key = (kind, key.to_vec());
-        if let Some(table) = lock(&self.inner.tables).map.get(&key) {
-            return Ok(Arc::clone(table));
+        let found = {
+            let mut tables = lock(&self.inner.tables);
+            let found = tables.map.get(&key).map(Arc::clone);
+            if found.is_some() {
+                // The least recently used go first: a pass about to be
+                // recorded finds every table it used as it came.
+                if let Some(at) = tables.order.iter().position(|k| *k == key) {
+                    let key = tables.order.remove(at).expect("found");
+                    tables.order.push_back(key);
+                }
+            }
+            found
+        };
+        if let Some(table) = found {
+            self.retain_in_arena(&table);
+            return Ok(table);
         }
         let values = make()?;
         let table = Arc::new(Table {
@@ -447,7 +489,16 @@ impl Cuda {
                 tables.bytes += bytes;
             }
         }
+        self.retain_in_arena(&table);
         Ok(table)
+    }
+
+    /// Keeps `table` with the pass being recorded, if one is: its graph reads
+    /// the table at every replay, even once the cache has let it go.
+    fn retain_in_arena(&self, table: &Arc<Table>) {
+        if let Some(arena) = self.arena() {
+            lock(&arena.tables).push(Arc::clone(table));
+        }
     }
 
     /// The table of rotary angles kept for `key`, or `make`'s, kept among the
@@ -925,6 +976,9 @@ pub(crate) struct Arena {
     /// layers of a pass rotate by the same angles, computed once per replay.
     /// Emptied when the recording ends.
     pub(crate) angles: Mutex<Vec<(Vec<u8>, Tensor)>>,
+    /// The backend's tables the recorded kernels read, kept while the
+    /// recording lives.
+    pub(crate) tables: Mutex<Vec<Arc<Table>>>,
 }
 
 impl Arena {
@@ -933,6 +987,7 @@ impl Arena {
             free: Mutex::new(Pool::new()),
             shared: Arc::clone(&cuda.inner.shared),
             angles: Mutex::new(Vec::new()),
+            tables: Mutex::new(Vec::new()),
         }
     }
 }

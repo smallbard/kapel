@@ -21,8 +21,10 @@
 //!   (the prompt). Q2_K and Q3_K go through the host.
 //!
 //! A pass can be recorded once as a CUDA graph and replayed
-//! ([`kapel_ops::Record`]): its buffers stay with the graph, and no other
-//! thread may use the backend while it records.
+//! ([`kapel_ops::Record`]): its buffers, and the backend's tables its kernels
+//! read, stay with the graph, and no other thread may use the backend while
+//! it records. `Cuda::memory` gives the device's free memory, to size a
+//! cache.
 //!
 //! The whole catalogue conforms in `f32`, `bf16` and `f16`, and the models of
 //! `kapel-models` run on the card (`tests/parity.rs`, `tests/recorded.rs`,

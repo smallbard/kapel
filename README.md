@@ -67,6 +67,23 @@ cargo run --release -p kapel-cli --features cuda --example throughput -- \
 Sur une RTX 3090, Llama 3.2 3B en bf16 génère 105 tokens/s pour une seule séquence,
 et 3330 tokens/s pour 64 séquences ensemble, 90 % du débit de vLLM.
 
+`kapel serve` sert un modèle derrière une API compatible avec celle d'OpenAI
+(`/v1/chat/completions`, `/v1/completions`, `/v1/models`, en flux ou non, avec les
+sorties contraintes : schéma JSON, expression régulière, grammaire, choix), les
+requêtes calculées ensemble :
+
+```
+cargo run --release -p kapel-cli --features cuda -- serve Qwen/Qwen3-0.6B --device cuda
+curl http://127.0.0.1:8000/v1/chat/completions -H 'content-type: application/json' \
+    -d '{"messages": [{"role": "user", "content": "Bonjour !"}]}'
+```
+
+Les clients d'OpenAI s'en servent sans modification (`base_url`). `/metrics` donne
+les mesures au format de Prometheus, `/health` l'état du serveur ; le `Dockerfile`
+construit son image pour les cartes NVIDIA. Sur une RTX 3090, Llama 3.2 3B sert
+environ 20 requêtes par seconde (4300 tokens/s), et à 80 % de ce débit, le premier
+token arrive en moins de 70 ms pour 99 % des requêtes.
+
 ## Feuille de route
 
 Kapel se construit en trois temps :

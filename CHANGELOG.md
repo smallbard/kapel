@@ -118,6 +118,44 @@ changelog says how.
   examples `decode` and `quantized`.
 - `kapel-core`: `Tensor::storage_mut` and `Storage::as_any_mut`; `Layout::reshape`
   reshapes strided views when their strides allow it.
+- `kapel-serve`: the server of OpenAI's API (`serve`, `Server`):
+  `/v1/chat/completions` and `/v1/completions`, whole or streamed (server-sent
+  events, `stream_options.include_usage`), `n` answers, stop sequences, OpenAI's
+  and vLLM's sampling settings, `response_format` (`json_object`, `json_schema`)
+  and vLLM's `guided_json`, `guided_regex`, `guided_choice`, `guided_grammar`;
+  `/v1/models`, `/health`, `/metrics` (Prometheus: requests, tokens, latency of
+  the first token and between tokens, use of the cache, suspensions, shared
+  prompt positions). A closed connection cancels its request; limits on the
+  body, the positions of the model, the answers in flight (429) and the time
+  of a request; one line of JSON per request on the standard error. The
+  example `load`, a Poisson load as Smallem's simulator of serving drew it.
+- `kapel-cli`: `kapel serve MODEL`, the cache sized from the card's free memory
+  (`--gpu-memory-utilization`) or given (`--cache-memory`).
+- `kapel-infer`: `Engine`, continuous batching: requests added and cancelled at
+  any time, prompts computed by pieces within a budget of tokens per pass,
+  admission by free pages, the request admitted last suspended when they run
+  out and computed again later; recorded decoding passes for a few sizes of
+  batch. `Pipeline::prepare` and `Engine::add_prepared`, to get a request ready
+  on another thread. `Batch` is an engine whose requests all come at once.
+- `kapel-infer`: answers held to a form, `Constraint` (JSON schema, JSON object,
+  regular expression, Lark grammar, list of texts), through llguidance;
+  `Request::constraint`; `Finish::Error`, a request failed on its own.
+- `kapel-infer`: OpenAI's `frequency_penalty` and `presence_penalty` in
+  `Sampling`.
+- `kapel-models`: prefix sharing (`KvCache::with_prefix_sharing`,
+  `add_sequence_sharing`): sequences take the pages of the longest beginning of
+  their prompt the cache holds, counted by references, and idle shared pages
+  are taken back least recently used first; a sequence cut inside a shared
+  page gets its own copy. `KvCache::reserve_padding`.
+- `kapel-models`: a recorded step serves any batch of as many sequences or
+  fewer (`record_step` takes its rows and pages; padding rows write lines of
+  their own); `Recorded`, what `record_step` did, the step computed even when
+  the backend fails to record it. `Config::max_positions`.
+- `kapel-tokenizers`: `Tokenizer::token_bytes`, the bytes of a token in the
+  middle of a text, and `Tokenizer::is_special`.
+- `kapel-cuda`: `Cuda::memory`, the free and total memory of the device.
+- `tools/serve/openai_client.py`: the server through OpenAI's official Python
+  client. A `Dockerfile` for the server on NVIDIA cards.
 
 ### Changed
 
@@ -162,6 +200,10 @@ changelog says how.
 
 ### Fixed
 
+- `kapel-cuda`: a recorded pass keeps the tables its kernels read; once the
+  table cache had let them go, a replay read freed memory. The table cache
+  evicts the least recently used, and memory short at an allocation frees the
+  pool before the tables.
 - `kapel-cli`: on the processor, `kapel run` converts the weights to `f32` by default,
   as its help says; it kept `bf16`, forty times slower.
 - `kapel-cpu`: rotary embeddings accept negative `i32` positions, as the contract and

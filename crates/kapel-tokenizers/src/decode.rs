@@ -20,6 +20,13 @@ fn chars_to_bytes() -> &'static HashMap<char, u8> {
     })
 }
 
+/// One token on its way through [`Decoder::token_bytes`]: still text, or
+/// already bytes.
+enum Token {
+    Text(String),
+    Bytes(Vec<u8>),
+}
+
 /// A decoder of `tokenizer.json`: it turns the list of token strings into another
 /// list, joined at the end.
 #[derive(Debug)]
@@ -86,6 +93,56 @@ impl Decoder {
             ),
             other => return Err(bad(format!("unsupported decoder {other:?}"))),
         })
+    }
+
+    /// The bytes one token stands for in the middle of a text: what it adds to
+    /// the decoded text there. The steps that only act at the ends of the
+    /// text (`Strip`, the space `Metaspace` takes off the first token) leave
+    /// it unchanged.
+    pub(crate) fn token_bytes(&self, token: &str) -> Vec<u8> {
+        match self.bytes_of(Token::Text(token.to_string())) {
+            Token::Text(t) => t.into_bytes(),
+            Token::Bytes(b) => b,
+        }
+    }
+
+    fn bytes_of(&self, token: Token) -> Token {
+        let Token::Text(text) = token else {
+            // Bytes are final: the steps after a byte decoder leave them.
+            return token;
+        };
+        match self {
+            Self::ByteLevel => {
+                let to_byte = chars_to_bytes();
+                let mut bytes = Vec::with_capacity(text.len());
+                for c in text.chars() {
+                    match to_byte.get(&c) {
+                        Some(&b) => bytes.push(b),
+                        None => bytes.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes()),
+                    }
+                }
+                Token::Bytes(bytes)
+            }
+            Self::Metaspace { replacement, .. } => Token::Text(
+                text.chars()
+                    .map(|c| if c == *replacement { ' ' } else { c })
+                    .collect(),
+            ),
+            Self::Replace(pattern, content) => {
+                Token::Text(crate::text::replace(pattern, &text, content).unwrap_or(text))
+            }
+            Self::ByteFallback => match text
+                .strip_prefix("<0x")
+                .and_then(|r| r.strip_suffix('>'))
+                .filter(|h| h.len() == 2)
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+            {
+                Some(b) => Token::Bytes(vec![b]),
+                None => Token::Text(text),
+            },
+            Self::Fuse | Self::Strip { .. } => Token::Text(text),
+            Self::Sequence(all) => all.iter().fold(Token::Text(text), |t, d| d.bytes_of(t)),
+        }
     }
 
     pub(crate) fn apply(&self, tokens: Vec<String>) -> Vec<String> {

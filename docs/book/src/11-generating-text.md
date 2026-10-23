@@ -1,6 +1,6 @@
 # 11. Generating text: kapel-infer and kapel-cli
 
-`kapel-infer` is the first piece of the inference plan: it loads a model directory or a GGUF file onto a backend and generates text token by token, making the same choices as `transformers`. With greedy decoding, its tokens match the reference generations of `transformers` saved in `data/parity/generation`. `kapel-cli` wraps it in the `kapel run` command.
+`kapel-infer` is the first piece of the inference plan: it loads a model directory or a GGUF file onto a backend and generates text token by token, making the same choices as `transformers`. With greedy decoding, its tokens match the reference generations of `transformers` saved in `data/parity/generation`. `kapel-cli` wraps it in the `kapel run` command; the engine that serves many requests at once is the base of the server of chapter 12.
 
 ## 11.1 The pipeline
 
@@ -18,7 +18,7 @@ for piece in pipeline.generate(&prompt, &Request::default())? {
 
 A file is read as GGUF (`Pipeline::load_gguf`). The model comes from `Model::from_gguf` (chapter 10), and everything else from the metadata. The tokenizer is written back as the `tokenizer.json` it was converted from: the tokens and merges of a byte-level BPE, the splitting pattern that `tokenizer.ggml.pre` names (Llama 3's, or Qwen's with its NFC normalization), the control and user-defined tokens as added tokens, and a beginning of sequence when the file asks for one, or by llama.cpp's default for its pre-tokenizer. `kapel-tokenizers` then reads it as any other. The end tokens are those the file names (end of sequence, of turn, of message) and the control tokens that llama.cpp recognizes as ends (`<|eot_id|>`, `<|im_end|>`, …): the same set as `generation_config.json` gives for the models measured. A GGUF file has no sampling settings, so the default is greedy.
 
-`prompt(text)` encodes raw text; `chat_prompt(messages)` renders a conversation through the template first. A `Request` says how to choose tokens, how many to generate at most (256 by default), and which stop sequences end the answer; `ignore_eos` takes the end tokens as any other, so that answers have known lengths, to measure speed.
+`prompt(text)` encodes raw text; `chat_prompt(messages)` renders a conversation through the template first. A `Request` says how to choose tokens, how many to generate at most (256 by default), which stop sequences end the answer, and the form the answer must take, if any (`constraint`, section 11.4); `ignore_eos` takes the end tokens as any other, so that answers have known lengths, to measure speed.
 
 ## 11.2 Prefill, then one token at a time
 
@@ -31,24 +31,35 @@ On a backend that records passes, each generated token goes through `Cache::reco
 | `Finish::Eos` | the model produced a token that ends its answers |
 | `Finish::Stop(text)` | a stop sequence appeared; the answer stops before it |
 | `Finish::Length` | the maximum number of tokens was generated |
+| `Finish::Error(message)` | the request failed on its own (its constraint's parser) |
 
 After an error, the iterator ends: the cache may hold part of a failed step, so nothing can follow.
 
-## 11.3 Batches
+## 11.3 Serving many requests: the engine
 
-A server answers many requests at once, and a pass that reads every weight for one token mostly waits for memory. `Pipeline::batch(&requests)` makes a `Batch` of several prompts, each with its `Request`, in one `KvCache` that grows (`batch_in` takes a cache of fixed size, or of another type). `Batch::step` makes one pass of the model:
+A server answers many requests at once, and a pass that reads every weight for one token mostly waits for memory. An `Engine` (`crates/kapel-infer/src/engine.rs`) serves requests that come and go, all computed together: *continuous batching*. `Pipeline::engine(EngineOptions)` makes one; `EngineOptions` gives the pages of its cache (`None` for a cache that grows), whether sequences share the pages of their common beginnings (`prefix_sharing`, chapter 10), the most tokens of one pass (`max_pass_tokens`, 2048 by default), the most sequences at once (`max_sequences`, 256) and a share of pages to keep free at admission (`reserve`).
 
-- while some prompts are not computed, it computes them, several per pass when they are short (up to 8192 tokens a pass, a longer prompt alone);
-- then it computes one token of every sequence in progress, in one pass (`Model::step_batch`, or a recorded step replayed while the same sequences continue).
+`add(prompt, &request)` queues a request and gives its `RequestId`; `cancel(id)` ends it wherever it is, its pages given back. The work of checking a request and compiling its constraint, which can take a while, may be done on another thread: `Pipeline::prepare` gives a `Prepared` request, and `add_prepared` queues it. That is how the server keeps the engine's thread for the passes (chapter 12).
 
-It returns the pieces it gave, each with the index of its request. A sequence that ends gives its pages back to the cache, and the next steps no longer include it. `tokens(i)`, `finish(i)`, `in_progress()` and `is_finished()` follow the requests. When every request is greedy, the tokens are found on the device; otherwise the logits come back and each row is sampled on the machine's threads, each request with its own generator (the seed plus its index), so that requests with the same seed do not draw the same tokens.
+Each `step()` makes one pass:
 
-The test `a_batch_gives_the_greedy_tokens_of_each_prompt` checks that a batch gives each prompt the tokens it gets alone.
+1. **Admit.** Waiting requests enter, in order, while the free pages hold their prompt (less what prefix sharing gives them) and one more token, beyond the pages the prompts already admitted will still take and the reserve. Alone, a request takes what there is.
+2. **Plan.** One token of every request that decodes, first; then pieces of the prompts not yet computed, in the order of admission, until the pass has `max_pass_tokens` tokens. A long prompt is thus computed over several passes and never holds up the others for long.
+3. **Suspend if needed.** If the pages free do not hold the pass, the request admitted last is *suspended*: its pages go back, and it waits again at the front of the queue, its prompt and the tokens it had generated to be computed anew. Its full pages often stay in the cache, idle but indexed, and are taken back rather than computed. A request alone that the cache cannot hold ends with `CacheFull`.
+4. **Compute.** A pass of decoding only goes through a recorded pass (chapter 10), one per size of batch: the sizes are 1, 2, 4, 8, 16, 24, 32, 48, then multiples of 32, and a smaller batch is completed with padding rows. The engine sets aside, when it starts, the scratch pages of the largest recording, so that recording never takes pages a pass was counting on. A size the backend fails to record (the device short of memory, say) is computed as it comes, and tried again only after 256 passes. Any other pass goes through `Model::step_batch`.
+5. **Choose.** The requests whose last position was computed get a token: found on the device by `ArgMax` when all of them are greedy and unconstrained, otherwise sampled on the machine's threads from the downloaded logits.
+
+`step` returns `Event`s: a request, its `Piece`, and its `Finish` if it ended (the request is then gone from the engine), with the prompt positions it took from shared pages. A pass that fails gives a `StepError`, with the error and the requests that were in progress, which all end; the shared pages no sequence uses are forgotten, since what the failed pass wrote may be wrong. `stats()` gives an `EngineStats`: requests waiting and running, pages and free pages, suspensions, shared positions, passes and recorded passes.
+
+`Pipeline::batch(&requests)` makes a `Batch`: an engine whose requests all come at the start, in a cache that grows (`batch_in` takes a cache of fixed size, or of another type), with up to 8192 tokens a pass so that short prompts are computed together. `Batch::step` returns the pieces it gave, each with the index of its request; `tokens(i)`, `finish(i)`, `in_progress()` and `is_finished()` follow the requests. Each request draws from its own generator (the seed plus its index), so that requests with the same seed do not draw the same tokens.
+
+The test `a_batch_gives_the_greedy_tokens_of_each_prompt` checks that a batch gives each prompt the tokens it gets alone. `tests/engine.rs` checks the engine on the processor: requests that arrive while others are computed, in a cache so small that they are suspended, prompts in pieces of 7 tokens and shared beginnings, each get the greedy tokens of `transformers`; a cancelled request gives its pages back; answers held to a list, a regular expression and a JSON schema take that form.
 
 ## 11.4 Choosing a token
 
-`Sampling` applies the filters of `transformers`, in the same order:
+`Sampling` applies the filters of `transformers`, in the same order, after the two penalties of OpenAI's API:
 
+0. **Frequency and presence penalties**: the logit of each token generated so far (the prompt's are left alone) loses `frequency_penalty` times the number of times it was generated, plus `presence_penalty` once.
 1. **Repetition penalty**: the logit of every token already in the sequence, prompt included, is divided by the factor if positive, multiplied if negative.
 2. **Greedy**: with a temperature of 0, take the most likely token, the first on a tie.
 3. **Temperature**: divide the logits.
@@ -59,13 +70,23 @@ The test `a_batch_gives_the_greedy_tokens_of_each_prompt` checks that a batch gi
 
 `Sampling::from_generation_config` follows `transformers`' defaults: greedy unless `do_sample` is set, and then a temperature of 1 and a top-k of 50 unless the file says otherwise. The draws use a small xoshiro256\*\* generator seeded through SplitMix64, written in the crate, so the same seed gives the same tokens on every machine.
 
+### Answers held to a form
+
+A `Request` may carry a `Constraint` (`crates/kapel-infer/src/constraint.rs`): a JSON schema, any JSON object, a regular expression matched whole, a grammar in llguidance's Lark syntax, or one text of a list. The constraint is compiled by llguidance into a parser that reads the answer as it is generated; before each token, the parser gives the set of tokens that can continue the answer in its form, and the others get a logit of −∞. Sampling then chooses among the allowed tokens only, with the same filters.
+
+llguidance works on the bytes of the tokens, kept in a tree. A `Grammars` is made once per pipeline, at the first constraint: the bytes of every id (`Tokenizer::token_bytes`, chapter 9), special tokens marked so that no text spells them, ids beyond the tokenizer empty. A list of texts becomes a Lark grammar of alternatives, each a JSON string. Each answer then gets its own `Guide`. The model may have several end tokens; they are all allowed when llguidance allows its own (the answer may end), and alone allowed once nothing can follow, so a complete answer ends with `Finish::Eos`. An end token is not fed to the parser.
+
+A constraint that does not compile is refused when the request is made (`Pipeline::check_constraint` checks one). A parser that fails during an answer, out of its limits say, ends that request only, with `Finish::Error`; the others go on. Constrained requests choose on the host, since the mask is computed there.
+
 ## 11.5 Text that is never taken back
 
 A token does not always map to finished text. A character may be split over two tokens, and the start of a stop sequence may appear before it is complete. A `Piece` therefore carries a token and the text it makes *final*: the concatenation of all pieces' texts is the answer, and no later token changes what was already given out.
 
-The text stream decodes the whole generated sequence again at each token, because spaces and multi-byte characters depend on their neighbours, and gives out only the new suffix. It holds back a trailing U+FFFD, the mark of an unfinished character, and the longest ending that could be the start of a stop sequence. When a stop sequence appears, possibly straddling text already held back, the answer is cut just before it.
+Spaces and multi-byte characters depend on their neighbours, so the text of the tokens is not the sum of their texts. The text stream decodes the last few tokens twice, as Hugging Face's `DecodeStream` does: the tokens from `prefix` to `read`, and the same with the new ones. What the second adds to the first is new text, after the text of the tokens before `read`, already final. When the new text ends with a whole character, the window moves: `prefix` to `read`, `read` to the end. The cost of a token thus stays the same however long the answer, and the text is the whole sequence's, decoded at once: the test `streamed_text_is_the_whole_text` checks it for every tokenizer of `data/parity`. Of that text, the stream gives out only the new suffix. It holds back a trailing U+FFFD, the mark of an unfinished character, and the longest ending that could be the start of a stop sequence. When a stop sequence appears, possibly straddling text already held back, the answer is cut just before it.
 
 ## 11.6 The kapel command
+
+`kapel serve`, the server, is the subject of chapter 12; this section is about `kapel run`.
 
 ```
 cargo run --release -p kapel-cli -- run Qwen/Qwen3-0.6B --prompt "Why is the sky blue?"

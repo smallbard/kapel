@@ -13,7 +13,8 @@
 - [9. Text: kapel-tokenizers](09-text.md)
 - [10. Models: kapel-models](10-models.md)
 - [11. Generating text: kapel-infer and kapel-cli](11-generating-text.md)
-- [12. Safety and security](12-safety-and-security.md)
-- [13. Working on Kapel](13-working-on-kapel.md)
+- [12. Serving: kapel-serve](12-serving.md)
+- [13. Safety and security](13-safety-and-security.md)
+- [14. Working on Kapel](14-working-on-kapel.md)
 
 [Appendix](appendix.md)

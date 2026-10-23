@@ -6,6 +6,9 @@ all-features = true
 [licenses]
 allow = [
     "MIT",
+    # MIT without its attribution clause (borrow-or-share, through the JSON
+    # schema references of llguidance).
+    "MIT-0",
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
     "BSD-3-Clause",

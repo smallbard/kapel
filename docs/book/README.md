@@ -15,8 +15,9 @@ read, change or extend the code.
 - [9. Text: kapel-tokenizers](src/09-text.md)
 - [10. Models: kapel-models](src/10-models.md)
 - [11. Generating text: kapel-infer and kapel-cli](src/11-generating-text.md)
-- [12. Safety and security](src/12-safety-and-security.md)
-- [13. Working on Kapel](src/13-working-on-kapel.md)
+- [12. Serving: kapel-serve](src/12-serving.md)
+- [13. Safety and security](src/13-safety-and-security.md)
+- [14. Working on Kapel](src/14-working-on-kapel.md)
 - [Appendix](src/appendix.md)
 
 The chapters are plain Markdown and read well on GitHub. To build them as a
@@ -26,5 +27,5 @@ website with [mdBook](https://rust-lang.github.io/mdBook/):
 mdbook serve docs/book
 ```
 
-The book describes the repository as of 22 October 2026. When the code changes
+The book describes the repository as of 23 October 2026. When the code changes
 what a chapter says, update the chapter in the same pull request.

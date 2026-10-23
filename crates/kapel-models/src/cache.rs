@@ -16,11 +16,23 @@
 //! pages keep their numbers. One made by [`KvCache::with_pages`] has a fixed
 //! number of pages, as a server sizes it for the memory of its device, and
 //! refuses positions beyond them ([`ModelError::CacheFull`]).
+//!
+//! With [`KvCache::with_prefix_sharing`], sequences share the pages of their
+//! common beginning, as the requests of a server share a system prompt. Each
+//! full page is indexed by the tokens it holds and those before it; a
+//! sequence started by [`KvCache::add_sequence_sharing`] takes, rather than
+//! computes, the pages of the longest beginning of its prompt the cache
+//! knows. A page counts the sequences that use it; once none does, it stays
+//! indexed, free to be taken back, until its room is needed (the page served
+//! least recently goes first). Pages are written only past the end of their
+//! sequence: a shared page is full, and never written again.
 
+use std::collections::{BTreeMap, HashMap};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use kapel_core::{DType, Tensor};
-use kapel_ops::{Transfer, Write};
+use kapel_ops::{Backend, Contiguous, Transfer, Write};
 
 use crate::ModelError;
 
@@ -38,6 +50,74 @@ struct Sequence {
     pages: Vec<u32>,
     /// The positions it holds.
     len: usize,
+    /// The tokens of its positions, with prefix sharing.
+    tokens: Vec<u32>,
+    /// Its full pages that are indexed or known not to be: those before
+    /// this one have been offered to the index.
+    offered: usize,
+    /// The hash of the tokens of its first `offered` pages ([`chain_of`]).
+    chain: u64,
+}
+
+/// The hash of `tokens`, whole pages, as the index chains it: `0` for none.
+fn chain_of(tokens: &[u32]) -> u64 {
+    tokens
+        .as_chunks::<PAGE>()
+        .0
+        .iter()
+        .fold(0, |parent, page| PageKey::new(parent, page).chain)
+}
+
+/// What the index knows of a full page: the tokens before it, by their
+/// hash, and its own.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PageKey {
+    /// The hash of every token before the page's own and of them.
+    chain: u64,
+    /// The hash of the tokens before the page (`0` for a first page).
+    parent: u64,
+    tokens: [u32; PAGE],
+}
+
+impl PageKey {
+    fn new(parent: u64, tokens: &[u32]) -> Self {
+        let tokens: [u32; PAGE] = tokens.try_into().expect("a full page");
+        let mut hasher = DefaultHasher::new();
+        parent.hash(&mut hasher);
+        tokens.hash(&mut hasher);
+        Self {
+            // Never 0, which means "no page before".
+            chain: hasher.finish() | 1,
+            parent,
+            tokens,
+        }
+    }
+}
+
+/// The pages that sequences can share, by the tokens they hold.
+#[derive(Debug, Default)]
+struct Prefixes {
+    /// The indexed page of each chain.
+    by_chain: HashMap<u64, u32>,
+    /// Per page, its key if it is indexed.
+    keys: Vec<Option<PageKey>>,
+    /// The indexed pages no sequence uses, by the time they were let go:
+    /// the first is the next taken back.
+    idle: BTreeMap<u64, u32>,
+    /// Per page, its key in `idle`.
+    idle_since: Vec<Option<u64>>,
+    clock: u64,
+    /// Positions taken from the index rather than computed.
+    hits: u64,
+}
+
+/// A copy of the first lines of one page into another, waiting for a
+/// backend: a sequence cut inside a page it shared gets its own copy.
+#[derive(Clone, Copy, Debug)]
+struct PageCopy {
+    from: u32,
+    to: u32,
+    lines: usize,
 }
 
 /// The keys and values of every sequence in progress, by pages.
@@ -48,8 +128,17 @@ pub struct KvCache {
     layers: Vec<Option<(Tensor, Tensor)>>,
     /// The pages of the tables: they have `pages · PAGE` lines.
     pages: usize,
-    /// The free pages; the next one given is the last.
+    /// The free pages, not indexed; the next one given is the last.
     free: Vec<u32>,
+    /// Per page, the sequences that use it.
+    refs: Vec<u32>,
+    /// The index of shared pages, with prefix sharing.
+    prefixes: Option<Prefixes>,
+    /// The pages the padding rows of recorded passes write into, taken as
+    /// they are needed and kept.
+    scratch: Vec<u32>,
+    /// Copies to make before the next pass.
+    copies: Vec<PageCopy>,
     /// Indexed by [`SequenceId`]; `None` for a sequence that ended.
     sequences: Vec<Option<Sequence>>,
     /// Whether the cache grows when it is full.
@@ -69,6 +158,10 @@ impl Default for KvCache {
             layers: Vec::new(),
             pages: 0,
             free: Vec::new(),
+            refs: Vec::new(),
+            prefixes: None,
+            scratch: Vec::new(),
+            copies: Vec::new(),
             sequences: Vec::new(),
             fixed: false,
             dtype: None,
@@ -86,6 +179,26 @@ pub(crate) struct Plan {
     pub(crate) widest: usize,
     /// `[R, 2]`.
     pub(crate) rows: Vec<u32>,
+}
+
+impl Plan {
+    /// Adds rows up to `rows`, each one token that writes into a line of
+    /// `scratch` of its own and sees it alone: rows that compute nothing
+    /// anyone reads, so that a recorded pass serves smaller batches.
+    pub(crate) fn pad(&mut self, rows: usize, scratch: &[u32]) {
+        let real = self.positions.len();
+        for r in real..rows {
+            let line = scratch[r - real];
+            self.positions.push(0);
+            self.lines.push(line);
+            let at = self.pages.len();
+            self.pages.resize(at + self.widest, 0);
+            self.pages[at] = line / PAGE as u32;
+            // The line is the first position its row sees: the row's
+            // positions start at the line's place in its page.
+            self.rows.extend([r as u32, line % PAGE as u32 + 1]);
+        }
+    }
 }
 
 /// What the attention layers of one pass need to know of its tokens: where to
@@ -117,8 +230,94 @@ impl KvCache {
         Self {
             pages,
             free: (0..pages as u32).rev().collect(),
+            refs: vec![0; pages],
             fixed: true,
             ..Self::default()
+        }
+    }
+
+    /// The same cache, its sequences sharing the pages of their common
+    /// beginnings (see the module's documentation). Set it before the first
+    /// sequence.
+    #[must_use]
+    pub fn with_prefix_sharing(mut self) -> Self {
+        self.prefixes = Some(Prefixes {
+            keys: vec![None; self.pages],
+            idle_since: vec![None; self.pages],
+            ..Prefixes::default()
+        });
+        self
+    }
+
+    /// Whether the cache keeps its number of pages.
+    pub fn is_fixed(&self) -> bool {
+        self.fixed
+    }
+
+    /// Starts a new sequence that will continue `prompt`, its first positions
+    /// taken from the pages of the longest beginning of `prompt` the cache
+    /// holds, whole pages short of its last token (which is left to compute,
+    /// for its logits). The sequence and the positions it holds already:
+    /// what is left of `prompt` to compute. Without prefix sharing, a new
+    /// empty sequence.
+    pub fn add_sequence_sharing(&mut self, prompt: &[u32]) -> (SequenceId, usize) {
+        let id = self.add_sequence();
+        let Some(prefixes) = self.prefixes.as_mut() else {
+            return (id, 0);
+        };
+        let mut parent = 0;
+        let mut pages = Vec::new();
+        for chunk in prompt[..prompt.len().saturating_sub(1)]
+            .as_chunks::<PAGE>()
+            .0
+        {
+            let key = PageKey::new(parent, chunk);
+            let Some(&page) = prefixes.by_chain.get(&key.chain) else {
+                break;
+            };
+            if prefixes.keys[page as usize].as_ref() != Some(&key) {
+                break;
+            }
+            pages.push(page);
+            parent = key.chain;
+        }
+        let len = pages.len() * PAGE;
+        for &page in &pages {
+            if self.refs[page as usize] == 0
+                && let Some(since) = prefixes.idle_since[page as usize].take()
+            {
+                prefixes.idle.remove(&since);
+            }
+            self.refs[page as usize] += 1;
+        }
+        prefixes.hits += len as u64;
+        let sequence = self.sequences[id.0].as_mut().expect("just added");
+        sequence.offered = pages.len();
+        sequence.chain = parent;
+        sequence.pages = pages;
+        sequence.len = len;
+        sequence.tokens = prompt[..len].to_vec();
+        (id, len)
+    }
+
+    /// The positions taken from shared pages rather than computed, since the
+    /// cache was made.
+    pub fn shared_positions(&self) -> u64 {
+        self.prefixes.as_ref().map_or(0, |p| p.hits)
+    }
+
+    /// Forgets every shared page no sequence uses: after a pass that failed,
+    /// what they hold may be wrong.
+    pub fn clear_prefixes(&mut self) {
+        let Some(prefixes) = self.prefixes.as_mut() else {
+            return;
+        };
+        for (_, page) in std::mem::take(&mut prefixes.idle) {
+            prefixes.idle_since[page as usize] = None;
+            if let Some(key) = prefixes.keys[page as usize].take() {
+                prefixes.by_chain.remove(&key.chain);
+            }
+            self.free.push(page);
         }
     }
 
@@ -160,7 +359,52 @@ impl KvCache {
     /// If the sequence already ended.
     pub fn remove_sequence(&mut self, id: SequenceId) {
         let sequence = self.sequences[id.0].take().expect("a sequence in progress");
-        self.free.extend(sequence.pages.iter().rev());
+        // The last pages first: they are taken back before the pages they
+        // follow, which other sequences are likelier to share.
+        for &page in sequence.pages.iter().rev() {
+            self.release(page);
+        }
+    }
+
+    /// One sequence fewer uses `page`: once none does, it is free, or idle
+    /// if indexed.
+    fn release(&mut self, page: u32) {
+        let refs = &mut self.refs[page as usize];
+        *refs -= 1;
+        if *refs > 0 {
+            return;
+        }
+        match self.prefixes.as_mut() {
+            Some(p) if p.keys[page as usize].is_some() => {
+                p.clock += 1;
+                p.idle.insert(p.clock, page);
+                p.idle_since[page as usize] = Some(p.clock);
+            }
+            _ => self.free.push(page),
+        }
+    }
+
+    /// A page for a sequence: a free one, or else the idle page let go
+    /// first, taken out of the index.
+    fn take_page(&mut self) -> u32 {
+        let page = match self.free.pop() {
+            Some(page) => page,
+            None => {
+                let p = self.prefixes.as_mut().expect("pages were counted");
+                let (_, page) = p.idle.pop_first().expect("pages were counted");
+                p.idle_since[page as usize] = None;
+                let key = p.keys[page as usize].take().expect("an indexed page");
+                p.by_chain.remove(&key.chain);
+                page
+            }
+        };
+        self.refs[page as usize] = 1;
+        page
+    }
+
+    /// The pages free or idle.
+    fn available(&self) -> usize {
+        self.free.len() + self.prefixes.as_ref().map_or(0, |p| p.idle.len())
     }
 
     fn sequence(&self, id: SequenceId) -> &Sequence {
@@ -187,9 +431,10 @@ impl KvCache {
         self.len(id) == 0
     }
 
-    /// The pages not given to any sequence.
+    /// The pages no sequence uses (those that keep a shared beginning
+    /// included: they are taken back when needed).
     pub fn free_pages(&self) -> usize {
-        self.free.len()
+        self.available()
     }
 
     /// The pages of the tables.
@@ -223,8 +468,89 @@ impl KvCache {
             .expect("a sequence in progress");
         assert!(len <= sequence.len, "a sequence can only be shortened");
         sequence.len = len;
+        sequence.tokens.truncate(len);
+        if sequence.offered > len / PAGE {
+            sequence.offered = len / PAGE;
+            sequence.chain = chain_of(&sequence.tokens[..sequence.offered * PAGE]);
+        }
         let freed: Vec<u32> = sequence.pages.drain(len.div_ceil(PAGE)..).collect();
-        self.free.extend(freed.iter().rev());
+        let last = (!len.is_multiple_of(PAGE)).then(|| sequence.pages[len / PAGE]);
+        for &page in freed.iter().rev() {
+            self.release(page);
+        }
+        // The page now cut will be written again: no other sequence may see
+        // it change, nor the index keep it.
+        let Some(page) = last else { return };
+        if self.refs[page as usize] > 1 {
+            self.refs[page as usize] -= 1;
+            let copy = self.take_page();
+            self.copies.push(PageCopy {
+                from: page,
+                to: copy,
+                lines: len % PAGE,
+            });
+            let sequence = self.sequences[id.0].as_mut().expect("in progress");
+            sequence.pages[len / PAGE] = copy;
+        } else if let Some(p) = self.prefixes.as_mut()
+            && let Some(key) = p.keys[page as usize].take()
+        {
+            p.by_chain.remove(&key.chain);
+        }
+    }
+
+    /// Makes the copies of pages that cut sequences wait for.
+    fn copy_pages<B: Backend + Transfer>(&mut self, backend: &B) -> Result<(), ModelError> {
+        for copy in std::mem::take(&mut self.copies) {
+            let to: Vec<u32> = (0..copy.lines)
+                .map(|j| copy.to * PAGE as u32 + j as u32)
+                .collect();
+            let index = backend.upload(&Tensor::from_slice(&to, &[to.len()])?)?;
+            for (k, v) in self.layers.iter_mut().flatten() {
+                for table in [k, v] {
+                    let lines = table.narrow(0, copy.from as usize * PAGE, copy.lines)?;
+                    let rows = backend.forward(&Contiguous, &[&lines])?;
+                    drop(lines);
+                    backend.write_rows(table, &index, &rows)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Takes now, from the reserve, the pages the padding of recorded passes
+    /// of up to `rows` rows will write into, so that recording one never
+    /// takes pages a pass was counting on. They are never given back.
+    ///
+    /// # Errors
+    ///
+    /// [`ModelError::CacheFull`] for a cache of fixed size without them.
+    pub fn reserve_padding(&mut self, rows: usize) -> Result<(), ModelError> {
+        self.scratch_lines(rows.saturating_sub(1)).map(drop)
+    }
+
+    /// `count` lines for the padding rows of recorded passes to write into
+    /// and read, one each: lines of pages taken from the reserve the first
+    /// time they are needed, and never given back.
+    pub(crate) fn scratch_lines(&mut self, count: usize) -> Result<Vec<u32>, ModelError> {
+        let pages = count.div_ceil(PAGE);
+        let missing = pages.saturating_sub(self.scratch.len());
+        if self.fixed && missing > self.available() {
+            // All or nothing: a pass may count on the pages left.
+            return Err(ModelError::CacheFull {
+                needed: missing,
+                free: self.available(),
+            });
+        }
+        while self.scratch.len() < pages {
+            if self.available() == 0 {
+                self.grow_to(self.pages * 2 + 1);
+            }
+            let page = self.take_page();
+            self.scratch.push(page);
+        }
+        Ok((0..count)
+            .map(|i| self.scratch[i / PAGE] * PAGE as u32 + (i % PAGE) as u32)
+            .collect())
     }
 
     /// The bytes the tables hold, or will hold once a pass has made them:
@@ -268,7 +594,8 @@ impl KvCache {
             .iter()
             .all(|&(id, _)| self.sequences.get(id.0).is_some_and(Option::is_some))
             && self.widest(batch) <= widest
-            && needed <= self.free.len()
+            && needed <= self.available()
+            && self.copies.is_empty()
     }
 
     /// Makes room for `batch` (each sequence and the positions it will add):
@@ -279,12 +606,13 @@ impl KvCache {
     ///
     /// [`ModelError::CacheFull`] for a cache of fixed size without the room;
     /// those of the backend.
-    pub(crate) fn reserve<B: Write + Transfer>(
+    pub(crate) fn reserve<B: Backend + Transfer>(
         &mut self,
         backend: &B,
         batch: &[(SequenceId, usize)],
     ) -> Result<(), ModelError> {
         self.make_room(batch)?;
+        self.copy_pages(backend)?;
         let lines = self.pages * PAGE;
         for layer in 0..self.layers.len() {
             if let Some((k, v)) = &self.layers[layer] {
@@ -304,21 +632,30 @@ impl KvCache {
             .iter()
             .map(|&(id, count)| self.pages_needed(id, count))
             .sum();
-        if needed > self.free.len() {
+        let available = self.available();
+        if needed > available {
             if self.fixed {
                 return Err(ModelError::CacheFull {
                     needed,
-                    free: self.free.len(),
+                    free: available,
                 });
             }
-            let pages = (self.pages * 2)
-                .max(self.pages + needed - self.free.len())
-                .max(4);
-            self.free
-                .splice(0..0, (self.pages as u32..pages as u32).rev());
-            self.pages = pages;
+            self.grow_to((self.pages * 2).max(self.pages + needed - available).max(4));
         }
         Ok(())
+    }
+
+    /// Grows the cache to `pages` pages; the new ones are given after the
+    /// free ones.
+    fn grow_to(&mut self, pages: usize) {
+        self.free
+            .splice(0..0, (self.pages as u32..pages as u32).rev());
+        self.refs.resize(pages, 0);
+        if let Some(p) = self.prefixes.as_mut() {
+            p.keys.resize(pages, None);
+            p.idle_since.resize(pages, None);
+        }
+        self.pages = pages;
     }
 
     /// Plans a pass of the model over `batch`: for each sequence, the number
@@ -329,6 +666,42 @@ impl KvCache {
     /// The new tokens of all the sequences form one list of `R` rows, in the
     /// order of the batch.
     pub(crate) fn plan(
+        &mut self,
+        batch: &[(SequenceId, &[u32])],
+        widest: Option<usize>,
+    ) -> Result<Plan, ModelError> {
+        let counts: Vec<(SequenceId, usize)> =
+            batch.iter().map(|&(id, ids)| (id, ids.len())).collect();
+        let plan = self.plan_counts(&counts, widest)?;
+        if self.prefixes.is_some() {
+            for &(id, ids) in batch {
+                self.offer(id, ids);
+            }
+        }
+        Ok(plan)
+    }
+
+    /// Notes the new tokens of a sequence, and indexes the pages they fill.
+    fn offer(&mut self, id: SequenceId, ids: &[u32]) {
+        let sequence = self.sequences[id.0].as_mut().expect("in progress");
+        sequence.tokens.extend_from_slice(ids);
+        let prefixes = self.prefixes.as_mut().expect("prefix sharing");
+        let full = sequence.len / PAGE;
+        while sequence.offered < full {
+            let at = sequence.offered;
+            let key = PageKey::new(sequence.chain, &sequence.tokens[at * PAGE..][..PAGE]);
+            sequence.chain = key.chain;
+            let page = sequence.pages[at];
+            if !prefixes.by_chain.contains_key(&key.chain) && prefixes.keys[page as usize].is_none()
+            {
+                prefixes.by_chain.insert(key.chain, page);
+                prefixes.keys[page as usize] = Some(key);
+            }
+            sequence.offered += 1;
+        }
+    }
+
+    fn plan_counts(
         &mut self,
         batch: &[(SequenceId, usize)],
         widest: Option<usize>,
@@ -347,8 +720,7 @@ impl KvCache {
         self.make_room(batch)?;
         for &(id, count) in batch {
             let take = self.pages_needed(id, count);
-            let at = self.free.len() - take;
-            let pages: Vec<u32> = self.free.drain(at..).rev().collect();
+            let pages: Vec<u32> = (0..take).map(|_| self.take_page()).collect();
             self.sequences[id.0]
                 .as_mut()
                 .expect("a sequence in progress")
@@ -383,11 +755,12 @@ impl KvCache {
 
     /// Prepares a pass of the model over `batch` ([`KvCache::plan`]), and
     /// uploads what the attention needs to `backend`.
-    pub(crate) fn begin<B: Transfer>(
+    pub(crate) fn begin<B: Backend + Transfer>(
         &mut self,
         backend: &B,
-        batch: &[(SequenceId, usize)],
+        batch: &[(SequenceId, &[u32])],
     ) -> Result<Step, ModelError> {
+        self.copy_pages(backend)?;
         let plan = self.plan(batch, None)?;
         let r = plan.positions.len();
         let upload = |values: &[u32], shape: &[usize]| -> Result<Tensor, ModelError> {
@@ -462,7 +835,7 @@ mod tests {
     }
 
     fn grow(cache: &mut KvCache, id: SequenceId, count: usize) -> Result<Step, ModelError> {
-        cache.begin(&kapel_ref::Reference, &[(id, count)])
+        cache.begin(&kapel_ref::Reference, &[(id, &vec![0; count])])
     }
 
     #[test]
@@ -517,7 +890,7 @@ mod tests {
         let (a, b) = (cache.add_sequence(), cache.add_sequence());
         grow(&mut cache, a, 3).unwrap();
         let step = cache
-            .begin(&kapel_ref::Reference, &[(b, 2), (a, 1)])
+            .begin(&kapel_ref::Reference, &[(b, &[1, 2]), (a, &[3])])
             .unwrap();
         assert_eq!(step.positions.to_vec::<u32>().unwrap(), [0, 1, 3]);
         assert_eq!(step.lines.to_vec::<u32>().unwrap(), [16, 17, 3]);
@@ -525,8 +898,82 @@ mod tests {
         assert_eq!(step.rows.to_vec::<u32>().unwrap(), [0, 1, 0, 2, 1, 4]);
         assert!(
             cache
-                .begin(&kapel_ref::Reference, &[(a, 1), (a, 1)])
+                .begin(&kapel_ref::Reference, &[(a, &[1]), (a, &[2])])
                 .is_err()
         );
+    }
+
+    fn write(cache: &mut KvCache, id: SequenceId, tokens: &[u32]) {
+        cache.begin(&kapel_ref::Reference, &[(id, tokens)]).unwrap();
+    }
+
+    #[test]
+    fn sequences_share_the_pages_of_a_common_beginning() {
+        let mut cache = KvCache::with_pages(8).with_prefix_sharing();
+        let prompt: Vec<u32> = (0..40).collect();
+        let (a, held) = cache.add_sequence_sharing(&prompt);
+        assert_eq!(held, 0);
+        write(&mut cache, a, &prompt);
+        assert_eq!(cache.free_pages(), 5);
+        // Two full pages in common, then another token.
+        let mut other = prompt[..32].to_vec();
+        other.push(99);
+        let (b, held) = cache.add_sequence_sharing(&other);
+        assert_eq!(held, 32);
+        assert_eq!(lines(&cache, b), lines(&cache, a)[..32]);
+        assert_eq!(cache.free_pages(), 5, "nothing taken for shared pages");
+        write(&mut cache, b, &[99]);
+        assert_eq!(cache.free_pages(), 4);
+        // A prompt of exactly two pages keeps its last token to compute.
+        let (c, held) = cache.add_sequence_sharing(&prompt[..32]);
+        assert_eq!(held, 16);
+        cache.remove_sequence(c);
+        assert_eq!(cache.shared_positions(), 48);
+        // Once every sequence has ended, the pages stay, idle but known.
+        cache.remove_sequence(a);
+        cache.remove_sequence(b);
+        assert_eq!(cache.free_pages(), 8);
+        let (d, held) = cache.add_sequence_sharing(&prompt);
+        assert_eq!(held, 32);
+        cache.remove_sequence(d);
+    }
+
+    #[test]
+    fn idle_pages_are_taken_back_last_page_first() {
+        let mut cache = KvCache::with_pages(4).with_prefix_sharing();
+        let prompt: Vec<u32> = (0..48).collect();
+        let (a, _) = cache.add_sequence_sharing(&prompt);
+        write(&mut cache, a, &prompt);
+        cache.remove_sequence(a);
+        // Three pages: the free one, then the idle ones, the last page of
+        // the prompt first; its first page stays.
+        let (b, _) = cache.add_sequence_sharing(&[7]);
+        write(&mut cache, b, &[7; 48]);
+        let (c, held) = cache.add_sequence_sharing(&prompt);
+        assert_eq!(held, 16);
+        cache.remove_sequence(c);
+    }
+
+    #[test]
+    fn a_sequence_cut_in_a_shared_page_writes_into_its_own_copy() {
+        let mut cache = KvCache::with_pages(4).with_prefix_sharing();
+        let prompt: Vec<u32> = (0..33).collect();
+        let (a, _) = cache.add_sequence_sharing(&prompt);
+        write(&mut cache, a, &prompt);
+        let (b, held) = cache.add_sequence_sharing(&prompt);
+        assert_eq!(held, 32);
+        let shared = lines(&cache, a)[16];
+        cache.truncate(b, 20);
+        assert_ne!(lines(&cache, b)[16], shared, "a page of its own");
+        assert_eq!(lines(&cache, b)[..16], lines(&cache, a)[..16]);
+        assert_eq!(cache.copies.len(), 1);
+        assert!(!cache.fits(&[(b, 1)], 4), "the copy comes first");
+        write(&mut cache, b, &[5]);
+        assert!(cache.copies.is_empty());
+        // The first sequence still finds its pages.
+        cache.remove_sequence(b);
+        let (c, held) = cache.add_sequence_sharing(&prompt);
+        assert_eq!(held, 32);
+        assert_eq!(lines(&cache, c)[16], shared);
     }
 }

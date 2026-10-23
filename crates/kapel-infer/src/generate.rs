@@ -1,6 +1,7 @@
 //! Generation: a prompt, then one token at a time.
 
 use std::path::Path;
+use std::sync::OnceLock;
 
 use kapel_core::{DType, Tensor};
 use kapel_hub::{Checkpoint, read_json};
@@ -9,6 +10,7 @@ use kapel_ops::{ArgMax, Backend, Transfer};
 use kapel_tokenizers::{ChatTemplate, Message, Tokenizer};
 use serde_json::Value;
 
+use crate::constraint::{Constraint, Grammars, Guide};
 use crate::sampling::{Sampler, Sampling};
 use crate::text::TextStream;
 use crate::{InferError, Result};
@@ -24,6 +26,8 @@ pub struct Pipeline<B> {
     sampling: Sampling,
     /// The type of the caches of generation; `None` for the keys'.
     cache_dtype: Option<DType>,
+    /// What compiles constraints, made at the first one.
+    grammars: OnceLock<std::result::Result<Grammars, String>>,
 }
 
 /// How [`Pipeline::load_with`] prepares the weights.
@@ -78,6 +82,8 @@ pub struct Request {
     /// the answer goes on to `max_tokens`: answers of known lengths, to
     /// measure speed.
     pub ignore_eos: bool,
+    /// The form the answer must take, if any.
+    pub constraint: Option<Constraint>,
 }
 
 impl Default for Request {
@@ -88,6 +94,7 @@ impl Default for Request {
             max_tokens: 256,
             stop: Vec::new(),
             ignore_eos: false,
+            constraint: None,
         }
     }
 }
@@ -110,6 +117,9 @@ pub enum Finish {
     Stop(String),
     /// [`Request::max_tokens`] were generated.
     Length,
+    /// The request failed on its own (its constraint's parser, say); the
+    /// others go on.
+    Error(String),
 }
 
 /// The tokens of `eos_token_id`: a number or a list of them.
@@ -189,6 +199,7 @@ impl<B: Backend + Transfer> Pipeline<B> {
             eos,
             sampling: Sampling::from_generation_config(&generation),
             cache_dtype: options.cache_dtype,
+            grammars: OnceLock::new(),
         })
     }
 
@@ -222,6 +233,7 @@ impl<B: Backend + Transfer> Pipeline<B> {
             eos: vocabulary.eos,
             sampling: Sampling::default(),
             cache_dtype: options.cache_dtype,
+            grammars: OnceLock::new(),
         })
     }
 
@@ -241,6 +253,34 @@ impl<B: Backend + Transfer> Pipeline<B> {
             Some(dtype) => kapel_models::KvCache::new().with_dtype(dtype),
             None => kapel_models::KvCache::new(),
         }
+    }
+
+    /// The type of the caches of generation; `None` for that of the keys.
+    pub fn cache_dtype(&self) -> Option<DType> {
+        self.cache_dtype
+    }
+
+    /// The guide of one answer held to `constraint`; the model's tokens are
+    /// read into llguidance at the first call.
+    pub(crate) fn guide(&self, constraint: &Constraint) -> Result<Guide> {
+        let grammars = self.grammars.get_or_init(|| {
+            Grammars::new(&self.tokenizer, self.model.config().vocab, &self.eos)
+                .map_err(|e| e.to_string())
+        });
+        match grammars {
+            Ok(grammars) => grammars.guide(constraint),
+            Err(e) => Err(InferError::Constraint(e.clone())),
+        }
+    }
+
+    /// Checks that `constraint` compiles, so that a request can be refused
+    /// before it is queued.
+    ///
+    /// # Errors
+    ///
+    /// If it does not: an invalid schema, regular expression or grammar.
+    pub fn check_constraint(&self, constraint: &Constraint) -> Result<()> {
+        self.guide(constraint).map(drop)
     }
 
     /// The tokenizer.
@@ -292,12 +332,18 @@ impl<B: Backend + Transfer> Pipeline<B> {
     ///
     /// # Errors
     ///
-    /// If `prompt` is empty.
+    /// If `prompt` is empty, or the request's constraint does not compile.
     pub fn generate(&self, prompt: &[u32], request: &Request) -> Result<Generation<'_, B>> {
         if prompt.is_empty() {
             return Err(InferError::EmptyPrompt);
         }
+        let guide = request
+            .constraint
+            .as_ref()
+            .map(|c| self.guide(c))
+            .transpose()?;
         Ok(Generation {
+            guide,
             pipeline: self,
             cache: match self.cache_dtype {
                 Some(dtype) => Cache::with_dtype(dtype),
@@ -346,6 +392,8 @@ pub struct Generation<'p, B> {
     finish: Option<Finish>,
     /// The pass of the next tokens, recorded once.
     recorded: Option<RecordedStep>,
+    /// The parser of the answer's form, if it has one.
+    guide: Option<Guide>,
 }
 
 impl<B: Backend + Transfer> Generation<'_, B> {
@@ -379,12 +427,19 @@ impl<B: Backend + Transfer> Generation<'_, B> {
             Some(logits) => logits,
             None => p.model.step(&p.backend, fresh, &mut self.cache)?,
         };
-        let token = if self.sampler.is_argmax() {
+        let token = if self.sampler.is_argmax() && self.guide.is_none() {
             p.most_likely(&logits)?
         } else {
             let mut logits = p.backend.download(&logits)?.to_f64_vec()?;
-            self.sampler.choose(&mut logits, &self.sequence)
+            if let Some(guide) = &mut self.guide {
+                guide.mask(&mut logits)?;
+            }
+            self.sampler
+                .choose(&mut logits, &self.sequence, self.prompt_len)
         };
+        if let Some(guide) = &mut self.guide {
+            guide.advance(token)?;
+        }
         self.sequence.push(token);
         if !self.ignore_eos && p.eos.contains(&token) {
             self.finish = Some(Finish::Eos);

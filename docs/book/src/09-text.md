@@ -41,6 +41,8 @@ When a symbol is not in the vocabulary, byte fallback encodes it as `<0xHH>` tok
 
 Decoders undo the pre-tokenizer: ByteLevel maps characters back to bytes, Metaspace turns `▁` back into spaces, ByteFallback reassembles `<0xHH>` runs into UTF-8, and Replace, Fuse and Strip clean up. Invalid bytes become U+FFFD rather than an error, so decoding never fails. `decode(ids, skip_special_tokens)` optionally drops special tokens. The generation engine relies on this to stream text (chapter 11).
 
+**The bytes of one token.** `token_bytes(id)` gives what a token adds to the decoded text when it stands in the middle of it, as bytes: a token of a byte-level vocabulary may be part of a character, so it is not always text. The decoder's steps run on the one token, at the level of bytes: ByteLevel maps its characters to bytes, ByteFallback turns `<0xHH>` into its byte, Metaspace and Replace turn `▁` into a space. The steps that act only at the ends of a whole text, Strip and the space Metaspace takes off a first token, leave the token unchanged. A special token gives its content as it is; `is_special(id)` says which tokens are. Constrained generation (chapter 11) builds its tree of tokens from these bytes. The parity test checks, for every case of every tokenizer, that the bytes of its tokens, one after the other, are the decoded text, but for a leading space a first-token rule removes.
+
 ## 9.5 Chat templates
 
 A chat model expects its conversations in a precise format, written by its authors as a Jinja template in `chat_template.jinja` or in `tokenizer_config.json`. Kapel renders it with `minijinja`, plus the pieces that `transformers` templates assume:

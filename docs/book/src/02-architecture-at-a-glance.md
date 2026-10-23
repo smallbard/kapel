@@ -19,9 +19,10 @@ Models sit above the catalogue, never above a particular backend: swapping the r
 | Files | `kapel-hub` | safetensors, GGUF, checkpoints, Hub downloads | core |
 | Text | `kapel-tokenizers` | `tokenizer.json`, BPE, decoding, chat templates | none |
 | Models | `kapel-models` | Configurations and the transformer forward pass | core, ops, hub |
-| Applications | `kapel-infer` | Generation: pipeline, cache, sampling, streaming text | core, ops, hub, models, tokenizers |
+| Applications | `kapel-infer` | Generation: pipeline, engine of many requests, sampling, constraints, streaming text | core, ops, hub, models, tokenizers |
+|  | `kapel-serve` | The server of OpenAI's API: HTTP, streams, metrics | core, ops, models, infer, tokenizers |
 |  | `kapel-cli` | The `kapel` command | all of the above |
-|  | `kapel-serve`, `kapel-train` | Placeholders for the server and for training | none yet |
+|  | `kapel-train` | A placeholder for training | none yet |
 
 Outside the workspace, `kernels/` holds the simple CUDA kernels written in Rust for the nightly compiler. They are compiled once to PTX and the result, `crates/kapel-cuda/kernels.ptx`, is checked in, so the published crates build on stable Rust. `fuzz/` holds the fuzzing targets and `tools/parity/` the Python scripts that produce reference outputs from `transformers`.
 
@@ -46,3 +47,13 @@ Follow `kapel run Qwen/Qwen3-0.6B --prompt "Hello"` from the command line to the
 7. **Stream the text.** Each token is decoded to text. Incomplete UTF-8 characters, and text that might be the start of a stop sequence, wait until they are settled, so the text that reaches the screen is never taken back.
 
 Every step of the forward pass is an operation from the catalogue, run by the chosen backend. The rest of the book walks through these layers from the bottom up.
+
+## The life of a served request
+
+`kapel serve` puts the same pipeline behind HTTP (chapter 12). Two kinds of threads share it: the HTTP threads of tokio, and one thread that owns the engine and is the only one to touch the device.
+
+1. **Read.** An axum handler receives `POST /v1/chat/completions`, reads the JSON, checks the model's name and the limits, and turns the OpenAI fields into a `Request` (sampling, stop sequences, constraint).
+2. **Prepare.** On a blocking thread of tokio, the chat template renders the messages, the tokenizer encodes them, and `Pipeline::prepare` compiles the constraint, if any. Nothing of this waits for the engine.
+3. **Submit.** The prepared request, with the sending end of a channel, goes to the engine's thread.
+4. **Serve.** The engine's thread admits it between two passes (`Engine::add_prepared`) once the cache has pages for it. Each pass computes a token of every request that decodes, and pieces of new prompts (chapter 11).
+5. **Answer.** Each token goes back through its request's channel; the handler sends it to the client as a server-sent event, or gathers the whole answer. A client that closes its connection closes the channel, and the engine cancels the request before its next pass.

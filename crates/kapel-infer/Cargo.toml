@@ -17,6 +17,7 @@ kapel-ops.workspace = true
 kapel-hub.workspace = true
 kapel-models.workspace = true
 kapel-tokenizers.workspace = true
+llguidance.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]

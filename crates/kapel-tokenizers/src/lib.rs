@@ -270,6 +270,22 @@ impl Tokenizer {
         self.id_to_token.get(&id).map(String::as_str)
     }
 
+    /// The bytes of an id in the middle of a text: what decoding it adds
+    /// there. A token of a byte-level vocabulary may be part of a character,
+    /// so this is bytes, not text. A special token gives its content.
+    pub fn token_bytes(&self, id: u32) -> Option<Vec<u8>> {
+        let token = self.id_to_token.get(&id)?;
+        if self.special_ids.contains(&id) || self.decoder.is_none() {
+            return Some(token.clone().into_bytes());
+        }
+        self.decoder.as_ref().map(|d| d.token_bytes(token))
+    }
+
+    /// Whether an id is a special token (an added token marked special).
+    pub fn is_special(&self, id: u32) -> bool {
+        self.special_ids.contains(&id)
+    }
+
     /// The text cut at the added tokens: segments of plain text with their byte
     /// offset in `text`, and the ids of the added tokens between them.
     fn split_added<'t>(&self, text: &'t str) -> Vec<Result<(usize, &'t str), u32>> {
@@ -576,6 +592,19 @@ mod tests {
                     failures.push(format!(
                         "{name} {text:?}: {got:?}, expected {:?}",
                         ids("ids")
+                    ));
+                }
+                // The bytes of the tokens, one after the other, are the
+                // decoded text, but for the space taken off its start.
+                let bytes: Vec<u8> = ids("ids_no_special")
+                    .iter()
+                    .flat_map(|&id| tokenizer.token_bytes(id).unwrap())
+                    .collect();
+                let whole = tokenizer.decode(&ids("ids_no_special"), false);
+                if bytes != whole.as_bytes() && bytes.strip_prefix(b" ") != Some(whole.as_bytes()) {
+                    failures.push(format!(
+                        "{name} bytes {text:?}: {:?}, expected {whole:?}",
+                        String::from_utf8_lossy(&bytes)
                     ));
                 }
                 let decoded = tokenizer.decode(&ids("ids_no_special"), false);

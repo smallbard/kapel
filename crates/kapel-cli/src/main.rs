@@ -7,14 +7,16 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use kapel_infer::{Finish, LoadOptions, Pipeline, Request};
+use kapel_core::DType;
+use kapel_infer::{EngineOptions, Finish, LoadOptions, Pipeline, Request};
 use kapel_ops::{Backend, Transfer};
 use kapel_tokenizers::Message;
 
-use crate::args::{Device, Run};
+use crate::args::{Device, Load, Run, Serve};
 
 const USAGE: &str = "\
 usage: kapel run MODEL [options]
+       kapel serve MODEL [options]
 
 Generates text with MODEL: a model directory, a GGUF file, or a repository of the
 Hugging Face Hub (owner/name, downloaded once into ~/.cache/kapel/hub, or
@@ -45,18 +47,34 @@ options:
   --byte-activations       on cpu, quantize the activations of the products by
                            quantized weights to bytes, as llama.cpp does: faster,
                            and the results change a little
+
+kapel serve serves MODEL behind an HTTP API compatible with OpenAI's
+(/v1/chat/completions, /v1/completions, /v1/models, /health, /metrics), the
+requests computed together. It takes --device, --dtype, --revision, --quantize,
+--quantize-output, --kv-cache and --byte-activations as kapel run does, and:
+  --host HOST              the address to listen on (default 127.0.0.1)
+  --port PORT              (default 8000)
+  --served-model-name NAME the model's name in the API (default from MODEL)
+  --max-model-len N        the most positions of a sequence, prompt and answer
+                           (default the model's, at most what the cache holds)
+  --gpu-memory-utilization F
+                           on cuda, the share of the card's memory to use, the
+                           cache taking what the weights leave (default 0.85)
+  --cache-memory GIB       the memory of the cache instead (default 4 on cpu)
+  --max-sequences N        the most answers computed at once (default 256)
+  --max-pass-tokens N      the most tokens of one pass (default 2048)
+  --max-requests N         the most answers in flight; beyond, 429 (default 1024)
+  --no-prefix-sharing      do not share the cache of common prompt beginnings
+  --timeout SECONDS        the longest a request may take (default 600)
 ";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
-        Some("run") => match args::parse(&args[1..]).and_then(|run| execute(&run)) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(message) => {
-                eprintln!("kapel: {message}");
-                ExitCode::FAILURE
-            }
-        },
+        Some("run") => exit(args::parse(&args[1..]).and_then(|run| execute(&run))),
+        Some("serve") => {
+            exit(args::parse_serve(&args[1..]).and_then(|serve| execute_serve(&serve)))
+        }
         Some("--version" | "-V") => {
             println!("kapel {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
@@ -67,6 +85,16 @@ fn main() -> ExitCode {
         }
         _ => {
             eprint!("{USAGE}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn exit(result: Result<(), String>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(message) => {
+            eprintln!("kapel: {message}");
             ExitCode::FAILURE
         }
     }
@@ -84,19 +112,27 @@ fn directory(model: &str, revision: &str) -> Result<PathBuf, String> {
         .map_err(|e| e.to_string())
 }
 
+/// How `load` prepares the weights on its device.
+fn load_options(load: &Load) -> LoadOptions {
+    let cuda = matches!(load.device, Device::Cuda(_));
+    LoadOptions {
+        dtype: load
+            .dtype
+            .or(Some(if cuda { DType::BF16 } else { DType::F32 })),
+        quantize: load.quantize,
+        quantize_output: load.quantize_output,
+        fuse: cuda,
+        cache_dtype: load.kv_cache,
+    }
+}
+
 fn execute(run: &Run) -> Result<(), String> {
-    let dir = directory(&run.model, &run.revision)?;
-    match run.device {
+    let dir = directory(&run.load.model, &run.load.revision)?;
+    let options = load_options(&run.load);
+    match run.load.device {
         Device::Cpu => {
-            let options = LoadOptions {
-                dtype: run.dtype.or(Some(kapel_core::DType::F32)),
-                quantize: run.quantize,
-                quantize_output: run.quantize_output,
-                fuse: false,
-                cache_dtype: run.kv_cache,
-            };
-            let cpu = kapel_cpu::Cpu::new().with_byte_activations(run.byte_activations);
-            serve(
+            let cpu = kapel_cpu::Cpu::new().with_byte_activations(run.load.byte_activations);
+            converse(
                 run,
                 Pipeline::load_with(&dir, cpu, &options).map_err(|e| e.to_string())?,
             )
@@ -104,14 +140,7 @@ fn execute(run: &Run) -> Result<(), String> {
         #[cfg(feature = "cuda")]
         Device::Cuda(ordinal) => {
             let cuda = kapel_cuda::Cuda::new(ordinal).map_err(|e| e.to_string())?;
-            let options = LoadOptions {
-                dtype: run.dtype.or(Some(kapel_core::DType::BF16)),
-                quantize: run.quantize,
-                quantize_output: run.quantize_output,
-                fuse: true,
-                cache_dtype: run.kv_cache,
-            };
-            serve(
+            converse(
                 run,
                 Pipeline::load_with(&dir, cuda, &options).map_err(|e| e.to_string())?,
             )
@@ -121,13 +150,140 @@ fn execute(run: &Run) -> Result<(), String> {
     }
 }
 
+/// The name of a model in the API: its Hub repository, from the name given
+/// or from the path of a snapshot of the Hub's cache, else the last part of
+/// its path.
+fn model_name(model: &str) -> String {
+    let path = std::path::Path::new(model);
+    for part in path.components() {
+        if let Some(repo) = part
+            .as_os_str()
+            .to_str()
+            .and_then(|p| p.strip_prefix("models--"))
+        {
+            return repo.replacen("--", "/", 1);
+        }
+    }
+    if !path.exists() {
+        return model.to_string();
+    }
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(model)
+        .to_string()
+}
+
+/// The bytes of one page of the cache of `pipeline`'s model.
+fn page_bytes<B: Backend + Transfer>(pipeline: &Pipeline<B>, load: &Load) -> usize {
+    let config = pipeline.model().config();
+    let dtype = pipeline
+        .cache_dtype()
+        .or(load_options(load).dtype)
+        .unwrap_or(DType::F32);
+    let element = dtype.element_size().unwrap_or(4);
+    config.layers * 2 * config.kv_heads * config.head_dim * element * kapel_models::PAGE
+}
+
+fn execute_serve(serve: &Serve) -> Result<(), String> {
+    let dir = directory(&serve.load.model, &serve.load.revision)?;
+    let options = load_options(&serve.load);
+    match serve.load.device {
+        Device::Cpu => {
+            let cpu = kapel_cpu::Cpu::new().with_byte_activations(serve.load.byte_activations);
+            let pipeline = Pipeline::load_with(&dir, cpu, &options).map_err(|e| e.to_string())?;
+            let memory = serve.cache_memory.unwrap_or(4.0);
+            let pages =
+                (memory * f64::from(1u32 << 30)) as usize / page_bytes(&pipeline, &serve.load);
+            start_server(serve, pipeline, pages)
+        }
+        #[cfg(feature = "cuda")]
+        Device::Cuda(ordinal) => {
+            let cuda = kapel_cuda::Cuda::new(ordinal).map_err(|e| e.to_string())?;
+            let pipeline =
+                Pipeline::load_with(&dir, cuda.clone(), &options).map_err(|e| e.to_string())?;
+            let page = page_bytes(&pipeline, &serve.load);
+            let pages = match serve.cache_memory {
+                Some(memory) => (memory * f64::from(1u32 << 30)) as usize / page,
+                None => {
+                    cuda.clear_pool();
+                    let (free, total) = cuda.memory().map_err(|e| e.to_string())?;
+                    let config = pipeline.model().config();
+                    // What the passes need besides the cache: activations of
+                    // the widest pass, logits, and the recorded passes, which
+                    // keep their own buffers (one per size of batch).
+                    let activations =
+                        serve.max_pass_tokens * (config.hidden * 8 + config.intermediate * 4) * 4
+                            + serve.max_sequences * config.vocab * 8
+                            + (5usize << 29);
+                    let budget = (total as f64 * serve.gpu_memory_utilization) as usize;
+                    let used = total - free;
+                    let left = budget.saturating_sub(used + activations);
+                    if left < 64 * page {
+                        return Err(format!(
+                            "the card has room for {} pages of cache; raise \
+                             --gpu-memory-utilization or use --cache-memory",
+                            left / page
+                        ));
+                    }
+                    left / page
+                }
+            };
+            start_server(serve, pipeline, pages)
+        }
+        #[cfg(not(feature = "cuda"))]
+        Device::Cuda(_) => Err("this kapel was built without the feature `cuda`".into()),
+    }
+}
+
+fn start_server<B>(serve: &Serve, pipeline: Pipeline<B>, pages: usize) -> Result<(), String>
+where
+    B: Backend + Transfer + Send + Sync + 'static,
+{
+    let held = pages * kapel_models::PAGE;
+    let max_model_len = serve.max_model_len.unwrap_or_else(|| {
+        pipeline
+            .model()
+            .config()
+            .max_positions
+            .unwrap_or(held)
+            .min(held)
+    });
+    let page = page_bytes(&pipeline, &serve.load);
+    eprintln!(
+        "kapel: a cache of {pages} pages ({held} positions, {:.1} GiB); sequences of up to \
+         {max_model_len} positions",
+        (pages * page) as f64 / f64::from(1u32 << 30)
+    );
+    let address = format!("{}:{}", serve.host, serve.port)
+        .parse()
+        .map_err(|e| format!("--host, --port: {e}"))?;
+    let mut options = kapel_serve::ServeOptions::new(
+        serve
+            .name
+            .clone()
+            .unwrap_or_else(|| model_name(&serve.load.model)),
+        max_model_len,
+    );
+    options.address = address;
+    options.max_requests = serve.max_requests;
+    options.request_timeout = std::time::Duration::from_secs(serve.timeout);
+    let engine = EngineOptions {
+        pages: Some(pages),
+        prefix_sharing: serve.prefix_sharing,
+        max_pass_tokens: serve.max_pass_tokens,
+        max_sequences: serve.max_sequences,
+        reserve: 0.0,
+    };
+    kapel_serve::serve(pipeline, engine, options).map_err(|e| e.to_string())
+}
+
 /// Answers the prompt, or holds the conversation.
-fn serve<B: Backend + Transfer>(run: &Run, pipeline: Pipeline<B>) -> Result<(), String> {
+fn converse<B: Backend + Transfer>(run: &Run, pipeline: Pipeline<B>) -> Result<(), String> {
     let mut request = Request {
         sampling: pipeline.default_sampling().clone(),
         max_tokens: run.max_tokens,
         stop: run.stop.clone(),
-        ignore_eos: false,
+        ..Request::default()
     };
     run.sampling.apply(&mut request.sampling);
     let chat = !run.raw && pipeline.has_chat_template();
@@ -194,6 +350,7 @@ fn answer<B: Backend + Transfer>(
             Some(Finish::Eos) => "end of sequence".to_string(),
             Some(Finish::Stop(s)) => format!("stop {s:?}"),
             Some(Finish::Length) | None => "length".to_string(),
+            Some(Finish::Error(e)) => format!("error: {e}"),
         };
         eprintln!(
             "[{} prompt tokens in {:.2} s ({:.0}/s); {n} tokens in {:.2} s ({:.1}/s); {finish}]",

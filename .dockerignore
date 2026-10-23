@@ -1,0 +1,10 @@
+target
+data
+fuzz/target
+fuzz/corpus
+kernels/target
+.venv
+.git
+*.safetensors
+*.gguf
+PLAN*.md

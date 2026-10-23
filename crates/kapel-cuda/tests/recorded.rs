@@ -9,7 +9,7 @@ use std::sync::{Mutex, MutexGuard};
 use kapel_core::DType;
 use kapel_cuda::Cuda;
 use kapel_hub::Checkpoint;
-use kapel_models::{Cache, KvCache, Model};
+use kapel_models::{Cache, KvCache, Model, PAGE, Recorded};
 use kapel_ops::Transfer;
 
 /// Held by each test: a recording captures all the work of the device's
@@ -84,6 +84,7 @@ fn replays_give_the_logits_of_steps_as_they_come() {
         let mut recorded = None;
         for (i, &t) in next.iter().take(10).enumerate() {
             let tokens = [t, t + 1, t + 2];
+            let pairs: Vec<_> = ids.iter().copied().zip(tokens).collect();
             let singles: Vec<[u32; 1]> = tokens.iter().map(|&t| [t]).collect();
             let entries: Vec<_> = eager_ids
                 .iter()
@@ -96,17 +97,20 @@ fn replays_give_the_logits_of_steps_as_they_come() {
             );
             let got = match &mut recorded {
                 None => {
-                    let pairs: Vec<_> = ids.iter().copied().zip(tokens).collect();
-                    let (step, logits) = model
-                        .record_step(&cuda, &mut many, &pairs, 8)
+                    // Four rows, the last one padding.
+                    let pages = (many.len(ids[0]) + 9).div_ceil(PAGE);
+                    let Recorded::Made(step, logits) = model
+                        .record_step(&cuda, &mut many, &pairs, 4, pages)
                         .unwrap()
-                        .unwrap();
+                    else {
+                        panic!("the card records passes")
+                    };
                     recorded = Some(step);
                     values(&cuda, &logits)
                 }
                 Some(step) => {
                     let logits = model
-                        .replay_step(&cuda, &mut many, step, &tokens)
+                        .replay_step(&cuda, &mut many, step, &pairs)
                         .unwrap()
                         .unwrap();
                     values(&cuda, &logits)
@@ -148,10 +152,12 @@ fn recording_changes_nothing_around_it() {
         model
             .step_batch(&cuda, &mut cache, &[(id, &prompt)])
             .unwrap();
-        let (step, logits) = model
-            .record_step(&cuda, &mut cache, &[(id, 7)], room)
+        let Recorded::Made(step, logits) = model
+            .record_step(&cuda, &mut cache, &[(id, 7)], 1, (41 + room).div_ceil(PAGE))
             .unwrap()
-            .unwrap();
+        else {
+            panic!("the card records passes")
+        };
         assert_eq!(values(&cuda, &logits), want, "room {room}");
         drop(step);
         assert_eq!(plain(), want, "after a recording with room {room}");
@@ -195,4 +201,125 @@ fn a_recorded_pass_replays_with_new_inputs() {
         let want = values(&cuda, &pass(&cuda.upload(&input).unwrap()).unwrap());
         assert_eq!(got, want, "seed {seed}");
     }
+}
+
+/// A recording of eight rows serves three sequences, then two of them, in a
+/// cache of fixed size: the padding rows (five, then six) write lines of
+/// their own, and the logits are those of steps as they come.
+#[test]
+fn a_recording_serves_smaller_batches() {
+    let _alone = alone();
+    let cuda = Cuda::new(0).unwrap();
+    let Some(model) = model("smollm2", &cuda) else {
+        return;
+    };
+    let prompts: Vec<Vec<u32>> = (0..3)
+        .map(|s| (0..20 + 7 * s).map(|i| 100 + 37 * i + s).collect())
+        .collect();
+    let start = |cache: &mut KvCache| {
+        let ids: Vec<_> = prompts.iter().map(|_| cache.add_sequence()).collect();
+        let batch: Vec<_> = ids
+            .iter()
+            .zip(&prompts)
+            .map(|(&id, p)| (id, &p[..]))
+            .collect();
+        model.step_batch(&cuda, cache, &batch).unwrap();
+        ids
+    };
+    let (mut eager, mut many) = (KvCache::with_pages(64), KvCache::with_pages(64));
+    let eager_ids = start(&mut eager);
+    let ids = start(&mut many);
+    let mut recorded = None;
+    for i in 0..6u32 {
+        // Three sequences, then the first two only.
+        let n = if i < 3 { 3 } else { 2 };
+        let tokens: Vec<u32> = (0..n).map(|s| 300 + 13 * i + s).collect();
+        let singles: Vec<[u32; 1]> = tokens.iter().map(|&t| [t]).collect();
+        let entries: Vec<_> = eager_ids[..n as usize]
+            .iter()
+            .zip(&singles)
+            .map(|(&id, t)| (id, &t[..]))
+            .collect();
+        let want = values(
+            &cuda,
+            &model.step_batch(&cuda, &mut eager, &entries).unwrap(),
+        );
+        let pairs: Vec<_> = ids[..n as usize].iter().copied().zip(tokens).collect();
+        let got = match &mut recorded {
+            None => {
+                let Recorded::Made(step, logits) =
+                    model.record_step(&cuda, &mut many, &pairs, 8, 8).unwrap()
+                else {
+                    panic!("the card records passes")
+                };
+                recorded = Some(step);
+                values(&cuda, &logits)
+            }
+            Some(step) => values(
+                &cuda,
+                &model
+                    .replay_step(&cuda, &mut many, step, &pairs)
+                    .unwrap()
+                    .expect("the recording fits"),
+            ),
+        };
+        assert_eq!(got, want, "step {i}, {n} sequences");
+    }
+}
+
+/// The tables a recording reads stay its own: once the backend lets go of
+/// its tables and buffers (as when memory runs short), and the memory is
+/// written over, replays still give the logits of steps as they come.
+#[test]
+fn a_recording_keeps_the_tables_it_reads() {
+    use kapel_core::Tensor;
+    let _alone = alone();
+    let cuda = Cuda::new(0).unwrap();
+    let Some(model) = model("smollm2", &cuda) else {
+        return;
+    };
+    let prompt: Vec<u32> = (0..30).map(|i| 100 + 37 * i).collect();
+    let start = |cache: &mut KvCache| {
+        let id = cache.add_sequence();
+        model.step_batch(&cuda, cache, &[(id, &prompt)]).unwrap();
+        id
+    };
+    let (mut eager, mut recorded_cache) = (KvCache::with_pages(16), KvCache::with_pages(16));
+    let (e, r) = (start(&mut eager), start(&mut recorded_cache));
+    let Recorded::Made(mut step, _) = model
+        .record_step(&cuda, &mut recorded_cache, &[(r, 5)], 1, 8)
+        .unwrap()
+    else {
+        panic!("the card records passes")
+    };
+    model
+        .step_batch(&cuda, &mut eager, &[(e, &[5][..])])
+        .unwrap();
+    cuda.clear_pool();
+    // Memory taken again, and written over.
+    let junk: Vec<Tensor> = (8..22)
+        .flat_map(|bits| {
+            let cuda = &cuda;
+            (0..4).map(move |_| {
+                let values = vec![u32::MAX; 1 << bits];
+                cuda.upload(&Tensor::from_slice(&values, &[values.len()]).unwrap())
+                    .unwrap()
+            })
+        })
+        .collect();
+    for i in 0..4u32 {
+        let token = 40 + i;
+        let want = values(
+            &cuda,
+            &model
+                .step_batch(&cuda, &mut eager, &[(e, &[token][..])])
+                .unwrap(),
+        );
+        let got = model
+            .replay_step(&cuda, &mut recorded_cache, &mut step, &[(r, token)])
+            .unwrap()
+            .expect("the recording fits");
+        assert_eq!(values(&cuda, &got), want, "token {i}");
+    }
+    drop(junk);
 }

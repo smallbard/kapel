@@ -4,7 +4,8 @@ use serde_json::Value;
 
 /// How the next token is chosen, as `transformers` chooses it: the repetition
 /// penalty first, then the temperature, `top_k`, `top_p` and `min_p`, then a
-/// draw from what is left.
+/// draw from what is left. The frequency and presence penalties of OpenAI's
+/// API come before them all.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Sampling {
     /// The divisor of the logits. 0 for greedy decoding: always the most
@@ -22,6 +23,12 @@ pub struct Sampling {
     /// The logit of every token already in the sequence, prompt included, is
     /// divided by this factor if positive, multiplied if negative; 1 for none.
     pub repetition_penalty: f64,
+    /// Subtracted from the logit of each generated token, times the number
+    /// of times it was generated (OpenAI's `frequency_penalty`); 0 for none.
+    pub frequency_penalty: f64,
+    /// Subtracted from the logit of each token generated at least once
+    /// (OpenAI's `presence_penalty`); 0 for none.
+    pub presence_penalty: f64,
     /// The seed of the draws: the same seed gives the same tokens.
     pub seed: u64,
 }
@@ -35,6 +42,8 @@ impl Default for Sampling {
             top_p: 1.0,
             min_p: 0.0,
             repetition_penalty: 1.0,
+            frequency_penalty: 0.0,
+            presence_penalty: 0.0,
             seed: 0,
         }
     }
@@ -128,13 +137,28 @@ impl Sampler {
     /// greedy, without a repetition penalty. It can then be made where the
     /// logits are (`kapel_ops::ArgMax`, the same rule as here).
     pub(crate) fn is_argmax(&self) -> bool {
-        self.settings.is_greedy() && self.settings.repetition_penalty == 1.0
+        let s = &self.settings;
+        s.is_greedy()
+            && s.repetition_penalty == 1.0
+            && s.frequency_penalty == 0.0
+            && s.presence_penalty == 0.0
     }
 
     /// The next token, from the logits of the last position and the tokens
-    /// of the sequence so far.
-    pub(crate) fn choose(&mut self, logits: &mut [f64], sequence: &[u32]) -> u32 {
+    /// of the sequence so far, the generated ones from `generated` on.
+    pub(crate) fn choose(&mut self, logits: &mut [f64], sequence: &[u32], generated: usize) -> u32 {
         let s = &self.settings;
+        if s.frequency_penalty != 0.0 || s.presence_penalty != 0.0 {
+            let mut counts: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+            for &id in &sequence[generated.min(sequence.len())..] {
+                *counts.entry(id).or_default() += 1;
+            }
+            for (id, count) in counts {
+                if let Some(l) = logits.get_mut(id as usize) {
+                    *l -= f64::from(count) * s.frequency_penalty + s.presence_penalty;
+                }
+            }
+        }
         if s.repetition_penalty != 1.0 {
             let mut seen = vec![false; logits.len()];
             for &id in sequence {
@@ -238,7 +262,7 @@ mod tests {
     use super::*;
 
     fn choose(settings: Sampling, logits: &[f64], sequence: &[u32]) -> u32 {
-        Sampler::new(settings).choose(&mut logits.to_vec(), sequence)
+        Sampler::new(settings).choose(&mut logits.to_vec(), sequence, 0)
     }
 
     #[test]
@@ -258,6 +282,20 @@ mod tests {
         // 4 → 2 falls below 3; −1 → −2 stays below 0.5.
         assert_eq!(choose(s.clone(), &[4.0, 3.0], &[0, 0]), 1);
         assert_eq!(choose(s, &[-1.0, -0.6], &[1]), 0);
+    }
+
+    #[test]
+    fn openai_penalties_count_only_the_generated_tokens() {
+        let s = Sampling {
+            frequency_penalty: 1.0,
+            presence_penalty: 0.5,
+            ..Sampling::greedy()
+        };
+        let mut sampler = Sampler::new(s);
+        // Token 0 twice in the answer: 3 − 2 − 0.5 < 1. Token 1 in the
+        // prompt only keeps its logit.
+        assert_eq!(sampler.choose(&mut [3.0, 1.0, 0.0], &[1, 1, 0, 0], 2), 1);
+        assert!(!sampler.is_argmax());
     }
 
     fn counts(settings: &Sampling, logits: &[f64], draws: u64) -> Vec<u64> {
@@ -324,8 +362,8 @@ mod tests {
         let logits = [0.1, 0.2, 0.3, 0.4];
         for _ in 0..50 {
             assert_eq!(
-                a.choose(&mut logits.to_vec(), &[]),
-                b.choose(&mut logits.to_vec(), &[])
+                a.choose(&mut logits.to_vec(), &[], 0),
+                b.choose(&mut logits.to_vec(), &[], 0)
             );
         }
     }

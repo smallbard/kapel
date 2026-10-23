@@ -11,6 +11,13 @@ pub(crate) struct TextStream {
     /// The text given out so far.
     emitted: String,
     stop: Vec<String>,
+    /// The text of `ids[..read]`, final: no character is left unfinished.
+    confirmed: String,
+    /// The tokens decoded again with the new ones (`ids[prefix..]`), so that
+    /// what depends on neighbours (a space a decoder takes off a first token,
+    /// bytes split across tokens) comes out as in the whole text.
+    prefix: usize,
+    read: usize,
 }
 
 /// What a token added.
@@ -29,15 +36,35 @@ impl TextStream {
             ids: Vec::new(),
             emitted: String::new(),
             stop: stop.into_iter().filter(|s| !s.is_empty()).collect(),
+            confirmed: String::new(),
+            prefix: 0,
+            read: 0,
         }
+    }
+
+    /// The text of every token so far, as decoding them all gives it, from
+    /// the last few: the cost of a token does not grow with the answer.
+    fn text(&mut self, tokenizer: &Tokenizer) -> String {
+        let before = tokenizer.decode(&self.ids[self.prefix..self.read], true);
+        let after = tokenizer.decode(&self.ids[self.prefix..], true);
+        let Some(tail) = after.strip_prefix(before.as_str()) else {
+            // The last tokens changed what came before them: all again.
+            return tokenizer.decode(&self.ids, true);
+        };
+        let text = format!("{}{tail}", self.confirmed);
+        if !tail.is_empty() && !tail.ends_with('\u{FFFD}') {
+            self.confirmed.clone_from(&text);
+            self.prefix = self.read;
+            self.read = self.ids.len();
+        }
+        text
     }
 
     /// Adds token `id`.
     pub(crate) fn push(&mut self, tokenizer: &Tokenizer, id: u32) -> Added {
         self.ids.push(id);
-        let text = tokenizer.decode(&self.ids, true);
-        // Decoding the whole sequence again keeps what depends on neighbours
-        // (spaces, bytes split across tokens) right; what was given out stays.
+        let text = self.text(tokenizer);
+        // What was given out stays.
         let Some(fresh) = text.strip_prefix(self.emitted.as_str()) else {
             return Added {
                 text: String::new(),
@@ -97,12 +124,57 @@ impl TextStream {
 
     /// The text still held back, given out now that no token follows.
     pub(crate) fn finish(&mut self, tokenizer: &Tokenizer) -> String {
-        let text = tokenizer.decode(&self.ids, true);
+        let text = self.text(tokenizer);
         let rest = text
             .strip_prefix(self.emitted.as_str())
             .unwrap_or_default()
             .to_string();
         self.emitted.push_str(&rest);
         rest
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use serde_json::Value;
+
+    use super::*;
+
+    /// For every tokenizer of `data/parity` (byte-level, SentencePiece with
+    /// byte fallback, Gemma's), the text given out token by token is the
+    /// text of all the tokens, decoded at once.
+    #[test]
+    fn streamed_text_is_the_whole_text() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/parity");
+        let Ok(dirs) = std::fs::read_dir(&root) else {
+            return;
+        };
+        let mut checked = 0;
+        for dir in dirs.flatten() {
+            let Ok(cases) = std::fs::read_to_string(dir.path().join("tokenizer_cases.json")) else {
+                continue;
+            };
+            let tokenizer = Tokenizer::from_file(dir.path().join("tokenizer.json")).unwrap();
+            let cases: Value = serde_json::from_str(&cases).unwrap();
+            for case in cases.as_array().unwrap() {
+                let ids: Vec<u32> = case["ids_no_special"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_u64().unwrap() as u32)
+                    .collect();
+                let mut stream = TextStream::new(Vec::new());
+                let mut text = String::new();
+                for &id in &ids {
+                    text.push_str(&stream.push(&tokenizer, id).text);
+                }
+                text.push_str(&stream.finish(&tokenizer));
+                assert_eq!(text, tokenizer.decode(&ids, true), "{:?}", dir.file_name());
+                checked += 1;
+            }
+        }
+        eprintln!("{checked} texts streamed");
     }
 }
