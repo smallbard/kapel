@@ -38,11 +38,13 @@ Beyond the main list, three groups target the places where backends break:
 - **Masked attention**: one query whose keys are all masked with −∞ (zeros and no gradient), and the same row masked with `f32::MIN` (uniform weights).
 - **Paged attention**: one sequence decoding; two sequences sharing a cache with their pages interleaved, one of them computing several queries; a window with capped scores and a set scale; queries narrowed out of a wider projection; a cache of another float type than the queries, including `f8e4m3` and `f8e5m2`; a query that sees nothing; heads of 64 and 128 over 300 positions, long enough for a backend to split them; and a prompt of 400 queries after 10 cached positions, next to a query of another sequence, with and without a window.
 - **`ArgMax` and `Glu`**: rows of rounded values, so that ties occur, and rows mixing NaN and −∞; SiLU and GELU gates, on a transposed input too.
+- **Products**: the first factor transposed (the gradient of a weight), both transposed, and a bias added, with sizes no tile divides.
+- **Whole pieces of eight values**, which a backend may compute eight at a time: a bias added to rows, sums and products of one shape, a function, conversions.
 - **`CrossEntropy`**: targets of both integer types with an ignored row each, rows of 100 logits (wider than a warp and not a multiple of it), transposed logits, logits in \[−30, 30), and no rows at all.
 
 Each input is an argument plus a view (whole, transposed, narrowed or broadcast), and the view is applied after upload, so a GPU backend really receives a strided device tensor.
 
-**Rows written in place.** `Write` is not an operation, so it has its own check: three rows written into tables of the type under test, of `f16` and of `f8e4m3`, compared bit for bit with the reference, and four calls that must be refused: a row out of range, a row written twice, a shared table and rows of another width. The values of an input that `infer` does not read are checked the same way: a cross-entropy target beyond the vocabulary, and one of −2, must be refused.
+**Rows written in place.** `Write` is not an operation, so it has its own check: three rows written into tables of the type under test, of `f16` and of `f8e4m3`, compared bit for bit with the reference, and four calls that must be refused: a row out of range, a row written twice, a shared table and rows of another width. The values of an input that `infer` does not read are checked the same way: a cross-entropy target beyond the vocabulary, and one of −2, must be refused. AdamW in place (`Update::adamw`), last, is compared with the reference on a parameter, its moments and a transposed gradient, and must refuse a shared parameter and a gradient of another shape.
 
 **One check.** For every case, `Conformity::run` does five things:
 

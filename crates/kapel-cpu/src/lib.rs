@@ -79,6 +79,7 @@ pub mod pool;
 mod quantized;
 mod reduce;
 mod rope;
+mod update;
 
 pub use backend::Cpu;
 pub use isa::{Isa, IsaKind, default_threads};

@@ -5,6 +5,10 @@ use kapel_ops::{Binary, BinaryKind, Cast, Concat, CrossEntropy, Matmul, Sum};
 
 use crate::tape::{Compute, Grad, Var};
 
+/// The multiple the vocabulary is padded to in the products of
+/// [`linear_cross_entropy`].
+const ALIGN: usize = 64;
+
 /// A target that is not predicted: its position counts in no loss.
 pub const IGNORE: u32 = CrossEntropy::IGNORE;
 
@@ -17,6 +21,26 @@ fn counted(targets: &[u32], vocab: usize) -> Result<usize> {
         }
     }
     Ok(count)
+}
+
+/// The whole rows of `padded` columns that `g [N, V]` is the first `V`
+/// columns of, when it is laid out so (the padding written zero by the
+/// backend that chose the layout).
+fn padded_rows(g: &Tensor, padded: usize) -> Result<Option<Tensor>> {
+    let n = g.shape()[0];
+    let size = g.dtype().block_bytes();
+    let fits = g.layout().offset() == 0
+        && g.strides()[1] == 1
+        && (n <= 1 || g.strides()[0] == padded)
+        && g.storage().len() == n * padded * size;
+    if !fits || n <= 1 {
+        return Ok(None);
+    }
+    Ok(Some(Tensor::from_storage(
+        std::sync::Arc::clone(g.storage()),
+        kapel_core::Layout::contiguous(&[n, padded])?,
+        g.dtype(),
+    )?))
 }
 
 fn check_len(n: usize, targets: &[u32]) -> Result<()> {
@@ -102,7 +126,17 @@ pub fn linear_cross_entropy<B: Compute>(
         kind: BinaryKind::Add,
     };
     let scale = 1.0 / count.max(1) as f64;
-    let wt = wv.transpose(0, 1)?;
+    // The table with rows of zeros up to a multiple of `ALIGN`: GPT-2's
+    // 50,257 columns of logits, rows of an odd length, slow the products down
+    // eightfold on a card. The logits of the padding are not read.
+    let padded = vocab.next_multiple_of(ALIGN);
+    let wp = if padded == vocab {
+        wv.clone()
+    } else {
+        let zeros = backend.zeros(&[padded - vocab, c], wv.dtype())?;
+        backend.forward(&Concat { dim: 0 }, &[&wv, &zeros])?
+    };
+    let wt = wp.transpose(0, 1)?;
     let chunk = chunk.max(1);
     let mut total: Option<Tensor> = None;
     let mut gh_parts = Vec::new();
@@ -117,7 +151,7 @@ pub fn linear_cross_entropy<B: Compute>(
             continue;
         }
         let x = hv.narrow(0, start, len)?;
-        let logits = backend.forward(&Matmul, &[&x, &wt])?;
+        let logits = backend.forward(&Matmul, &[&x, &wt])?.narrow(1, 0, vocab)?;
         let t = backend.upload(&Tensor::from_slice(rows, &[len])?)?;
         let losses = backend.forward(&CrossEntropy, &[&logits, &t])?;
         let part = backend.forward(
@@ -145,8 +179,18 @@ pub fn linear_cross_entropy<B: Compute>(
                 .swap_remove(0)
                 .expect("the logits receive a gradient");
             drop(logits);
+            let g = if padded == vocab {
+                g
+            } else if let Some(wide) = padded_rows(&g, padded)? {
+                // The card gives the gradient the layout of the logits, the
+                // first columns of rows of `padded`, the others zeros.
+                wide
+            } else {
+                let zeros = backend.zeros(&[len, padded - vocab], g.dtype())?;
+                backend.forward(&Concat { dim: 1 }, &[&g, &zeros])?
+            };
             if needs_h {
-                gh_parts.push(backend.forward(&Matmul, &[&g, &wv])?);
+                gh_parts.push(backend.forward(&Matmul, &[&g, &wp])?);
             }
             if needs_w {
                 let part = backend.forward(&Matmul, &[&g.transpose(0, 1)?, &x])?;
@@ -172,7 +216,8 @@ pub fn linear_cross_entropy<B: Compute>(
         }
     };
     let wdtype = wv.dtype();
-    drop((hv, wv, wt));
+    let gw = gw.map(|g| g.narrow(0, 0, vocab)).transpose()?;
+    drop((hv, wv, wp, wt));
     let mul = Binary {
         kind: BinaryKind::Mul,
     };

@@ -25,6 +25,9 @@ use crate::device::{
     Args, Cuda, CudaStorage, Flat, FloatArg, Table, float_code, small, smalls, view_of,
 };
 
+/// The code of `f32` for the kernels that read any float type.
+const F32_CODE: u32 = kapel_cuda_abi::float::F32;
+
 /// The terms a thread adds in one stage of a long sum.
 const SEGMENT: usize = 128;
 
@@ -122,20 +125,31 @@ impl Cuda {
         scale: f32,
         out_shape: &[usize],
     ) -> Result<Tensor> {
-        self.reduce_raw(op, x.ptr, x.len, shape, dims, scale, out_shape)
+        self.reduce_raw(
+            op,
+            F32_CODE,
+            x.ptr,
+            x.len * 4,
+            shape,
+            dims,
+            scale,
+            out_shape,
+        )
     }
 
-    /// [`Cuda::reduce`] of the `len` `f32` values at `ptr`.
+    /// [`Cuda::reduce`] of the `bytes` bytes at `ptr`, values of float type
+    /// `kx` (a code of `kapel_cuda_abi::float`).
     ///
-    /// A result of more than [`SEGMENT`] terms is summed in two stages, for
-    /// speed and precision: segments of `SEGMENT` terms each, all at once
-    /// (`reduce_sum_segments`), then the segments of each result
-    /// (`reduce_sum`). The order of the additions is fixed: the same bits
-    /// on every run.
+    /// A result of more than [`SEGMENT`] terms is summed in stages, for speed
+    /// and precision: segments of `SEGMENT` terms each, all at once
+    /// (`reduce_sum_segments`), then the segments of each result, the same
+    /// way, until a stage has `SEGMENT` terms or fewer (`reduce_sum`). The
+    /// order of the additions is fixed: the same bits on every run.
     #[allow(clippy::too_many_arguments)]
     fn reduce_raw(
         &self,
         op: &'static str,
+        kx: u32,
         ptr: u64,
         len: usize,
         shape: &[usize],
@@ -143,6 +157,35 @@ impl Cuda {
         scale: f32,
         out_shape: &[usize],
     ) -> Result<Tensor> {
+        // The last dimensions of a row-major tensor: each result's terms
+        // follow each other, and no table of offsets is needed (that of a
+        // whole tensor would be as large as the tensor).
+        let rank = shape.len();
+        let suffix = !dims.is_empty() && {
+            let mut sorted = dims.to_vec();
+            sorted.sort_unstable();
+            sorted
+                .iter()
+                .enumerate()
+                .all(|(i, &d)| d == rank - sorted.len() + i)
+        };
+        if suffix {
+            let terms: usize = dims.iter().map(|&d| shape[d]).product();
+            let results = shape.iter().product::<usize>() / terms.max(1);
+            return self.reduce_rows(op, kx, ptr, len, results, terms, scale, out_shape);
+        }
+        // The first dimensions: sums of the columns of a matrix (the
+        // gradient of a bias), without a table either.
+        let prefix = !dims.is_empty() && {
+            let mut sorted = dims.to_vec();
+            sorted.sort_unstable();
+            sorted.iter().enumerate().all(|(i, &d)| d == i)
+        };
+        if prefix && !suffix {
+            let rows: usize = dims.iter().map(|&d| shape[d]).product();
+            let cols = shape.iter().product::<usize>() / rows.max(1);
+            return self.reduce_columns(op, kx, ptr, len, rows, cols, scale, out_shape);
+        }
         let (b, i) = self.reduction_tables(op, shape, dims)?;
         let (results, terms) = (b.len, i.len);
         if terms <= SEGMENT || results == 0 {
@@ -151,6 +194,7 @@ impl Cuda {
                     "reduce_sum",
                     n,
                     Args::new()
+                        .u32(kx)
                         .slice(ptr, len)
                         .table(&b)
                         .table(&i)
@@ -165,6 +209,7 @@ impl Cuda {
                 "reduce_sum_segments",
                 n,
                 Args::new()
+                    .u32(kx)
                     .slice(ptr, len)
                     .table(&b)
                     .table(&i)
@@ -172,26 +217,120 @@ impl Cuda {
                     .slice(out, n),
             )
         })?;
+        // The segments of each result, summed the same way: as many stages
+        // as it takes to come down to `SEGMENT` terms.
         let parts = self.flat(op, &parts)?;
-        let key = [results, segments];
-        let bases = self.table("segment bases", &key, || {
-            smalls(op, &(0..results).collect::<Vec<_>>())
-        })?;
-        let inner = self.table("segment offsets", &key, || {
-            smalls(op, &(0..segments).map(|s| s * results).collect::<Vec<_>>())
-        })?;
-        self.output(out_shape, false, |out, n| {
-            self.launch(
-                "reduce_sum",
-                n,
-                Args::new()
-                    .flat(&parts)
-                    .table(&bases)
-                    .table(&inner)
-                    .f32(scale)
-                    .slice(out, n),
-            )
-        })
+        self.reduce_raw(
+            op,
+            F32_CODE,
+            parts.ptr,
+            parts.len * 4,
+            &[segments, results],
+            &[0],
+            scale,
+            out_shape,
+        )
+    }
+
+    /// `scale ·` the sums of the columns of a row-major `[rows, cols]` matrix
+    /// at `ptr`, in stages of [`SEGMENT`] rows beyond that.
+    #[allow(clippy::too_many_arguments)]
+    fn reduce_columns(
+        &self,
+        op: &'static str,
+        kx: u32,
+        ptr: u64,
+        len: usize,
+        rows: usize,
+        cols: usize,
+        scale: f32,
+        out_shape: &[usize],
+    ) -> Result<Tensor> {
+        if rows == 0 || cols == 0 {
+            return self.output(out_shape, true, |_, _| Ok(()));
+        }
+        let launch = |shape: &[usize], seg: usize, scale: f32| {
+            self.output(shape, false, |out, n| {
+                self.launch(
+                    "reduce_sum_columns",
+                    n,
+                    Args::new()
+                        .u32(kx)
+                        .slice(ptr, len)
+                        .u32(small(op, rows)?)
+                        .u32(small(op, cols)?)
+                        .u32(small(op, seg)?)
+                        .f32(scale)
+                        .slice(out, n),
+                )
+            })
+        };
+        if rows <= SEGMENT {
+            return launch(out_shape, rows, scale);
+        }
+        let parts = rows.div_ceil(SEGMENT);
+        let partial = launch(&[parts, cols], SEGMENT, 1.0)?;
+        let partial = self.flat(op, &partial)?;
+        self.reduce_columns(
+            op,
+            F32_CODE,
+            partial.ptr,
+            partial.len * 4,
+            parts,
+            cols,
+            scale,
+            out_shape,
+        )
+    }
+
+    /// `scale ·` the sums of `results` runs of `terms` consecutive values at
+    /// `ptr`, in stages of [`SEGMENT`] terms beyond that.
+    #[allow(clippy::too_many_arguments)]
+    fn reduce_rows(
+        &self,
+        op: &'static str,
+        kx: u32,
+        ptr: u64,
+        len: usize,
+        results: usize,
+        terms: usize,
+        scale: f32,
+        out_shape: &[usize],
+    ) -> Result<Tensor> {
+        if terms == 0 {
+            return self.output(out_shape, true, |_, _| Ok(()));
+        }
+        let launch = |shape: &[usize], seg: usize, scale: f32| {
+            self.output(shape, false, |out, n| {
+                self.launch(
+                    "reduce_sum_rows",
+                    n,
+                    Args::new()
+                        .u32(kx)
+                        .slice(ptr, len)
+                        .u32(small(op, terms)?)
+                        .u32(small(op, seg)?)
+                        .f32(scale)
+                        .slice(out, n),
+                )
+            })
+        };
+        if terms <= SEGMENT {
+            return launch(out_shape, terms, scale);
+        }
+        let parts = terms.div_ceil(SEGMENT);
+        let partial = launch(&[results, parts], SEGMENT, 1.0)?;
+        let partial = self.flat(op, &partial)?;
+        self.reduce_rows(
+            op,
+            F32_CODE,
+            partial.ptr,
+            partial.len * 4,
+            results,
+            parts,
+            scale,
+            out_shape,
+        )
     }
 
     /// The key of a table computed from `shape` and `dims`.
@@ -422,6 +561,18 @@ trait InF32<O> {
         inputs: &[&Tensor],
         grad: &Tensor,
     ) -> Result<Vec<Option<Tensor>>>;
+
+    /// The backward pass from inputs and a gradient of any float type
+    /// directly, computing in `f32` in registers, when the operation has
+    /// one: `None` to widen them first. Called after `infer_backward`.
+    fn backward_native(
+        &self,
+        _op: &O,
+        _inputs: &[&Tensor],
+        _grad: &Tensor,
+    ) -> Option<Result<Vec<Option<Tensor>>>> {
+        None
+    }
 }
 
 impl Cuda {
@@ -471,6 +622,9 @@ macro_rules! in_f32 {
         ) -> Result<Vec<Option<Tensor>>> {
             let name = <$op>::NAME;
             op.infer_backward(inputs, grad)?;
+            if let Some(grads) = InF32::<$op>::backward_native(self, op, inputs, grad) {
+                return grads;
+            }
             let wide = self.widened_all(name, inputs)?;
             let wide: Vec<&Tensor> = wide.iter().collect();
             let g = self.widened(name, grad)?;
@@ -492,13 +646,13 @@ trait Native<O> {
 }
 
 in_f32!(
-    Sum,
-    Mean,
     Max,
     Softmax,
     LogSoftmax,
     ScatterAddRows;
-    native: Unary,
+    native: Sum,
+    Mean,
+    Unary,
     QuantizedMatmul,
     Glu,
     Affine,
@@ -508,11 +662,72 @@ in_f32!(
     Rope,
 );
 
+impl Cuda {
+    /// `scale ·` the sum of `x` over `dims`, read in its own type, as a
+    /// tensor of `shape` and `dtype`.
+    fn reduce_native(
+        &self,
+        op: &'static str,
+        x: &Tensor,
+        dims: &[usize],
+        scale: f32,
+        shape: &[usize],
+        dtype: DType,
+    ) -> Result<Tensor> {
+        let x = Run::<Contiguous>::forward(self, &Contiguous, &[x])?;
+        let size = x.dtype().block_bytes();
+        let storage = self.storage(op, &x)?;
+        let pointer = storage.pointer() + (x.layout().offset() * size) as u64;
+        let sums = self.reduce_raw(
+            op,
+            float_code(op, x.dtype())?,
+            pointer,
+            x.numel() * size,
+            x.shape(),
+            dims,
+            scale,
+            shape,
+        )?;
+        self.narrowed(op, &sums, dtype)
+    }
+}
+
+impl Native<Sum> for Cuda {
+    fn forward_native(&self, op: &Sum, inputs: &[&Tensor]) -> Result<Tensor> {
+        let s = op.infer(inputs)?;
+        self.reduce_native(Sum::NAME, inputs[0], &op.dims, 1.0, &s.shape, s.dtype)
+    }
+}
+
+impl Native<Mean> for Cuda {
+    fn forward_native(&self, op: &Mean, inputs: &[&Tensor]) -> Result<Tensor> {
+        let s = op.infer(inputs)?;
+        let scale = 1.0 / count(inputs[0].shape(), &op.dims);
+        self.reduce_native(Mean::NAME, inputs[0], &op.dims, scale, &s.shape, s.dtype)
+    }
+}
+
 impl Native<Unary> for Cuda {
     fn forward_native(&self, op: &Unary, inputs: &[&Tensor]) -> Result<Tensor> {
         let name = Unary::NAME;
         let signature = op.infer(inputs)?;
         let code = unary_code(name, op.kind)?;
+        if let Some(kind) = half_kind(inputs[0].dtype())
+            && signature.dtype == inputs[0].dtype()
+            && let Some((px, wx)) = self.pieces_16(name, inputs[0])?
+        {
+            return self.output_as(&signature.shape, signature.dtype, false, |out, n| {
+                self.launch(
+                    "unary_16",
+                    n / 8,
+                    Args::new()
+                        .u32(code)
+                        .u32(kind)
+                        .slice(px, wx)
+                        .slice(out, n / 2),
+                )
+            });
+        }
         let x = self.float_arg(name, inputs[0], inputs[0].layout())?;
         let ko = float_code(name, signature.dtype)?;
         self.output_as(&signature.shape, signature.dtype, false, |out, n| {
@@ -608,12 +823,72 @@ impl Native<Affine> for Cuda {
     }
 }
 
+/// The code of a 16-bit float type, for the kernels that pack them in pairs.
+fn half_kind(dtype: DType) -> Option<u32> {
+    match dtype {
+        DType::BF16 => Some(kapel_cuda_abi::half::BF16),
+        DType::F16 => Some(kapel_cuda_abi::half::F16),
+        _ => None,
+    }
+}
+
+impl Cuda {
+    /// `f(a, b)` eight values a thread (`binary_16`), when both are of one
+    /// 16-bit type, `a` of the output's shape and `b` too or a row of its
+    /// last dimension (a bias), all in whole aligned pieces.
+    fn binary_16(
+        &self,
+        code: u32,
+        a: &Tensor,
+        b: &Tensor,
+        shape: &[usize],
+    ) -> Result<Option<Tensor>> {
+        let name = Binary::NAME;
+        let Some(kind) = half_kind(a.dtype()) else {
+            return Ok(None);
+        };
+        if b.dtype() != a.dtype() || a.shape() != shape {
+            return Ok(None);
+        }
+        let width = shape.last().copied().unwrap_or(0);
+        let lead_ones = b.shape().iter().rev().skip(1).all(|&d| d == 1);
+        let row = if b.shape() == shape {
+            0
+        } else if lead_ones && b.shape().last() == Some(&width) && width.is_multiple_of(8) {
+            width / 8
+        } else {
+            return Ok(None);
+        };
+        let (Some((pa, wa)), Some((pb, wb))) = (self.pieces_16(name, a)?, self.pieces_16(name, b)?)
+        else {
+            return Ok(None);
+        };
+        let dtype = a.dtype();
+        Ok(Some(self.output_as(shape, dtype, false, |out, n| {
+            self.launch(
+                "binary_16",
+                n / 8,
+                Args::new()
+                    .u32(code)
+                    .u32(kind)
+                    .slice(pa, wa)
+                    .slice(pb, wb)
+                    .u32(small(name, row)?)
+                    .slice(out, n / 2),
+            )
+        })?))
+    }
+}
+
 impl Native<Binary> for Cuda {
     fn forward_native(&self, op: &Binary, inputs: &[&Tensor]) -> Result<Tensor> {
         let name = Binary::NAME;
         let signature = op.infer(inputs)?;
         let code = binary_code(name, op.kind)?;
         let shape = &signature.shape;
+        if let Some(y) = self.binary_16(code, inputs[0], inputs[1], shape)? {
+            return Ok(y);
+        }
         let a = self.float_arg(name, inputs[0], &inputs[0].layout().broadcast_to(shape)?)?;
         let b = self.float_arg(name, inputs[1], &inputs[1].layout().broadcast_to(shape)?)?;
         let ko = float_code(name, signature.dtype)?;
@@ -652,22 +927,65 @@ impl InF32<Unary> for Cuda {
         inputs: &[&Tensor],
         grad: &Tensor,
     ) -> Result<Vec<Option<Tensor>>> {
-        let signature = op.infer_backward(inputs, grad)?;
-        let code = unary_code(Unary::NAME, op.kind)?;
-        let x = self.flat(Unary::NAME, inputs[0])?;
-        let g = self.flat(Unary::NAME, grad)?;
-        let out = self.output(&signature.shape, false, |out, n| {
-            self.launch(
-                "unary_backward",
-                n,
-                Args::new().u32(code).flat(&x).flat(&g).slice(out, n),
-            )
-        })?;
-        Ok(vec![Some(out)])
+        op.infer_backward(inputs, grad)?;
+        Ok(vec![Some(self.unary_backward(op, inputs[0], grad)?)])
+    }
+
+    fn backward_native(
+        &self,
+        op: &Unary,
+        inputs: &[&Tensor],
+        grad: &Tensor,
+    ) -> Option<Result<Vec<Option<Tensor>>>> {
+        Some(
+            self.unary_backward(op, inputs[0], grad)
+                .map(|g| vec![Some(g)]),
+        )
     }
 }
 
 impl Cuda {
+    /// `g · f'(x)` in the type of `x`, both read through their views in
+    /// their own types.
+    fn unary_backward(&self, op: &Unary, x: &Tensor, grad: &Tensor) -> Result<Tensor> {
+        let name = Unary::NAME;
+        let code = unary_code(name, op.kind)?;
+        if let Some(kind) = half_kind(x.dtype())
+            && grad.dtype() == x.dtype()
+            && let (Some((px, wx)), Some((pg, wg))) =
+                (self.pieces_16(name, x)?, self.pieces_16(name, grad)?)
+        {
+            return self.output_as(x.shape(), x.dtype(), false, |out, n| {
+                self.launch(
+                    "unary_backward_16",
+                    n / 8,
+                    Args::new()
+                        .u32(code)
+                        .u32(kind)
+                        .slice(px, wx)
+                        .slice(pg, wg)
+                        .slice(out, n / 2),
+                )
+            });
+        }
+        let xa = self.float_arg(name, x, x.layout())?;
+        let ga = self.float_arg(name, grad, grad.layout())?;
+        let dtype = x.dtype();
+        let ko = float_code(name, dtype)?;
+        self.output_as(x.shape(), dtype, false, |out, n| {
+            self.launch(
+                "unary_backward",
+                n,
+                Args::new()
+                    .u32(code)
+                    .float(&xa)
+                    .float(&ga)
+                    .u32(ko)
+                    .slice(out, dtype.storage_bytes(n)?),
+            )
+        })
+    }
+
     fn affine(&self, x: &Tensor, scale: f64, bias: f64, shape: &[usize]) -> Result<Tensor> {
         let x = self.flat(Affine::NAME, x)?;
         self.output(shape, false, |out, n| {
@@ -778,7 +1096,9 @@ impl Cuda {
         if on_device(x.dtype(), dtype) {
             let wide = self.widened(op, x)?;
             return match dtype {
-                // `widened` copies 16-bit inputs; an `f32` one still needs its own.
+                // `widened` copies 16-bit inputs.
+                DType::F32 if x.dtype() != DType::F32 => Ok(wide),
+                // An `f32` one still needs its own.
                 DType::F32 => self.materialize(op, &wide, wide.layout()),
                 _ => self.narrowed(op, &wide, dtype),
             };
@@ -904,7 +1224,12 @@ impl Run<Contiguous> for Cuda {
 impl Run<Matmul> for Cuda {
     fn forward(&self, op: &Matmul, inputs: &[&Tensor]) -> Result<Tensor> {
         let signature = op.infer(inputs)?;
-        self.matmul(inputs[0], inputs[1], &signature.shape)
+        self.matmul(
+            inputs[0],
+            inputs[1],
+            inputs.get(2).copied(),
+            &signature.shape,
+        )
     }
 
     /// `∂a = g · bᵀ` and `∂b = aᵀ · g`, summed over the batch dimensions each
@@ -922,10 +1247,23 @@ impl Run<Matmul> for Cuda {
         let at = a.transpose(ra - 2, ra - 1)?;
         let ga = self.forward(op, &[grad, &bt])?;
         let gb = self.forward(op, &[&at, grad])?;
-        Ok(vec![
+        let mut grads = vec![
             Some(self.summed_to(&ga, a.shape())?),
             Some(self.summed_to(&gb, b.shape())?),
-        ])
+        ];
+        if let Some(bias) = inputs.get(2) {
+            // The output's gradient summed over every row.
+            let dims: Vec<usize> = (0..grad.rank() - 1).collect();
+            let sum = Sum {
+                dims,
+                keepdim: false,
+            };
+            grads.push(Some(self.converted(
+                &Run::<Sum>::forward(self, &sum, &[grad])?,
+                bias.dtype(),
+            )?));
+        }
+        Ok(grads)
     }
 }
 
@@ -981,7 +1319,8 @@ impl InF32<QuantizedMatmul> for Cuda {
         let x = x.reshape(&[rows, k])?;
         let wt = self.stacked(&inputs[1..])?.transpose(0, 1)?;
         let shape = [x.shape()[0], n];
-        self.matmul(&x, &wt, &shape)?.reshape(&signature.shape)
+        self.matmul(&x, &wt, None, &shape)?
+            .reshape(&signature.shape)
     }
 
     fn backward_f32(
@@ -999,7 +1338,7 @@ impl InF32<QuantizedMatmul> for Cuda {
         let g = g.reshape(&[rows, n])?;
         let w = self.stacked(&inputs[1..])?;
         let shape = [g.shape()[0], k];
-        let mut grads = vec![Some(self.matmul(&g, &w, &shape)?.reshape(x.shape())?)];
+        let mut grads = vec![Some(self.matmul(&g, &w, None, &shape)?.reshape(x.shape())?)];
         grads.resize(inputs.len(), None);
         Ok(grads)
     }
@@ -1280,7 +1619,7 @@ impl Cuda {
     /// A tensor of this backend, of any type, with its elements in row-major
     /// order from the start of its storage: itself if it already is,
     /// otherwise a copy.
-    fn contiguous_any(&self, op: &'static str, x: &Tensor) -> Result<Tensor> {
+    pub(crate) fn contiguous_any(&self, op: &'static str, x: &Tensor) -> Result<Tensor> {
         if x.is_contiguous() && x.layout().offset() == 0 {
             self.storage(op, x)?;
             return Ok(x.clone());
@@ -1395,24 +1734,38 @@ impl Cuda {
         let shape = x.shape().to_vec();
         let width = *shape.last().expect("checked by infer");
         let rows = x.numel() / width.max(1);
-        let x = self.flat(op, x)?;
-        let g = self.flat(op, grad)?;
+        let numel = x.numel();
+        let dtype = x.dtype();
+        // Row-major, in their own types.
+        let rows_of = |t: &Tensor| -> Result<(u32, u64, usize, Tensor)> {
+            let t = Run::<Contiguous>::forward(self, &Contiguous, &[t])?;
+            let size = t.dtype().block_bytes();
+            let storage = self.storage(op, &t)?;
+            let pointer = storage.pointer() + (t.layout().offset() * size) as u64;
+            Ok((float_code(op, t.dtype())?, pointer, numel * size, t))
+        };
+        let (kx, px, bx, _keep_x) = rows_of(x)?;
+        let (kg, pg, bg, _keep_g) = rows_of(grad)?;
         let w = self.norm_vector(op, norm.weight, width, norm.default_weight)?;
-        let gw_rows = self.alloc(x.len * 4, false)?;
-        let gb_rows = self.alloc(x.len * 4, false)?;
-        let gx = self.output(&shape, false, |out, n| {
+        let gw_rows = self.alloc(numel * 4, false)?;
+        let gb_rows = self.alloc(numel * 4, false)?;
+        let ko = float_code(op, dtype)?;
+        let gx = self.output_as(&shape, dtype, false, |out, n| {
             self.launch(
                 "norm_rows_backward",
                 warps(op, rows)?,
                 Args::new()
                     .u32(norm.rms)
-                    .flat(&x)
+                    .u32(kx)
+                    .slice(px, bx)
                     .flat(&w)
-                    .flat(&g)
+                    .u32(kg)
+                    .slice(pg, bg)
                     .f32(norm.offset)
                     .f32(norm.eps)
                     .u32(small(op, width)?)
-                    .slice(out, n)
+                    .u32(ko)
+                    .slice(out, dtype.storage_bytes(n)?)
                     .list(&gw_rows, n)
                     .list(&gb_rows, n),
             )
@@ -1420,8 +1773,9 @@ impl Cuda {
         let column_sum = |rows_of: &CudaStorage| {
             self.reduce_raw(
                 op,
+                F32_CODE,
                 rows_of.pointer(),
-                x.len,
+                numel * 4,
                 &[rows, width],
                 &[0],
                 1.0,
@@ -1466,6 +1820,22 @@ impl InF32<LayerNorm> for Cuda {
             grads.push(Some(self.converted(&g, input.dtype())?));
         }
         Ok(grads)
+    }
+
+    fn backward_native(
+        &self,
+        op: &LayerNorm,
+        inputs: &[&Tensor],
+        grad: &Tensor,
+    ) -> Option<Result<Vec<Option<Tensor>>>> {
+        Some((|| {
+            let (gx, gw, gb) = self.norm_backward(&layer_norm(op, inputs), inputs[0], grad)?;
+            let mut grads = vec![Some(gx)];
+            for (input, g) in inputs[1..].iter().zip([gw, gb]) {
+                grads.push(Some(self.converted(&g, input.dtype())?));
+            }
+            Ok(grads)
+        })())
     }
 }
 
@@ -1514,6 +1884,22 @@ impl InF32<RmsNorm> for Cuda {
             grads.push(Some(self.converted(&gw, w.dtype())?));
         }
         Ok(grads)
+    }
+
+    fn backward_native(
+        &self,
+        op: &RmsNorm,
+        inputs: &[&Tensor],
+        grad: &Tensor,
+    ) -> Option<Result<Vec<Option<Tensor>>>> {
+        Some((|| {
+            let (gx, gw, _) = self.norm_backward(&rms_norm(op, inputs), inputs[0], grad)?;
+            let mut grads = vec![Some(gx)];
+            if let Some(w) = inputs.get(1) {
+                grads.push(Some(self.converted(&gw, w.dtype())?));
+            }
+            Ok(grads)
+        })())
     }
 }
 
@@ -1908,21 +2294,62 @@ impl Cuda {
     }
 }
 
-/// One warp per row; the logits are read in their own type, through their
-/// view, and their gradient written in it.
+/// The logits of a cross-entropy as the kernels read them: rows of
+/// consecutive values `stride` apart, from `offset`.
+struct Logits {
+    /// Keeps the storage alive.
+    tensor: Tensor,
+    code: u32,
+    base: u64,
+    bytes: usize,
+    offset: usize,
+    stride: usize,
+}
+
+impl Cuda {
+    fn logits(&self, x: &Tensor) -> Result<Logits> {
+        let name = CrossEntropy::NAME;
+        let (n, vocab) = (x.shape()[0], x.shape()[1]);
+        let x = if x.strides()[1] == 1 || vocab <= 1 {
+            x.clone()
+        } else {
+            Run::<Contiguous>::forward(self, &Contiguous, &[x])?
+        };
+        let storage = self.storage(name, &x)?;
+        let (base, bytes) = (storage.pointer(), kapel_core::Storage::len(storage));
+        let stride = if n > 1 { x.strides()[0] } else { vocab };
+        Ok(Logits {
+            code: float_code(name, x.dtype())?,
+            base,
+            bytes,
+            offset: x.layout().offset(),
+            stride,
+            tensor: x,
+        })
+    }
+}
+
+/// One block of 256 threads per row; the logits are read in their own type,
+/// and their gradient written in it. Logits that are the first columns of
+/// wider rows (a vocabulary padded for the products) get a gradient of the
+/// same layout, the padding columns zero: the wider gradient is there for
+/// the products that follow.
 impl Run<CrossEntropy> for Cuda {
     fn forward(&self, op: &CrossEntropy, inputs: &[&Tensor]) -> Result<Tensor> {
         let name = CrossEntropy::NAME;
         let signature = op.infer(inputs)?;
         let (n, vocab) = (inputs[0].shape()[0], inputs[0].shape()[1]);
         let (t, _keep) = self.targets(inputs[1], vocab)?;
-        let x = self.float_arg(name, inputs[0], inputs[0].layout())?;
+        let x = self.logits(inputs[0])?;
         self.output(&signature.shape, false, |out, len| {
             self.launch(
                 "cross_entropy_rows",
-                warps(name, n)?,
+                n.checked_mul(256).ok_or(Error::Overflow { op: name })?,
                 Args::new()
-                    .float(&x)
+                    .u32(x.code)
+                    .slice(x.base, x.bytes)
+                    .u32(small(name, x.offset)?)
+                    .u32(small(name, x.stride)?)
                     .slice(t, n)
                     .u32(small(name, vocab)?)
                     .slice(out, len),
@@ -1940,24 +2367,88 @@ impl Run<CrossEntropy> for Cuda {
         op.infer_backward(inputs, grad)?;
         let (n, vocab) = (inputs[0].shape()[0], inputs[0].shape()[1]);
         let (t, _keep) = self.targets(inputs[1], vocab)?;
-        let x = self.float_arg(name, inputs[0], inputs[0].layout())?;
+        let x = self.logits(inputs[0])?;
         let g = self.widened(name, grad)?;
         let g = self.flat(name, &g)?;
         let dtype = inputs[0].dtype();
         let ko = float_code(name, dtype)?;
-        let gx = self.output_as(inputs[0].shape(), dtype, false, |out, len| {
+        let size = dtype.block_bytes();
+        let padded = x.offset == 0 && x.stride > vocab && x.bytes >= n * x.stride * size;
+        let width = if padded { x.stride } else { vocab };
+        let gx = self.output_as(&[n, width], dtype, false, |out, len| {
             self.launch(
                 "cross_entropy_rows_backward",
-                warps(name, n)?,
+                n.checked_mul(256).ok_or(Error::Overflow { op: name })?,
                 Args::new()
-                    .float(&x)
+                    .u32(x.code)
+                    .slice(x.base, x.bytes)
+                    .u32(small(name, x.offset)?)
+                    .u32(small(name, x.stride)?)
                     .slice(t, n)
                     .flat(&g)
                     .u32(small(name, vocab)?)
+                    .u32(small(name, width)?)
                     .u32(ko)
                     .slice(out, dtype.storage_bytes(len)?),
             )
         })?;
+        drop(x.tensor);
+        let gx = if padded { gx.narrow(1, 0, vocab)? } else { gx };
         Ok(vec![Some(gx), None])
+    }
+}
+
+impl Cuda {
+    /// The device address of a tensor of this backend that may be written in
+    /// place: its storage is its only handle's.
+    fn writable(&self, op: &'static str, t: &mut Tensor) -> Result<u64> {
+        let storage = t
+            .storage_mut()
+            .and_then(|s| s.as_any_mut())
+            .and_then(|any| any.downcast_mut::<CudaStorage>())
+            .ok_or_else(|| Error::InvalidArgument {
+                op,
+                message: "not a storage of this backend that can be written".into(),
+            })?;
+        Ok(storage.pointer())
+    }
+}
+
+impl kapel_ops::Update for Cuda {
+    /// One thread per element, the gradient read in its type through its
+    /// view.
+    fn adamw(
+        &self,
+        param: &mut Tensor,
+        m: &mut Tensor,
+        v: &mut Tensor,
+        grad: &Tensor,
+        step: &kapel_ops::AdamWStep,
+    ) -> Result<()> {
+        let op = kapel_ops::ADAMW;
+        kapel_ops::check_adamw(param, m, v, grad)?;
+        let n = param.numel();
+        let g = self.float_arg(op, grad, grad.layout())?;
+        let (pp, mp, vp) = (
+            self.writable(op, param)?,
+            self.writable(op, m)?,
+            self.writable(op, v)?,
+        );
+        self.launch(
+            "adamw",
+            n,
+            Args::new()
+                .slice(pp, n)
+                .slice(mp, n)
+                .slice(vp, n)
+                .float(&g)
+                .f32(step.beta1 as f32)
+                .f32(step.beta2 as f32)
+                .f32((1.0 - step.lr * step.weight_decay) as f32)
+                .f32((step.lr / step.correction1) as f32)
+                .f32(step.correction2 as f32)
+                .f32(step.eps as f32)
+                .f32(step.grad_scale as f32),
+        )
     }
 }

@@ -41,14 +41,17 @@ pub(crate) const KERNELS: &[(&str, &[Param])] = &[
     ("widen_16", &[U32, Slice, View, Slice]),
     ("narrow_16", &[U32, Slice, Slice]),
     ("unary_forward", &[U32, Slice, Slice]),
-    ("unary_backward", &[U32, Slice, Slice, Slice]),
+    (
+        "unary_backward",
+        &[U32, U32, Slice, View, U32, Slice, View, U32, Slice],
+    ),
     ("affine", &[F32, F32, Slice, Slice]),
     ("binary_forward", &[U32, Slice, View, Slice, View, Slice]),
     (
         "binary_backward",
         &[U32, U32, Slice, View, Slice, View, Slice, Slice],
     ),
-    ("reduce_sum", &[Slice, Slice, Slice, F32, Slice]),
+    ("reduce_sum", &[U32, Slice, Slice, Slice, F32, Slice]),
     ("spread", &[Slice, Slice, F32, Slice]),
     ("line_max", &[Slice, Slice, U32, U32, Slice, Slice]),
     ("place", &[Slice, Slice, Slice]),
@@ -63,13 +66,37 @@ pub(crate) const KERNELS: &[(&str, &[Param])] = &[
     ),
     (
         "norm_rows_backward",
-        &[U32, Slice, Slice, Slice, F32, F32, U32, Slice, Slice, Slice],
+        &[
+            U32, U32, Slice, Slice, U32, Slice, F32, F32, U32, U32, Slice, Slice, Slice,
+        ],
     ),
-    ("reduce_sum_segments", &[Slice, Slice, Slice, U32, Slice]),
-    ("cross_entropy_rows", &[U32, Slice, View, Slice, U32, Slice]),
+    (
+        "reduce_sum_segments",
+        &[U32, Slice, Slice, Slice, U32, Slice],
+    ),
+    ("widen_16v", &[U32, Slice, Slice]),
+    ("narrow_16v", &[U32, Slice, Slice]),
+    ("binary_16", &[U32, U32, Slice, Slice, U32, Slice]),
+    ("unary_16", &[U32, U32, Slice, Slice]),
+    ("unary_backward_16", &[U32, U32, Slice, Slice, Slice]),
+    (
+        "reduce_sum_columns",
+        &[U32, Slice, U32, U32, U32, F32, Slice],
+    ),
+    ("reduce_sum_rows", &[U32, Slice, U32, U32, F32, Slice]),
+    (
+        "adamw",
+        &[
+            Slice, Slice, Slice, U32, Slice, View, F32, F32, F32, F32, F32, F32, F32,
+        ],
+    ),
+    (
+        "cross_entropy_rows",
+        &[U32, Slice, U32, U32, Slice, U32, Slice],
+    ),
     (
         "cross_entropy_rows_backward",
-        &[U32, Slice, View, Slice, Slice, U32, U32, Slice],
+        &[U32, Slice, U32, U32, Slice, Slice, U32, U32, U32, Slice],
     ),
     ("rope_table", &[Slice, U32, Slice, F32, Slice]),
     ("rope", &[Slice, Slice, Slice, U32, U32, U32, Slice]),

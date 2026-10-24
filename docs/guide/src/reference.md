@@ -8,6 +8,7 @@
 | `kapel serve MODEL` | serves the model behind OpenAI's API | `kapel --help` |
 | `kapel quantize MODEL --output PATH` | quantizes and writes a model | `kapel quantize --help` |
 | `kapel eval MODEL --tasks FILE` | scores tasks of lm-evaluation-harness | `kapel eval --help` |
+| `kapel train CONFIG.toml` | trains a model as a TOML file describes it (`recipes/gpt2-124m/train.toml`; *The Kapel Book*, chapter 15) | `kapel train --help` |
 
 ## Loading options
 

@@ -10,6 +10,11 @@ use crate::{Operation, Signature, arity, float, same_device, shape};
 /// The batch dimensions (all but the last two) broadcast as in
 /// [`shape::broadcast`]. Both inputs may be strided views: a transposed matrix is
 /// a `transpose` of the last two dimensions, without a copy.
+///
+/// A third input, `bias [N]` of the type of `a`, is added to every row of the
+/// output before it is rounded to its type: `y[…, i, j] = bias[j] + Σₖ a[…,
+/// i, k] · b[…, k, j]`, the bias of a linear layer in the product itself.
+/// Its gradient is the sum of the output's over every row.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Matmul;
 
@@ -17,7 +22,7 @@ impl Operation for Matmul {
     const NAME: &'static str = "matmul";
 
     fn infer(&self, inputs: &[&Tensor]) -> Result<Signature> {
-        arity(Self::NAME, inputs, &[2], "2")?;
+        arity(Self::NAME, inputs, &[2, 3], "2 or 3")?;
         same_device(Self::NAME, inputs)?;
         let (a, b) = (inputs[0], inputs[1]);
         float(Self::NAME, a)?;
@@ -54,6 +59,22 @@ impl Operation for Matmul {
         }
         let mut out = shape::broadcast(Self::NAME, &a.shape()[..ra - 2], &b.shape()[..rb - 2])?;
         out.extend([m, n]);
+        if let Some(bias) = inputs.get(2) {
+            if bias.dtype() != a.dtype() {
+                return Err(Error::DTypeMismatch {
+                    op: Self::NAME,
+                    expected: a.dtype(),
+                    got: bias.dtype(),
+                });
+            }
+            if bias.shape() != [n] {
+                return Err(Error::ShapeMismatch {
+                    op: Self::NAME,
+                    expected: vec![n],
+                    got: bias.shape().to_vec(),
+                });
+            }
+        }
         Ok(Signature {
             shape: out,
             dtype: a.dtype(),

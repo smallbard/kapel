@@ -185,6 +185,22 @@ impl<B: Write> Write for Profiled<B> {
     }
 }
 
+impl<B: kapel_ops::Update> kapel_ops::Update for Profiled<B> {
+    fn adamw(
+        &self,
+        param: &mut Tensor,
+        m: &mut Tensor,
+        v: &mut Tensor,
+        grad: &Tensor,
+        step: &kapel_ops::AdamWStep,
+    ) -> Result<()> {
+        self.time(
+            || "adamw".into(),
+            || self.inner.adamw(param, m, v, grad, step),
+        )
+    }
+}
+
 impl<B: Record> Record for Profiled<B> {
     fn records(&self) -> bool {
         false

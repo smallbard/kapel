@@ -81,6 +81,95 @@ pub fn check<B: Backend + Transfer + Write>(backend: &B, dtype: DType) -> Vec<Fa
     let mut failures = visitor.failures;
     failures.extend(write_failures(backend, dtype));
     failures.extend(refusal_failures(backend, dtype));
+    failures.extend(update_failures(backend, dtype));
+    failures
+}
+
+/// AdamW in place, compared with the reference, and the calls that must be
+/// refused.
+fn update_failures<B: Backend + Transfer>(backend: &B, dtype: DType) -> Vec<Failure> {
+    use kapel_ops::{ADAMW, AdamWStep, Update};
+    let mut failures = Vec::new();
+    let mut fail = |case: &str, message: String| {
+        failures.push(Failure {
+            op: ADAMW,
+            case: case.into(),
+            message,
+        });
+    };
+    let mut rng = Rng::new(17);
+    let step = AdamWStep {
+        lr: 0.01,
+        beta1: 0.9,
+        beta2: 0.95,
+        eps: 1e-8,
+        weight_decay: 0.1,
+        correction1: 1.0 - 0.9f64.powi(3),
+        correction2: 1.0 - 0.95f64.powi(3),
+        grad_scale: 0.5,
+    };
+    let state = |rng: &mut Rng, lo: f64| random(rng, &[5, 7], DType::F32, lo, 1.0);
+    let (p0, m0, v0) = (
+        state(&mut rng, -1.0),
+        state(&mut rng, -1.0),
+        state(&mut rng, 0.0),
+    );
+    let grad = random(&mut rng, &[7, 5], dtype, -1.0, 1.0);
+    let case = format!("[5, 7], a gradient in {dtype} seen transposed");
+    // Copies of their own: an upload to a host backend keeps the tensor.
+    let copy = |t: &Tensor| -> Result<Tensor> {
+        let bytes: Vec<u8> = t
+            .to_f64_vec()?
+            .iter()
+            .flat_map(|&x| (x as f32).to_le_bytes())
+            .collect();
+        Tensor::from_bytes(t.dtype(), t.shape(), &bytes)
+    };
+    let fresh = |t: &Tensor| -> Result<Tensor> { backend.upload(&copy(t)?) };
+    let outcome = (|| -> Result<Option<String>> {
+        let (mut rp, mut rm, mut rv) = (copy(&p0)?, copy(&m0)?, copy(&v0)?);
+        let g = grad.transpose(0, 1)?;
+        Reference.adamw(&mut rp, &mut rm, &mut rv, &g, &step)?;
+        let (mut bp, mut bm, mut bv) = (fresh(&p0)?, fresh(&m0)?, fresh(&v0)?);
+        let bg = backend.upload(&grad)?.transpose(0, 1)?;
+        backend.adamw(&mut bp, &mut bm, &mut bv, &bg, &step)?;
+        for (name, expected, got) in [("p", &rp, &bp), ("m", &rm, &bm), ("v", &rv, &bv)] {
+            let got = backend.download(got)?.to_f64_vec()?;
+            let expected = expected.to_f64_vec()?;
+            for (i, (a, b)) in got.iter().zip(&expected).enumerate() {
+                if (a - b).abs() > 1e-6 * (1.0 + b.abs()) {
+                    return Ok(Some(format!("{name}[{i}] = {a}, expected {b}")));
+                }
+            }
+        }
+        Ok(None)
+    })();
+    match outcome {
+        Ok(None) => {}
+        Ok(Some(message)) => fail(&case, message),
+        Err(error) => fail(&case, error.to_string()),
+    }
+    let refused = (|| -> Result<()> {
+        let (mut p, mut m, mut v) = (fresh(&p0)?, fresh(&m0)?, fresh(&v0)?);
+        let _shared = p.clone();
+        backend.adamw(
+            &mut p,
+            &mut m,
+            &mut v,
+            &backend.upload(&grad)?.transpose(0, 1)?,
+            &step,
+        )
+    })();
+    if refused.is_ok() {
+        fail("a shared parameter", "accepted".into());
+    }
+    let refused = (|| -> Result<()> {
+        let (mut p, mut m, mut v) = (fresh(&p0)?, fresh(&m0)?, fresh(&v0)?);
+        backend.adamw(&mut p, &mut m, &mut v, &backend.upload(&grad)?, &step)
+    })();
+    if refused.is_ok() {
+        fail("a gradient of another shape", "accepted".into());
+    }
     failures
 }
 
@@ -326,6 +415,27 @@ fn cases<V: Visitor>(v: &mut V, dtype: DType) {
             args,
         );
     }
+    // Whole pieces of eight values, which a backend may compute eight at a
+    // time: a bias added to rows, a product of the same shape, a function.
+    for kind in [K::Add, K::Mul] {
+        let args = vec![x(rng, &[4, 16]), x(rng, &[16])];
+        v.visit(
+            &Binary { kind },
+            format!("{kind:?} [4, 16] · [16], a row"),
+            args,
+        );
+        let args = vec![x(rng, &[2, 24]), x(rng, &[2, 24])];
+        v.visit(
+            &Binary { kind },
+            format!("{kind:?} [2, 24] · [2, 24]"),
+            args,
+        );
+    }
+    v.visit(
+        &Unary { kind: U::GeluTanh },
+        "GeluTanh [4, 16]".into(),
+        vec![x(rng, &[4, 16])],
+    );
     v.visit(
         &Binary { kind: K::Div },
         "Div [4] · [2, 4]".into(),
@@ -344,6 +454,11 @@ fn cases<V: Visitor>(v: &mut V, dtype: DType) {
             &Cast { dtype: target },
             format!("to {target}"),
             vec![x(rng, &[3, 4])],
+        );
+        v.visit(
+            &Cast { dtype: target },
+            format!("[4, 16] to {target}"),
+            vec![x(rng, &[4, 16])],
         );
     }
     let mut r = |shape: &[usize]| random(rng, shape, dtype, -1.0, 1.0);
@@ -420,6 +535,40 @@ fn cases<V: Visitor>(v: &mut V, dtype: DType) {
         &Matmul,
         "[2, 3, 4] · [5, 4]ᵀ, strided".into(),
         vec![x(rng, &[2, 3, 4]), strided],
+    );
+    // With a bias: a linear layer, batched, its weight seen transposed, of
+    // sizes that no tile divides.
+    v.visit(
+        &Matmul,
+        "[2, 3, 4] · [4, 5] + [5]".into(),
+        vec![x(rng, &[2, 3, 4]), x(rng, &[4, 5]), x(rng, &[5])],
+    );
+    v.visit(
+        &Matmul,
+        "[70, 37] · [45, 37]ᵀ + [45]".into(),
+        vec![
+            x(rng, &[70, 37]),
+            transposed(random(rng, &[45, 37], dtype, -1.0, 1.0)),
+            x(rng, &[45]),
+        ],
+    );
+    // The gradient of a weight, `xᵀ · g`, and both factors transposed, with
+    // sizes that no tile divides.
+    v.visit(
+        &Matmul,
+        "[70, 37]ᵀ · [70, 45], the first transposed".into(),
+        vec![
+            transposed(random(rng, &[70, 37], dtype, -1.0, 1.0)),
+            x(rng, &[70, 45]),
+        ],
+    );
+    v.visit(
+        &Matmul,
+        "[2, 9, 3]ᵀ · [2, 5, 9]ᵀ, both transposed".into(),
+        vec![
+            transposed(random(rng, &[2, 9, 3], dtype, -1.0, 1.0)),
+            transposed(random(rng, &[2, 5, 9], dtype, -1.0, 1.0)),
+        ],
     );
     for format in [
         DType::int8(32).expect("valid"),

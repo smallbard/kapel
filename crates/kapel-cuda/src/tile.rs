@@ -21,8 +21,8 @@ use crate::device::{Cuda, CudaStorage};
 mod kernels {
     use cutile::core::*;
 
-    /// `z[t] = x[t] · y[t]` for each matrix `t` of a batch, with an `f32`
-    /// accumulator. Each tile block computes one `BM × BN` tile of the output,
+    /// `z[t] = bias + x[t] · y[t]` for each matrix `t` of a batch, the bias
+    /// `[1, N]` added to every row, with an `f32` accumulator. Each tile block computes one `BM × BN` tile of the output,
     /// adding the products along `K` in order. Loads past the edges read
     /// zeros, and stores past them are dropped, so no size needs to divide
     /// the tile.
@@ -31,11 +31,16 @@ mod kernels {
         z: &mut Tensor<E, { [1, BM, BN] }>,
         x: &Tensor<E, { [-1, -1, -1] }>,
         y: &Tensor<E, { [-1, -1, -1] }>,
+        bias: &Tensor<E, { [-1, -1] }>,
     ) {
         let part_x = x.partition(shape![1, BM, BK]);
         let part_y = y.partition(shape![1, BK, BN]);
         let pid: (i32, i32, i32) = get_tile_block_id();
-        let mut acc: Tile<f32, { [BM, BN] }> = constant(0.0f32, shape![BM, BN]);
+        // The accumulator starts from the bias, a row repeated (zeros
+        // without one).
+        let row: Tile<E, { [1, BN] }> = bias.partition(shape![1, BN]).load([0i32, pid.2]);
+        let row: Tile<f32, { [1, BN] }> = convert_tile(row);
+        let mut acc: Tile<f32, { [BM, BN] }> = row.broadcast(shape![BM, BN]);
         for i in 0i32..num_tiles(&part_x, 2) {
             let tx: Tile<E, { [BM, BK] }> = part_x.load([pid.0, pid.1, i]).reshape(shape![BM, BK]);
             let ty: Tile<E, { [BK, BN] }> = part_y.load([pid.0, i, pid.2]).reshape(shape![BK, BN]);
@@ -54,15 +59,47 @@ mod kernels {
         z: &mut Tensor<E, { [1, BM, BN] }>,
         x: &Tensor<E, { [-1, -1, -1] }>,
         y: &Tensor<E, { [-1, -1, -1] }>,
+        bias: &Tensor<E, { [-1, -1] }>,
     ) {
         let part_x = x.partition(shape![1, BM, BK]);
         let part_y = y.partition(shape![1, BN, BK]);
         let pid: (i32, i32, i32) = get_tile_block_id();
-        let mut acc: Tile<f32, { [BM, BN] }> = constant(0.0f32, shape![BM, BN]);
+        // The accumulator starts from the bias, a row repeated (zeros
+        // without one).
+        let row: Tile<E, { [1, BN] }> = bias.partition(shape![1, BN]).load([0i32, pid.2]);
+        let row: Tile<f32, { [1, BN] }> = convert_tile(row);
+        let mut acc: Tile<f32, { [BM, BN] }> = row.broadcast(shape![BM, BN]);
         for i in 0i32..num_tiles(&part_x, 2) {
             let tx: Tile<E, { [BM, BK] }> = part_x.load([pid.0, pid.1, i]).reshape(shape![BM, BK]);
             let ty: Tile<E, { [BN, BK] }> = part_y.load([pid.0, pid.2, i]).reshape(shape![BN, BK]);
             acc = mma(tx, ty.transpose(), acc);
+        }
+        let out: Tile<E, { [BM, BN] }> = convert_tile(acc);
+        z.store(out.reshape(shape![1, BM, BN]));
+    }
+
+    /// `z[t] = x[t]ᵀ · y[t]`, `x[t]` given as `[K, M]`: the gradient of a
+    /// weight, `xᵀ · g`. Each tile of `x` is loaded along `M`, its contiguous
+    /// dimension, then transposed in registers.
+    #[cutile::entry()]
+    fn batched_matmul_tn<E: ElementType, const BM: i32, const BN: i32, const BK: i32>(
+        z: &mut Tensor<E, { [1, BM, BN] }>,
+        x: &Tensor<E, { [-1, -1, -1] }>,
+        y: &Tensor<E, { [-1, -1, -1] }>,
+        bias: &Tensor<E, { [-1, -1] }>,
+    ) {
+        let part_x = x.partition(shape![1, BK, BM]);
+        let part_y = y.partition(shape![1, BK, BN]);
+        let pid: (i32, i32, i32) = get_tile_block_id();
+        // The accumulator starts from the bias, a row repeated (zeros
+        // without one).
+        let row: Tile<E, { [1, BN] }> = bias.partition(shape![1, BN]).load([0i32, pid.2]);
+        let row: Tile<f32, { [1, BN] }> = convert_tile(row);
+        let mut acc: Tile<f32, { [BM, BN] }> = row.broadcast(shape![BM, BN]);
+        for i in 0i32..num_tiles(&part_x, 1) {
+            let tx: Tile<E, { [BK, BM] }> = part_x.load([pid.0, i, pid.1]).reshape(shape![BK, BM]);
+            let ty: Tile<E, { [BK, BN] }> = part_y.load([pid.0, i, pid.2]).reshape(shape![BK, BN]);
+            acc = mma(tx.transpose(), ty, acc);
         }
         let out: Tile<E, { [BM, BN] }> = convert_tile(acc);
         z.store(out.reshape(shape![1, BM, BN]));
@@ -104,6 +141,7 @@ impl Tiles {
 enum Kernel {
     Nn,
     Nt,
+    Tn,
 }
 
 /// A batch of matrices in device memory: `[batch, rows, columns]` with any
@@ -206,7 +244,13 @@ impl Cuda {
 
     /// The batched product of two tensors of this backend, of shape `shape`
     /// (from `infer`): `f32`, `bf16` or `f16`, accumulated in `f32`.
-    pub(crate) fn matmul(&self, a: &Tensor, b: &Tensor, shape: &[usize]) -> Result<Tensor> {
+    pub(crate) fn matmul(
+        &self,
+        a: &Tensor,
+        b: &Tensor,
+        bias: Option<&Tensor>,
+        shape: &[usize],
+    ) -> Result<Tensor> {
         let op = Matmul::NAME;
         let dtype = a.dtype();
         if !matches!(dtype, DType::F32 | DType::BF16 | DType::F16) {
@@ -219,11 +263,22 @@ impl Cuda {
         let storage = self.alloc(numel * dtype.block_bytes(), k == 0)?;
         if numel > 0 && k > 0 {
             let batch = &shape[..rank - 2];
-            let (x, _keep_a) = self.matrices(op, a, batch)?;
+            // `a` read as the transpose of row-major `[K, M]` matrices (`xᵀ ·
+            // g`, the gradient of a weight): loaded along `M`. Through its
+            // swapped strides, it was three to four times slower.
+            let ra = a.rank();
+            let a_transposed = a.layout().strides()[ra - 2] == 1 && m > 1 && k > 1;
+            let (x, _keep_a) = if a_transposed {
+                self.matrices(op, &a.transpose(ra - 2, ra - 1)?, batch)?
+            } else {
+                self.matrices(op, a, batch)?
+            };
             // `b` read as the transpose of row-major `[N, K]` matrices (the
             // weights of a linear layer): loaded along `K`.
             let rb = b.rank();
-            let transposed = b.layout().strides()[rb - 2] == 1 && n > 1;
+            // With `a` transposed too, `b` is read through its strides:
+            // there is no kernel for both.
+            let transposed = b.layout().strides()[rb - 2] == 1 && n > 1 && !a_transposed;
             let (y, _keep_b) = if transposed {
                 self.matrices(op, &b.transpose(rb - 2, rb - 1)?, batch)?
             } else {
@@ -234,12 +289,36 @@ impl Cuda {
                 shape: [numel / (m * n), m, n],
                 strides: [m * n, n, 1],
             };
+            // The bias as one row `[1, N]`, row-major; zeros without one.
+            let zeros;
+            let bias = match bias {
+                Some(b) if b.is_contiguous() => b.clone(),
+                Some(b) => self.contiguous_any(op, b)?,
+                None => {
+                    zeros = self.alloc(n * dtype.block_bytes(), true)?;
+                    Tensor::from_storage(Arc::new(zeros), Layout::contiguous(&[n])?, dtype)?
+                }
+            };
+            let storage = self.storage(op, &bias)?;
+            let row = Matrices {
+                pointer: storage.pointer() + (bias.layout().offset() * dtype.block_bytes()) as u64,
+                shape: [1, 1, n],
+                strides: [n, n, 1],
+            };
             let launch = tiles_for(dtype, m, n);
-            let kernel = if transposed { Kernel::Nt } else { Kernel::Nn };
+            let kernel = match (a_transposed, transposed) {
+                (false, false) => Kernel::Nn,
+                (false, true) => Kernel::Nt,
+                (true, _) => Kernel::Tn,
+            };
             match dtype {
-                DType::F32 => self.batched_matmul::<f32>("f32", kernel, &z, &x, &y, launch)?,
-                DType::BF16 => self.batched_matmul::<bf16>("bf16", kernel, &z, &x, &y, launch)?,
-                _ => self.batched_matmul::<f16>("f16", kernel, &z, &x, &y, launch)?,
+                DType::F32 => {
+                    self.batched_matmul::<f32>("f32", kernel, &z, &x, &y, &row, launch)?
+                }
+                DType::BF16 => {
+                    self.batched_matmul::<bf16>("bf16", kernel, &z, &x, &y, &row, launch)?
+                }
+                _ => self.batched_matmul::<f16>("f16", kernel, &z, &x, &y, &row, launch)?,
             }
         }
         Tensor::from_storage(Arc::new(storage), layout, dtype)
@@ -250,6 +329,7 @@ impl Cuda {
         &self.tiles().stream
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn batched_matmul<T: cutile::DType>(
         &self,
         name: &str,
@@ -257,6 +337,7 @@ impl Cuda {
         z: &Matrices,
         x: &Matrices,
         y: &Matrices,
+        bias: &Matrices,
         (tiles, occupancy): ([usize; 3], Option<i32>),
     ) -> Result<()> {
         let op = Matmul::NAME;
@@ -283,6 +364,13 @@ impl Cuda {
             None => CompileOptions::new(),
         };
         let (x, y) = (Arc::new(tensor(x)?), Arc::new(tensor(y)?));
+        let row = |m: &Matrices| -> Result<TileTensor<T>> {
+            let (shape, strides) = (i32s(op, &m.shape[1..])?, i32s(op, &m.strides[1..])?);
+            // SAFETY: as for `tensor`: a row of a storage the caller keeps
+            // alive, only read.
+            Ok(unsafe { TileTensor::<T>::borrow_raw_parts(m.pointer, ordinal, shape, strides) })
+        };
+        let bias = Arc::new(row(bias)?);
         let error = |e: cutile::prelude::DeviceError| Error::Device {
             op,
             message: e.to_string(),
@@ -291,7 +379,7 @@ impl Cuda {
             // SAFETY: as above; the outputs returned are views of borrowed
             // memory, dropped without freeing it.
             Kernel::Nn => unsafe {
-                kernels::batched_matmul(out, x, y)
+                kernels::batched_matmul(out, x, y, bias)
                     .generics(generics)
                     .compile_options(options)
                     .async_on(self.tile_stream())
@@ -300,7 +388,16 @@ impl Cuda {
             .map_err(error),
             // SAFETY: as for `Kernel::Nn`.
             Kernel::Nt => unsafe {
-                kernels::batched_matmul_nt(out, x, y)
+                kernels::batched_matmul_nt(out, x, y, bias)
+                    .generics(generics)
+                    .compile_options(options)
+                    .async_on(self.tile_stream())
+            }
+            .map(drop)
+            .map_err(error),
+            // SAFETY: as for `Kernel::Nn`.
+            Kernel::Tn => unsafe {
+                kernels::batched_matmul_tn(out, x, y, bias)
                     .generics(generics)
                     .compile_options(options)
                     .async_on(self.tile_stream())

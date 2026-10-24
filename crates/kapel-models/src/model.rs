@@ -227,12 +227,20 @@ impl<B: Backend> Ops<'_, B> {
     fn linear(&self, x: &Tensor, w: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
         // `transformers` stores `[out, in]`: `y = x · wᵀ`, a view. Quantized
         // weights keep that layout, their blocks along `in`.
-        let y = if w.dtype().is_quantized() {
-            self.0.forward(&QuantizedMatmul, &[x, w])?
-        } else {
-            self.0.forward(&Matmul, &[x, &w.transpose(0, 1)?])?
-        };
-        self.bias(y, bias)
+        if w.dtype().is_quantized() {
+            let y = self.0.forward(&QuantizedMatmul, &[x, w])?;
+            return self.bias(y, bias);
+        }
+        self.product(x, &w.transpose(0, 1)?, bias)
+    }
+
+    /// `x · w (+ bias)`, the bias added in the product when it has the type
+    /// of `x`.
+    fn product(&self, x: &Tensor, w: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
+        match bias {
+            Some(b) if b.dtype() == x.dtype() => Ok(self.0.forward(&Matmul, &[x, w, b])?),
+            _ => self.bias(self.0.forward(&Matmul, &[x, w])?, bias),
+        }
     }
 
     fn bias(&self, y: Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
@@ -1288,21 +1296,14 @@ impl Model {
                     let x = ops.binary(BinaryKind::Add, &x, &a)?;
                     let h = self.norm(&ops, &x, &format!("{p}.ln_2"))?;
                     // GPT-2's `Conv1D` stores `[in, out]`: `y = x · w`.
-                    let fc = ops.bias(
-                        backend.forward(
-                            &Matmul,
-                            &[&h, self.weight(&format!("{p}.mlp.c_fc.weight"))?],
-                        )?,
+                    let fc = ops.product(
+                        &h,
+                        self.weight(&format!("{p}.mlp.c_fc.weight"))?,
                         self.optional(&format!("{p}.mlp.c_fc.bias")),
                     )?;
-                    let out = ops.bias(
-                        backend.forward(
-                            &Matmul,
-                            &[
-                                &ops.unary(c.activation, &fc)?,
-                                self.weight(&format!("{p}.mlp.c_proj.weight"))?,
-                            ],
-                        )?,
+                    let out = ops.product(
+                        &ops.unary(c.activation, &fc)?,
+                        self.weight(&format!("{p}.mlp.c_proj.weight"))?,
                         self.optional(&format!("{p}.mlp.c_proj.bias")),
                     )?;
                     ops.binary(BinaryKind::Add, &x, &out)?
@@ -1429,10 +1430,7 @@ impl Model {
         };
         let (q, k, v) = if c.block == Block::Gpt2 {
             let w = self.weight(&format!("{p}.attn.c_attn.weight"))?;
-            let qkv = ops.bias(
-                ops.0.forward(&Matmul, &[h, w])?,
-                self.optional(&format!("{p}.attn.c_attn.bias")),
-            )?;
+            let qkv = ops.product(h, w, self.optional(&format!("{p}.attn.c_attn.bias")))?;
             let width = hq * d;
             (
                 qkv.narrow(1, 0, width)?,
@@ -1534,11 +1532,9 @@ impl Model {
             }
         };
         Ok(if c.block == Block::Gpt2 {
-            ops.bias(
-                ops.0.forward(
-                    &Matmul,
-                    &[&y, self.weight(&format!("{p}.attn.c_proj.weight"))?],
-                )?,
+            ops.product(
+                &y,
+                self.weight(&format!("{p}.attn.c_proj.weight"))?,
                 self.optional(&format!("{p}.attn.c_proj.bias")),
             )?
         } else {

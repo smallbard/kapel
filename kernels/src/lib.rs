@@ -401,11 +401,14 @@ pub fn unary_forward(op: u32, x: &[f32], mut out: DisjointSlice<f32>) {
 /// `out[i] = g[i] · f'(x[i])`.
 #[kernel]
 #[launch_bounds(256)]
-pub fn unary_backward(op: u32, x: &[f32], g: &[f32], mut out: DisjointSlice<f32>) {
+pub fn unary_backward(op: u32, kx: u32, x: &[u8], vx: View, kg: u32, g: &[u8], vg: View, ko: u32, mut out: DisjointSlice<u8>) {
     let idx = thread::index_1d();
     let i = idx.get();
-    if let Some(y) = out.get_mut(idx) {
-        *y = g[i] * unary_slope(op, x[i]);
+    if i < elements(ko, out.len()) {
+        let value = read(kx, x, vx.at(i as u32) as usize);
+        let grad = read(kg, g, vg.at(i as u32) as usize);
+        // SAFETY: `i` is in bounds (checked above) and this thread's own.
+        unsafe { write(ko, out.as_mut_ptr(), i, grad * unary_slope(op, value)) };
     }
 }
 
@@ -456,16 +459,66 @@ pub fn binary_backward(
 /// `out[o] = scale · Σᵣ x[bases[o] + inner[r]]`, the terms added in order.
 #[kernel]
 #[launch_bounds(256)]
-pub fn reduce_sum(x: &[f32], bases: &[u32], inner: &[u32], scale: f32, mut out: DisjointSlice<f32>) {
+pub fn reduce_sum(kx: u32, x: &[u8], bases: &[u32], inner: &[u32], scale: f32, mut out: DisjointSlice<f32>) {
     let idx = thread::index_1d();
     let o = idx.get();
     if let Some(y) = out.get_mut(idx) {
         let base = bases[o] as usize;
         let mut total = 0.0f32;
         for r in 0..inner.len() {
-            total += x[base + inner[r] as usize];
+            total += read(kx, x, base + inner[r] as usize);
         }
         *y = scale * total;
+    }
+}
+
+/// Sums over the rows of a row-major `[rows, cols]` matrix of float type `kx`:
+/// `out[s · cols + o]` is the sum of column `o` over the rows `s · seg` to
+/// `(s + 1) · seg`, in order (all of them with `seg ≥ rows`). Adjacent
+/// threads take adjacent columns: the reads are coalesced.
+#[kernel]
+#[launch_bounds(256)]
+pub fn reduce_sum_columns(kx: u32, x: &[u8], rows: u32, cols: u32, seg: u32, scale: f32, mut out: DisjointSlice<f32>) {
+    let idx = thread::index_1d();
+    let j = idx.get();
+    let (rows, cols, seg) = (rows as usize, cols as usize, seg as usize);
+    if cols > 0 && seg > 0 && rows * cols <= elements(kx, x.len()) {
+        if let Some(y) = out.get_mut(idx) {
+            let (s, o) = (j / cols, j % cols);
+            let end = ((s + 1) * seg).min(rows);
+            let mut total = 0.0f32;
+            let mut r = s * seg;
+            while r < end {
+                total += read(kx, x, r * cols + o);
+                r += 1;
+            }
+            *y = scale * total;
+        }
+    }
+}
+
+/// Sums of consecutive terms: result `o` of `out` is `scale ·` the sum of
+/// the `len` values of `x` from `o · len`, in order. With `seg < len`, each
+/// result is cut into `parts = ⌈len / seg⌉` segments of `seg` terms, and
+/// `out[o · parts + s]` is the sum of segment `s`: a stage of a long sum.
+#[kernel]
+#[launch_bounds(256)]
+pub fn reduce_sum_rows(kx: u32, x: &[u8], len: u32, seg: u32, scale: f32, mut out: DisjointSlice<f32>) {
+    let idx = thread::index_1d();
+    let j = idx.get();
+    let (len, seg) = (len as usize, seg as usize);
+    if len > 0 && seg > 0 {
+        if let Some(y) = out.get_mut(idx) {
+            let parts = len.div_ceil(seg);
+            let (o, s) = (j / parts, j % parts);
+            let start = o * len + s * seg;
+            let end = (start + seg).min((o + 1) * len).min(elements(kx, x.len()));
+            let mut total = 0.0f32;
+            for i in start..end {
+                total += read(kx, x, i);
+            }
+            *y = scale * total;
+        }
     }
 }
 
@@ -476,7 +529,7 @@ pub fn reduce_sum(x: &[f32], bases: &[u32], inner: &[u32], scale: f32, mut out: 
 /// coalesced. `reduce_sum` then adds the segments of each result, in order.
 #[kernel]
 #[launch_bounds(256)]
-pub fn reduce_sum_segments(x: &[f32], bases: &[u32], inner: &[u32], seg: u32, mut out: DisjointSlice<f32>) {
+pub fn reduce_sum_segments(kx: u32, x: &[u8], bases: &[u32], inner: &[u32], seg: u32, mut out: DisjointSlice<f32>) {
     let idx = thread::index_1d();
     let j = idx.get();
     let results = bases.len();
@@ -488,9 +541,49 @@ pub fn reduce_sum_segments(x: &[f32], bases: &[u32], inner: &[u32], seg: u32, mu
             let end = (start + seg as usize).min(inner.len());
             let mut total = 0.0f32;
             for r in start..end {
-                total += x[base + inner[r] as usize];
+                total += read(kx, x, base + inner[r] as usize);
             }
             *y = total;
+        }
+    }
+}
+
+/// One AdamW step in place (`kapel_ops::Update::adamw`), one thread per
+/// element: `g = grad_scale · grad`, then the moments, then the parameter,
+/// as `AdamWStep::apply` computes them on the host.
+#[kernel]
+#[launch_bounds(256)]
+pub fn adamw(
+    mut p: DisjointSlice<f32>,
+    mut m: DisjointSlice<f32>,
+    mut v: DisjointSlice<f32>,
+    kg: u32,
+    g: &[u8],
+    vg: View,
+    beta1: f32,
+    beta2: f32,
+    keep: f32,
+    step: f32,
+    correction2: f32,
+    eps: f32,
+    grad_scale: f32,
+) {
+    let idx = thread::index_1d();
+    let i = idx.get();
+    if i < p.len() && i < m.len() && i < v.len() {
+        let grad = read(kg, g, vg.at(i as u32) as usize) * grad_scale;
+        // SAFETY: `i` is below the three lengths (checked above), and it is
+        // this thread's own element.
+        unsafe {
+            let pm = p.as_mut_ptr().add(i);
+            let mm = m.as_mut_ptr().add(i);
+            let vm = v.as_mut_ptr().add(i);
+            let first = beta1 * *mm + (1.0 - beta1) * grad;
+            let second = beta2 * *vm + (1.0 - beta2) * (grad * grad);
+            let denominator = (second / correction2).sqrt() + eps;
+            *pm = keep * *pm - step * (first / denominator);
+            *mm = first;
+            *vm = second;
         }
     }
 }
@@ -697,13 +790,16 @@ pub fn norm_rows(rms: u32, x: &[f32], w: &[f32], b: &[f32], offset: f32, eps: f3
 #[launch_bounds(256)]
 pub fn norm_rows_backward(
     rms: u32,
-    x: &[f32],
+    kx: u32,
+    x: &[u8],
     w: &[f32],
-    g: &[f32],
+    kg: u32,
+    g: &[u8],
     offset: f32,
     eps: f32,
     width: u32,
-    mut gx: DisjointSlice<f32>,
+    ko: u32,
+    mut gx: DisjointSlice<u8>,
     mut gw_rows: DisjointSlice<f32>,
     mut gb_rows: DisjointSlice<f32>,
 ) {
@@ -713,14 +809,14 @@ pub fn norm_rows_backward(
     let width = width as usize;
     let start = row * width;
     let end = start + width;
-    if width > 0 && end <= x.len() && end <= gx.len() && end <= gw_rows.len() && end <= gb_rows.len() {
+    if width > 0 && end <= elements(kx, x.len()) && end <= elements(kg, g.len()) && end <= elements(ko, gx.len()) && end <= gw_rows.len() && end <= gb_rows.len() {
         let n = width as f32;
         let mut mean = 0.0f32;
         if rms == 0 {
             let mut part = 0.0f32;
             let mut c = lane;
             while c < width {
-                part += x[start + c];
+                part += read(kx, x, start + c);
                 c += 32;
             }
             mean = warp_sum(part) / n;
@@ -728,7 +824,7 @@ pub fn norm_rows_backward(
         let mut part = 0.0f32;
         let mut c = lane;
         while c < width {
-            let v = x[start + c] - mean;
+            let v = read(kx, x, start + c) - mean;
             part += v * v;
             c += 32;
         }
@@ -736,8 +832,8 @@ pub fn norm_rows_backward(
         let (mut part_gh, mut part_ghh) = (0.0f32, 0.0f32);
         let mut c = lane;
         while c < width {
-            let hat = (x[start + c] - mean) * inv;
-            let gh = g[start + c] * (offset + w[c]);
+            let hat = (read(kx, x, start + c) - mean) * inv;
+            let gh = read(kg, g, start + c) * (offset + w[c]);
             part_gh += gh;
             part_ghh += gh * hat;
             c += 32;
@@ -749,14 +845,14 @@ pub fn norm_rows_backward(
         }
         let mut c = lane;
         while c < width {
-            let hat = (x[start + c] - mean) * inv;
-            let gh = g[start + c] * (offset + w[c]);
+            let hat = (read(kx, x, start + c) - mean) * inv;
+            let gh = read(kg, g, start + c) * (offset + w[c]);
             // SAFETY: `start + c < end`, within the three outputs (checked
             // above); row `row` belongs to this warp, column `c` to this lane.
             unsafe {
-                *gx.as_mut_ptr().add(start + c) = inv * (gh - mean_gh - hat * mean_ghh);
-                *gw_rows.as_mut_ptr().add(start + c) = g[start + c] * hat;
-                *gb_rows.as_mut_ptr().add(start + c) = g[start + c];
+                write(ko, gx.as_mut_ptr(), start + c, inv * (gh - mean_gh - hat * mean_ghh));
+                *gw_rows.as_mut_ptr().add(start + c) = read(kg, g, start + c) * hat;
+                *gb_rows.as_mut_ptr().add(start + c) = read(kg, g, start + c);
             }
             c += 32;
         }
@@ -767,91 +863,121 @@ pub fn norm_rows_backward(
 /// (`kapel_ops::CrossEntropy::IGNORE`, or −1 as an `i32`).
 const IGNORE: u32 = u32::MAX;
 
-/// The logarithm of `Σⱼ e^(x[j])` over row `row` of `x` (float type `kx`, seen
-/// through `vx`), `vocab` wide, computed by the warp: each lane keeps a
-/// running maximum and its sum over columns `lane, lane + 32, …`, in one
-/// reading, then the lanes are combined. The same on every lane.
+/// The maximum of `v` over the 256 threads of the block, the same on every
+/// thread. Every thread of the block must call it, the same number of times.
 #[inline(always)]
-fn row_log_sum_exp(kx: u32, x: &[u8], vx: View, row: usize, vocab: usize, lane: usize) -> f32 {
+fn block_max(v: f32) -> f32 {
+    static mut MAXIMA: SharedArray<f32, 8> = SharedArray::UNINIT;
+    let warp_top = warp_max(v);
+    let t = thread::threadIdx_x() as usize;
+    thread::sync_threads();
+    if t % 32 == 0 {
+        // SAFETY: as in `block_sum`: each warp's lane 0 writes its own slot,
+        // between two barriers.
+        unsafe { MAXIMA[t / 32] = warp_top };
+    }
+    thread::sync_threads();
+    let mut top = f32::NEG_INFINITY;
+    let mut i = 0;
+    while i < 8 {
+        // SAFETY: written before the barrier above.
+        let m = unsafe { MAXIMA[i] };
+        if m > top {
+            top = m;
+        }
+        i += 1;
+    }
+    top
+}
+
+/// The logarithm of `Σⱼ e^(x[j])` over the `vocab` values of `x` (float type
+/// `kx`) from `start`, computed by the block of 256 threads: each keeps a
+/// running maximum and its sum over columns `t, t + 256, …`, in one
+/// reading, then the threads are combined. The same on every thread.
+#[inline(always)]
+fn row_log_sum_exp(kx: u32, x: &[u8], start: usize, vocab: usize, t: usize) -> f32 {
     let (mut m, mut s) = (f32::NEG_INFINITY, 0.0f32);
-    let mut c = lane;
+    let mut c = t;
     while c < vocab {
-        let v = read(kx, x, vx.at((row * vocab + c) as u32) as usize);
+        let v = read(kx, x, start + c);
         if v > m {
             s = s * (m - v).exp() + 1.0;
             m = v;
         } else {
             s += (v - m).exp();
         }
-        c += 32;
+        c += 256;
     }
-    let top = warp_max(m);
+    let top = block_max(m);
     let part = if m == f32::NEG_INFINITY { 0.0 } else { s * (m - top).exp() };
-    top + warp_sum(part).ln()
+    top + block_sum(part).ln()
 }
 
 /// The cross-entropy of every row of logits (`kapel_ops::CrossEntropy`), one
-/// warp per row: `out[n] = ln Σⱼ e^(x[n, j]) − x[n, t[n]]`, 0 for a target
-/// `IGNORE`. The targets are checked by the backend.
+/// block of 256 threads per row: `out[n] = ln Σⱼ e^(x[n, j]) − x[n, t[n]]`, 0
+/// for a target `IGNORE`. Row `n` holds the `vocab` values of `x` from
+/// `offset + n · stride`. The targets are checked by the backend.
 #[kernel]
 #[launch_bounds(256)]
-pub fn cross_entropy_rows(kx: u32, x: &[u8], vx: View, targets: &[u32], vocab: u32, mut out: DisjointSlice<f32>) {
-    let idx = thread::index_1d();
-    let row = idx.get() / 32;
-    let lane = idx.get() % 32;
-    // The same for every lane of the warp: whole warps go on or stop.
+pub fn cross_entropy_rows(kx: u32, x: &[u8], offset: u32, stride: u32, targets: &[u32], vocab: u32, mut out: DisjointSlice<f32>) {
+    let row = thread::blockIdx_x() as usize;
+    let t = thread::threadIdx_x() as usize;
+    // The same for every thread of the block: whole blocks go on or stop,
+    // so that every thread reaches the barriers.
     if row < targets.len() && row < out.len() {
         let vocab = vocab as usize;
-        let lse = row_log_sum_exp(kx, x, vx, row, vocab, lane);
-        let t = targets[row];
-        if lane == 0 {
-            let y = if t == IGNORE {
-                0.0
-            } else {
-                lse - read(kx, x, vx.at((row * vocab + t as usize) as u32) as usize)
-            };
-            // SAFETY: `row < out.len()` (checked above); lane 0 of the row's
-            // warp alone writes it.
+        let start = offset as usize + row * stride as usize;
+        let lse = row_log_sum_exp(kx, x, start, vocab, t);
+        let target = targets[row];
+        if t == 0 {
+            let y = if target == IGNORE { 0.0 } else { lse - read(kx, x, start + target as usize) };
+            // SAFETY: `row < out.len()` (checked above); thread 0 of the
+            // row's block alone writes it.
             unsafe { *out.as_mut_ptr().add(row) = y };
         }
     }
 }
 
-/// The backward pass of `cross_entropy_rows`, one warp per row:
-/// `out[n, j] = g[n] · (softmax(x[n])[j] − [j = t[n]])` in float type `ko`,
-/// zeros on the rows whose target is `IGNORE`.
+/// The backward pass of `cross_entropy_rows`, one block per row:
+/// `out[n · width + j] = g[n] · (softmax(x[n])[j] − [j = t[n]])` in float
+/// type `ko` for `j < vocab`, and 0 for `vocab ≤ j < width` (the padding of
+/// a row) and on the rows whose target is `IGNORE`.
 #[kernel]
 #[launch_bounds(256)]
 pub fn cross_entropy_rows_backward(
     kx: u32,
     x: &[u8],
-    vx: View,
+    offset: u32,
+    stride: u32,
     targets: &[u32],
     g: &[f32],
     vocab: u32,
+    width: u32,
     ko: u32,
     mut out: DisjointSlice<u8>,
 ) {
-    let idx = thread::index_1d();
-    let row = idx.get() / 32;
-    let lane = idx.get() % 32;
-    let vocab = vocab as usize;
-    if row < targets.len() && row < g.len() && (row + 1) * vocab <= elements(ko, out.len()) {
-        let t = targets[row];
-        let lse = if t == IGNORE { 0.0 } else { row_log_sum_exp(kx, x, vx, row, vocab, lane) };
+    let row = thread::blockIdx_x() as usize;
+    let t = thread::threadIdx_x() as usize;
+    let (vocab, width) = (vocab as usize, width as usize);
+    if row < targets.len() && row < g.len() && (row + 1) * width <= elements(ko, out.len()) {
+        let target = targets[row];
+        let start = offset as usize + row * stride as usize;
+        // The same for the whole block: every thread reaches the barriers.
+        let lse = if target == IGNORE { 0.0 } else { row_log_sum_exp(kx, x, start, vocab, t) };
         let scale = g[row];
-        let mut c = lane;
-        while c < vocab {
-            let value = if t == IGNORE {
+        let mut c = t;
+        while c < width {
+            let value = if target == IGNORE || c >= vocab {
                 0.0
             } else {
-                let p = (read(kx, x, vx.at((row * vocab + c) as u32) as usize) - lse).exp();
-                scale * (p - if c == t as usize { 1.0 } else { 0.0 })
+                let p = (read(kx, x, start + c) - lse).exp();
+                scale * (p - if c == target as usize { 1.0 } else { 0.0 })
             };
-            // SAFETY: `row · vocab + c` is below the output's elements
-            // (checked above); the row is this warp's, the column this lane's.
-            unsafe { write(ko, out.as_mut_ptr(), row * vocab + c, value) };
-            c += 32;
+            // SAFETY: `row · width + c` is below the output's elements
+            // (checked above); the row is this block's, the column this
+            // thread's.
+            unsafe { write(ko, out.as_mut_ptr(), row * width + c, value) };
+            c += 256;
         }
     }
 }
@@ -1779,6 +1905,141 @@ fn unpack(kind: u32, pair: u32) -> (f32, f32) {
 #[inline(always)]
 fn pack(kind: u32, a: f32, b: f32) -> u32 {
     narrow(kind, a) as u32 | (narrow(kind, b) as u32) << 16
+}
+
+/// The eight 16-bit floats of format `kind` in a 128-bit piece, widened.
+#[inline(always)]
+fn unpack_8(kind: u32, p: (u32, u32, u32, u32)) -> [f32; 8] {
+    let (a, b) = unpack(kind, p.0);
+    let (c, d) = unpack(kind, p.1);
+    let (e, f) = unpack(kind, p.2);
+    let (g, h) = unpack(kind, p.3);
+    [a, b, c, d, e, f, g, h]
+}
+
+/// Eight values rounded to the 16-bit format `kind`, as a 128-bit piece.
+#[inline(always)]
+fn pack_8(kind: u32, v: [f32; 8]) -> (u32, u32, u32, u32) {
+    (
+        pack(kind, v[0], v[1]),
+        pack(kind, v[2], v[3]),
+        pack(kind, v[4], v[5]),
+        pack(kind, v[6], v[7]),
+    )
+}
+
+/// `out = x` widened from the 16-bit format `kind` to `f32`, eight values a
+/// thread: one 128-bit load, two 128-bit stores. `x` holds whole pieces of
+/// eight values, 16-byte aligned, as `u32` pairs; `out` the `f32` bits.
+#[kernel]
+#[launch_bounds(256)]
+pub fn widen_16v(kind: u32, x: &[u32], mut out: DisjointSlice<u32>) {
+    let p = thread::index_1d().get();
+    if 4 * p + 4 <= x.len() && 8 * p + 8 <= out.len() {
+        // SAFETY: piece `p` is within both slices (checked above), which are
+        // 16-byte aligned; it is this thread's own.
+        unsafe {
+            let v = unpack_8(kind, load_128(x.as_ptr().add(4 * p)));
+            let o = out.as_mut_ptr().add(8 * p);
+            store_128(o, (v[0].to_bits(), v[1].to_bits(), v[2].to_bits(), v[3].to_bits()));
+            store_128(o.add(4), (v[4].to_bits(), v[5].to_bits(), v[6].to_bits(), v[7].to_bits()));
+        }
+    }
+}
+
+/// `out = x` rounded from `f32` to the 16-bit format `kind`, eight values a
+/// thread; the layout of `widen_16v` the other way.
+#[kernel]
+#[launch_bounds(256)]
+pub fn narrow_16v(kind: u32, x: &[u32], mut out: DisjointSlice<u32>) {
+    let p = thread::index_1d().get();
+    if 8 * p + 8 <= x.len() && 4 * p + 4 <= out.len() {
+        // SAFETY: as in `widen_16v`.
+        unsafe {
+            let a = load_128(x.as_ptr().add(8 * p));
+            let b = load_128(x.as_ptr().add(8 * p + 4));
+            let v = [
+                f32::from_bits(a.0),
+                f32::from_bits(a.1),
+                f32::from_bits(a.2),
+                f32::from_bits(a.3),
+                f32::from_bits(b.0),
+                f32::from_bits(b.1),
+                f32::from_bits(b.2),
+                f32::from_bits(b.3),
+            ];
+            store_128(out.as_mut_ptr().add(4 * p), pack_8(kind, v));
+        }
+    }
+}
+
+/// `out = f(a, b)` on 16-bit floats of format `kind`, eight values a thread.
+/// `b` has the shape of `a`, or with `row` pieces of eight, is a row of `8 ·
+/// row` values repeated over the rows of `a` (a bias).
+#[kernel]
+#[launch_bounds(256)]
+pub fn binary_16(op: u32, kind: u32, a: &[u32], b: &[u32], row: u32, mut out: DisjointSlice<u32>) {
+    let p = thread::index_1d().get();
+    let q = if row == 0 { p } else { p % row as usize };
+    if 4 * p + 4 <= a.len() && 4 * q + 4 <= b.len() && 4 * p + 4 <= out.len() {
+        // SAFETY: as in `widen_16v`.
+        unsafe {
+            let x = unpack_8(kind, load_128(a.as_ptr().add(4 * p)));
+            let y = unpack_8(kind, load_128(b.as_ptr().add(4 * q)));
+            let mut v = [0.0f32; 8];
+            let mut i = 0;
+            #[unroll]
+            while i < 8 {
+                v[i] = binary_value(op, x[i], y[i]).0;
+                i += 1;
+            }
+            store_128(out.as_mut_ptr().add(4 * p), pack_8(kind, v));
+        }
+    }
+}
+
+/// `out = f(x)` on 16-bit floats of format `kind`, eight values a thread.
+#[kernel]
+#[launch_bounds(256)]
+pub fn unary_16(op: u32, kind: u32, x: &[u32], mut out: DisjointSlice<u32>) {
+    let p = thread::index_1d().get();
+    if 4 * p + 4 <= x.len() && 4 * p + 4 <= out.len() {
+        // SAFETY: as in `widen_16v`.
+        unsafe {
+            let v = unpack_8(kind, load_128(x.as_ptr().add(4 * p)));
+            let mut y = [0.0f32; 8];
+            let mut i = 0;
+            #[unroll]
+            while i < 8 {
+                y[i] = unary_value(op, v[i]);
+                i += 1;
+            }
+            store_128(out.as_mut_ptr().add(4 * p), pack_8(kind, y));
+        }
+    }
+}
+
+/// `out = g · f'(x)` on 16-bit floats of format `kind`, eight values a
+/// thread.
+#[kernel]
+#[launch_bounds(256)]
+pub fn unary_backward_16(op: u32, kind: u32, x: &[u32], g: &[u32], mut out: DisjointSlice<u32>) {
+    let p = thread::index_1d().get();
+    if 4 * p + 4 <= x.len() && 4 * p + 4 <= g.len() && 4 * p + 4 <= out.len() {
+        // SAFETY: as in `widen_16v`.
+        unsafe {
+            let v = unpack_8(kind, load_128(x.as_ptr().add(4 * p)));
+            let d = unpack_8(kind, load_128(g.as_ptr().add(4 * p)));
+            let mut y = [0.0f32; 8];
+            let mut i = 0;
+            #[unroll]
+            while i < 8 {
+                y[i] = d[i] * unary_slope(op, v[i]);
+                i += 1;
+            }
+            store_128(out.as_mut_ptr().add(4 * p), pack_8(kind, y));
+        }
+    }
 }
 
 /// The pieces of 8 columns one thread of `norm_16` keeps: rows of up to

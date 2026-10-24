@@ -2,7 +2,7 @@
 
 Every operation of the catalogue has had a backward pass since chapter 4: `Run::backward` turns the gradient of an output into the gradients of the inputs, and the conformity suite checks it on every backend. This chapter is about putting those derivatives to work. `kapel-train` records a computation on a tape, runs it backwards to get the gradient of a loss with respect to the parameters, and moves the parameters with an optimizer. The decoders of chapter 10 train on it without a second implementation: the same weights, by the same names, through the same operations.
 
-This is step T0 of the training plan: the differentiation. The training loop, the data, post-training and the tools of experiments come in the steps after it.
+Sections 15.1 to 15.7 are step T0 of the training plan, the differentiation; sections 15.8 to 15.12 are step T1, a training run on one card as fast as llm.c, with everything around it. The data, post-training and the tools of experiments come in the steps after them.
 
 ## 15.1 The tape
 
@@ -53,7 +53,9 @@ Some operations are cheaper when their derivative is written by hand than when i
 
 The first three were in the catalogue already. `CrossEntropy` (`kapel-ops/src/loss.rs`) was added for training: for logits `x [N, V]` and targets `t [N]`, `y[n] = ln Σⱼ e^(x[n, j]) − x[n, t[n]]`, and `y[n] = 0` where the target is `CrossEntropy::IGNORE` (all bits set: `u32::MAX`, or −1 as an `i32`), the positions that count in no loss. Its gradient is `g[n] · (softmax(x[n]) − onehot(t[n]))`, in the type of the logits. On the card, one warp computes a row: each lane keeps a running maximum and the sum of exponentials over its columns, in one reading, then the lanes are combined; the backward pass reads the row again and writes its gradient in place. The losses are in `f32` whatever the type of the logits (`f64` for logits in `f64`).
 
-**The loss of a large vocabulary.** GPT-2 predicts among 50,257 tokens: the logits of a batch of 16 × 1024 positions take 1.6 GB in bf16, and twice that in f32. `linear_cross_entropy(h, w, targets, chunk)` never forms them whole. It takes the final hidden states `h [N, C]` and the output table `w [V, C]`, and for each piece of `chunk` rows computes the logits, their loss by `CrossEntropy`, and at once their gradient, then `gh = g · w` for the piece and `gw += gᵀ · h` (in `f32`). The logits of a piece are let go before the next one is computed. The gradients, formed during the forward pass, are kept in the node, and the backward pass only scales them by the loss's own gradient. The memory of the vocabulary is that of `chunk` rows of logits, 1024 by default, instead of `N`.
+**The loss of a large vocabulary.** GPT-2 predicts among 50,257 tokens: the logits of a batch of 16 × 1024 positions take 1.6 GB in bf16, and twice that in f32. `linear_cross_entropy(h, w, targets, chunk)` never forms them whole. It takes the final hidden states `h [N, C]` and the output table `w [V, C]`, and for each piece of `chunk` rows computes the logits, their loss by `CrossEntropy`, and at once their gradient, then `gh = g · w` for the piece and `gw += gᵀ · h` (in `f32`). The logits of a piece are let go before the next one is computed. The gradients, formed during the forward pass, are kept in the node, and the backward pass only scales them by the loss's own gradient. The memory of the vocabulary is that of `chunk` rows of logits, 4096 by default, instead of `N`.
+
+The table is padded with rows of zeros up to a multiple of 64 for the products: GPT-2's 50,257 columns make rows of an odd length, which slowed the products down eightfold on the card (8.6 Top/s against 70.6 for 50,304 columns). `CrossEntropy` reads the logits through a view of the true columns. On the card, its gradient comes in the layout of those logits, the padding columns written zero, so that the products that follow read it whole.
 
 ## 15.4 Sparse gradients
 
@@ -84,16 +86,119 @@ The validation of step T0 is GPT-2 124M on an RTX 3090, with a batch of 16 × 10
 | Peak memory | 13.54 GiB | 6.41 GiB | 2.57 GiB | 10.84 GiB |
 | Forward and backward | 0.28 s | 0.55 s | 0.64 s | 5.75 s |
 
-The distance is the norm of the difference of all gradients over the norm of PyTorch's in f32. In bf16, PyTorch's own gradients are 16.6 % from its f32 ones, and the worst tensor for both is the final norm's weight: that is the precision of bf16 on this model, and Kapel's gradients are as close. Kapel's peak memory is less than half of PyTorch's: the activations kept are those of the derivatives only, and the logits are never whole. With every block checkpointed, it is a fifth.
+These are the measures at the end of step T0; section 15.12 has those of step T1. The distance is the norm of the difference of all gradients over the norm of PyTorch's in f32. In bf16, PyTorch's own gradients are 16.6 % from its f32 ones, and the worst tensor for both is the final norm's weight: that is the precision of bf16 on this model, and Kapel's gradients are as close. Kapel's peak memory is less than half of PyTorch's: the activations kept are those of the derivatives only, and the logits are never whole. With every block checkpointed, it is a fifth.
 
 The example `steps` trains the model from GPT-2's initialization with AdamW at 6 × 10⁻⁴: the loss goes from 11.02 to 7.34 in 30 steps, 0.57 s each.
 
 Two kernels of the card were found on the way, both doing a reduction with one thread for each result, adding its terms in sequence. That was slow and, over millions of terms, imprecise: a sum of 12.8 million values was off by 5 × 10⁻⁵. Sums of more than 128 terms now go in two stages (`reduce_sum_segments`, then `reduce_sum` over the segments): adjacent threads read adjacent values, and the order of the additions is still fixed. The backward pass of a layer norm over 16,384 rows, whose weight gradients are such sums, went from 11 ms to 1 ms. The other, the softmax, no longer runs in training: `CrossEntropy` replaced it.
 
-What is left of the gap to PyTorch is in the attention (half the time of a step, its backward pass computing the forward one again) and in the products, which reach about 20 Top/s of the card's 71. Speed is the target of step T1.
+What was left of the gap to PyTorch is the subject of section 15.12.
 
 ## 15.7 Seeing where the time goes
 
 `kapel_train::profile::Profiled<B>` wraps a backend and times each call by operation and direction (`"matmul"`, `"attention backward"`), waiting for the device before and after each. `report()` lists them, the longest first. The example `gradients` prints it with `--profile`; it is how the reductions above, and a scatter of the first loss that took three quarters of a step, were found.
 
 The card's backend counts the bytes held by its live tensors: `Cuda::memory_in_use`, and `Cuda::peak_memory` since the last `reset_peak_memory`, the equivalents of `torch.cuda.memory_allocated` and `max_memory_allocated`. Buffers kept for reuse are not counted.
+
+## 15.8 The training loop
+
+`kapel train CONFIG.toml` runs a training described by one TOML file (`kapel_train::config::TrainConfig`): the model (a `config.json`, new weights or a directory's), the token files, the batch, the optimizer and its groups of parameters, the schedule of learning rates, the computation, the evaluations, the checkpoints and the log. Every field but the model's configuration, the training files and the number of steps has a default; an unknown field is an error, and the values are checked before anything starts (`TrainConfig::validate`), each refusal naming its field. `recipes/gpt2-124m/train.toml` is GPT-2 124M on FineWeb with llm.c's settings.
+
+```toml
+[batch]
+rows = 16          # sequences of one pass
+length = 1024
+tokens = 524288    # per step: 32 passes accumulated
+
+[optimizer]
+kind = "adamw"     # or "muon", "adafactor"
+lr = 6e-4
+weight_decay = 0.1
+[[optimizer.groups]]
+matches = "*.bias" # the first group that matches a name applies
+lr_scale = 0.5
+
+[schedule]
+kind = "cosine"    # or "constant", "wsd"
+warmup = 700
+steps = 19073
+final = 0.0
+```
+
+`kapel_train::trainer::run` does each step this way:
+
+1. **Batches.** The `Loader` (`data.rs`) reads llm.c's token files, mapped: the next `rows × length + 1` tokens of the current file, the last one only as a target, then the next file when one has not enough, the last handing over to the first. FineWeb as llm.c and modded-nanogpt publish it is in this format (GPT-2's tokens in `u16`, Llama 3's in `u32`).
+2. **Accumulation.** Each of the step's passes computes its loss and its gradients on a tape of its own; the gradients are added up across passes, those by rows joined.
+3. **Clipping.** The global norm of the gradients, `√Σ g²` over all of them, divided by the passes, is read back; above `training.clip`, the gradients are scaled down to it. The scale goes to the optimizer with `1 / passes`: no gradient is rewritten.
+4. **The step**, at the learning rate of the schedule (`schedule.rs`): a linear warmup from zero, `(step + 1) / warmup` as llm.c's, then half a cosine down to `final` (llm.c, nanoGPT), a constant, or WSD's plateau then a straight decay over the last part of the run.
+5. **The log.** Every step goes to `log.jsonl` in the run's directory: its loss, learning rate, gradient norm, time, tokens per second, model FLOP utilization and, on a card, peak memory. The terminal gets a line every `log.every` steps.
+6. **Evaluation.** Every `eval.every` steps and at the end, the mean loss of the first `eval.tokens` validation tokens, computed with the parameters as constants: nothing is recorded for a backward pass.
+7. **Checkpoints**, every `checkpoint.every` steps and at the end (section 15.11).
+
+**The model's FLOP utilization.** `flops.rs` counts the operations a step's definition asks for: the products of the blocks and of the output table, and the attention's whole score matrix, as llm.c and Smallem count it, three forward passes for a step, two operations per multiply-add. Over the step's time and the card's peak in the computation's type (`flops::peak_tflops`, from the card's name, or `log.peak_tflops`), that is the MFU of the log. The test `gpt2_small_costs_what_nanogpt_counts` checks the count against nanoGPT's estimate.
+
+`--profile` times each operation (section 15.7) from the second step on, the first compiling the kernels.
+
+## 15.9 Optimizers
+
+`Optimizer` (`optim.rs`) is one of three, with their states for the checkpoints:
+
+- **AdamW**, dense and by rows (section 15.4). Its step is one fused operation in place, `Update::adamw` (`kapel-ops/src/update.rs`): the gradient read in its type, the parameter and both moments updated in `f32` by one kernel, where the step had been fifteen operations and as many temporary tensors per parameter. `AdamWStep::apply` is the arithmetic every backend does, element by element; the conformity suite compares each with the reference, and checks that a shared parameter and a gradient of another shape are refused.
+- **Muon**, the variant Smallem measured (DeepSeek-V4's): for each matrix of the blocks, a momentum with Nesterov's look ahead, made orthogonal by ten iterations of Newton-Schulz, then scaled by `0.18 · √max(m, n)` so that its elements have the size of an AdamW step and one learning rate serves both. The matrices of one shape are orthogonalized together, as one batched product. The tables (embeddings, positions, output) and the vectors stay with AdamW.
+- **Adafactor** (Shazeer and Stern), without first moment: the second moment of a matrix kept as its means by row and by column, `β₂ = 1 − t^−0.8`, the update divided by `max(1, rms)`.
+
+A group of parameters (`optimizer.groups`) sets, for the names its pattern matches, a factor of the learning rate, whether weight decay applies, whether the parameter trains, and whether its gradient stays rows.
+
+## 15.10 Mixed precision
+
+The parameters and the optimizer's moments are `f32`, the master weights. Each pass converts the parameters to the computation's type (`training.dtype`, bf16 by default) and computes in it; the conversions' derivatives bring the gradients back to `f32` for the optimizer. The losses are `f32`. 8-bit floats for the products, which the plan asks on Ada and Hopper cards, are left for a card that has them: the RTX 3090 is an Ampere.
+
+## 15.11 Checkpoints and resuming
+
+A checkpoint is a directory `step-NNNNNNNN` in the run's (`checkpoint.rs`): `model.safetensors`, the parameters in `f32` under the names of `transformers`, with `config.json` (the directory is a model that `transformers` and `kapel run` load); `optimizer.safetensors`, the moments; `state.json`, the step, the optimizer's steps, the position in the training files and the tokens seen; and `config.toml`, the run's configuration. The tensors are copied to host memory when the checkpoint is taken, and a thread writes them while the next steps compute, under a temporary name renamed once complete: a run killed while writing leaves the previous checkpoints whole. The oldest are removed beyond `checkpoint.keep`. (On the processor, a download is the tensor itself: the checkpoint takes copies, since the next steps update the tensors in place.)
+
+`kapel train --resume` goes on from the last complete checkpoint: the parameters, the moments and steps of the optimizer, the position in the data. Nothing else in a step depends on the past: on the same machine, the run computes the bits of a run that was not interrupted. The tests `a_resumed_run_computes_the_bits_of_an_uninterrupted_one` (on the processor, with each optimizer, accumulation and clipping) and `a_resumed_run_on_the_card_computes_the_same_bits` (bf16 on the card) kill a run after three steps (`--steps 3` does it), resume it, and compare every parameter with those of a run of seven steps, bit for bit.
+
+## 15.12 As fast as llm.c
+
+The validation of step T1 is GPT-2 124M reaching the target loss of modded-nanogpt's speedrun, 3.28 on FineWeb's validation, in at most 1.2 times llm.c's time with the same settings on the same card. With llm.c's settings, 3.28 takes about 10 billion tokens: some 45 hours on an RTX 3090 for each side, and more disk than the machine had. The validation was therefore cut in two: the time of a step with the same settings, and the losses of a shorter run, both from new weights.
+
+For one pass of 16 × 1024 tokens a step, llm.c takes 0.27 s on the RTX 3090. The first version of the loop took 0.80 s, with its clipping and its optimizer. The gap closed in a dozen changes, each measured by the profile of section 15.7 and by `nsys`, in the order they were made:
+
+| Change | Step (ms) |
+| --- | --- |
+| The loop as first written (the gradient's norm and AdamW composed of operations) | 795 |
+| Long sums on the card in stages, each stage table-free for the last dimensions; AdamW fused (`Update::adamw`) | 455 |
+| `CrossEntropy` reading rows by their stride, one block per row instead of one warp | 413 |
+| Backward passes of the element-wise functions, of the norms and the sums reading 16-bit inputs in place, without widening them to `f32` first | 379 |
+| Element-wise operations eight values a thread, in 128-bit loads and stores (290–435 → 800–840 GB/s) | 351 |
+| The loss's products by pieces of 4096 rows instead of 1024 (the products along the vocabulary fill the card) | 329 |
+| Sums over the first dimensions (the gradients of biases) table-free too | 328 |
+| Gradients kept as views: the tape had made every transposed gradient contiguous | 324 |
+| The bias added in the product (`Matmul` with a third input), as cuBLASLt's epilogue does for llm.c | 322 |
+| Each attention's output and statistics kept for its backward pass, which no longer computes the forward one again (`Cuda::keep_attention_for_backward`) | 316 |
+
+Before the loop was written, the gradient of a weight, `xᵀ · g`, got a kernel that reads the transposed tiles along their contiguous dimension (13–25 → 54–60 Top/s), and the table was padded to 50,304 columns (section 15.3). Two attempts were measured and undone: a backward pass of the layer norm that kept its weight gradients in registers over several rows, twice as slow for want of registers, and other sizes of tiles for the products, whose current ones stayed the best on these shapes.
+
+With llm.c's settings, 32 passes accumulated for a step of 524,288 tokens:
+
+| | llm.c | Kapel |
+| --- | --- | --- |
+| Step | 8.46 s | 9.84 s |
+| Tokens per second | 62,000 | 53,300 |
+| MFU | 70 % | 64 % |
+| Peak memory | 12.9 GiB (the card's memory in use, as llm.c reports it) | 7.9 GiB (the allocator's peak, `peak_gib` in `log.jsonl`) |
+
+Kapel takes 1.16 times llm.c's time: within the 1.2 the plan asks. The products are about two thirds of a step and run at 55 to 71 Top/s of the card's 71. The rest is in the layer norm's backward pass, which writes and reads its rows' parts of the weight gradients in `f32`, and in the many small operations around the products.
+
+The losses come from 250 such steps, 131 million tokens, both runs from new weights with the same schedule (25 steps of warmup, then a cosine down to a tenth of 6 × 10⁻⁴), validated every 50 steps on the same 327,680 tokens of FineWeb's validation. llm.c draws its training samples in a shuffled order and Kapel reads them in the files' order, so llm.c was also run with its shuffling turned off, reading the very tokens Kapel reads:
+
+| Step | llm.c, shuffled | llm.c, in order | Kapel, in order |
+| --- | --- | --- | --- |
+| 50 | 6.925 | 6.997 | 6.908 |
+| 100 | 6.454 | 6.531 | 6.476 |
+| 150 | 6.217 | 6.305 | 6.246 |
+| 200 | 6.057 | 6.160 | 6.096 |
+| 250 | 5.971 | 6.084 | 6.014 |
+
+The order of the data moves the loss by 0.11 at step 250, more than anything that separates the two programs: on the same tokens Kapel's loss is the lower one, by 0.07, from initial weights drawn by another generator. The curves leave no sign of a difference in what is computed; the target of 3.28 itself is left to a machine that can give the run its 45 hours.

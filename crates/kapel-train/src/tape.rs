@@ -667,11 +667,8 @@ fn combine<B: Compute>(
     } else {
         total.reshape(shape)?
     };
-    let total = if total.is_contiguous() {
-        total
-    } else {
-        backend.forward(&Contiguous, &[&total])?
-    };
+    // A view stays a view: the operations read strided tensors, and a copy
+    // here was a copy of every transposed gradient.
     Ok(Grad::Dense(cast(backend, &total, dtype)?))
 }
 
@@ -690,7 +687,14 @@ fn join_rows<B: Compute>(
         let n = i.numel();
         let mut s = vec![n];
         s.extend(&width);
-        Ok((i.reshape(&[n])?, v.reshape(&s)?))
+        let row_major = |t: Tensor| -> Result<Tensor> {
+            if t.is_contiguous() {
+                Ok(t)
+            } else {
+                backend.forward(&Contiguous, &[&t])
+            }
+        };
+        Ok((row_major(i)?.reshape(&[n])?, row_major(v)?.reshape(&s)?))
     };
     let flat: Vec<(Tensor, Tensor)> = rows.into_iter().map(flat).collect::<Result<_>>()?;
     let dtype = flat[0].1.dtype();
@@ -745,7 +749,10 @@ fn expand<B: Compute>(
     let g = if keepdim {
         g.clone()
     } else {
-        g.reshape(&kept)?
+        match g.reshape(&kept) {
+            Ok(g) => g,
+            Err(_) => backend.forward(&Contiguous, &[g])?.reshape(&kept)?,
+        }
     };
     let g = if g.is_contiguous() {
         g
@@ -1102,10 +1109,22 @@ impl<B: Compute> Var<B> {
     ///
     /// Those of [`Matmul`] and [`Binary`].
     pub fn linear(&self, w: &Self, bias: Option<&Self>) -> Result<Self> {
-        let y = self.matmul(&w.transpose(0, 1)?)?;
+        self.matmul_bias(&w.transpose(0, 1)?, bias)
+    }
+
+    /// `self · w (+ bias)`, the bias added in the product ([`Matmul`] with
+    /// three inputs) when it has the type of `self`.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Matmul`] and [`Binary`].
+    pub fn matmul_bias(&self, w: &Self, bias: Option<&Self>) -> Result<Self> {
         match bias {
-            Some(b) => y.add(b),
-            None => Ok(y),
+            Some(b) if b.dtype() == self.dtype() && b.shape().len() == 1 => {
+                Self::apply(Matmul, &[self, w, b])
+            }
+            Some(b) => self.matmul(w)?.add(b),
+            None => self.matmul(w),
         }
     }
 

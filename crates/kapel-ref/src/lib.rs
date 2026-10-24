@@ -37,6 +37,7 @@ pub(crate) mod paged;
 mod reduce;
 mod rng;
 mod rope;
+mod update;
 
 use kapel_core::{Device, Error, Result, Tensor};
 use kapel_ops::Transfer;
@@ -188,6 +189,19 @@ mod tests {
 
         fn copy_from_host(&self, target: &mut Tensor, values: &Tensor) -> Result<()> {
             Reference.copy_from_host(target, values)
+        }
+    }
+
+    impl kapel_ops::Update for Typed {
+        fn adamw(
+            &self,
+            param: &mut Tensor,
+            m: &mut Tensor,
+            v: &mut Tensor,
+            grad: &Tensor,
+            step: &kapel_ops::AdamWStep,
+        ) -> Result<()> {
+            Reference.adamw(param, m, v, grad, step)
         }
     }
 

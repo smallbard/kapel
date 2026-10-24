@@ -24,6 +24,7 @@ mod reduce;
 mod rope;
 pub mod shape;
 pub mod special;
+mod update;
 
 use std::fmt;
 
@@ -41,6 +42,7 @@ pub use paged::{
 };
 pub use reduce::{ArgMax, Max, Mean, Sum};
 pub use rope::{Rope, RopeLayout, RopeScaling};
+pub use update::{ADAMW, AdamWStep, Update, check_adamw};
 
 /// The shape and data type of an operation's output.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -154,6 +156,7 @@ pub trait Transfer {
 pub trait Backend:
     Write
     + Record
+    + Update
     + Run<Unary>
     + Run<Glu>
     + Run<Binary>
@@ -183,6 +186,7 @@ pub trait Backend:
 impl<B> Backend for B where
     B: Write
         + Record
+        + Update
         + Run<Unary>
         + Run<Glu>
         + Run<Binary>

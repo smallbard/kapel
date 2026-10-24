@@ -17,7 +17,7 @@ workspace = true
 
 [features]
 # Runs models on an NVIDIA card (`--device cuda`): needs the CUDA toolkit.
-cuda = ["dep:kapel-cuda", "kapel-cuda/cuda"]
+cuda = ["dep:kapel-cuda", "kapel-cuda/cuda", "kapel-train/cuda"]
 
 [dependencies]
 kapel-core.workspace = true
@@ -27,6 +27,7 @@ kapel-hub.workspace = true
 kapel-infer.workspace = true
 kapel-models.workspace = true
 kapel-quant.workspace = true
+kapel-train.workspace = true
 kapel-serve.workspace = true
 kapel-tokenizers.workspace = true
 kapel-cuda = { workspace = true, optional = true }

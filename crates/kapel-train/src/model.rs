@@ -116,6 +116,12 @@ impl Parameters {
                 if value.dtype().is_float() && value.dtype() != dtype {
                     value = backend.forward(&kapel_ops::Cast { dtype }, &[&value])?;
                 }
+                // A storage of its own, that the optimizer may write in place:
+                // a host backend keeps the tensor it is given, which may be a
+                // file mapped read-only.
+                if std::sync::Arc::ptr_eq(value.storage(), p.value.storage()) {
+                    value = owned(&value)?;
+                }
                 Ok((n.clone(), Parameter { value, ..p.clone() }))
             })
             .collect::<Result<_>>()?;
@@ -163,6 +169,20 @@ impl Parameters {
     }
 }
 
+/// A copy of a host tensor in a buffer of its own; a device tensor as it is.
+pub(crate) fn owned(t: &Tensor) -> Result<Tensor> {
+    let t = t.contiguous()?;
+    match t.storage().host_bytes() {
+        Some(bytes) => {
+            let size = t.dtype().block_bytes();
+            let start = t.layout().offset() * size;
+            let len = t.dtype().storage_bytes(t.numel())?;
+            Tensor::from_bytes(t.dtype(), t.shape(), &bytes[start..start + len])
+        }
+        None => Ok(t),
+    }
+}
+
 /// The parameters of one step, on its tape.
 pub struct Leaves<B: Compute> {
     vars: BTreeMap<String, Var<B>>,
@@ -206,7 +226,9 @@ pub struct Options {
     /// its activations ([`Tape::checkpoint`]).
     pub checkpoint: bool,
     /// The rows of logits formed at once by the loss
-    /// ([`linear_cross_entropy`]).
+    /// ([`linear_cross_entropy`]): 4096 by default, the fastest for GPT-2 on
+    /// an RTX 3090 (the products along the vocabulary fill the card from
+    /// there).
     pub chunk: usize,
 }
 
@@ -215,7 +237,7 @@ impl Default for Options {
         Self {
             dtype: DType::F32,
             checkpoint: false,
-            chunk: 1024,
+            chunk: 4096,
         }
     }
 }
@@ -479,31 +501,24 @@ fn block<'a, B: Compute + 'a>(
         Block::Gpt2 => {
             let h = norm(c, x, w("ln_1.weight"), w("ln_1.bias"))?;
             // `Conv1D` stores `[in, out]`: `y = x · w + b`.
-            let qkv = h.matmul(need("attn.c_attn.weight")?)?;
-            let qkv = match w("attn.c_attn.bias") {
-                Some(b) => qkv.add(b)?,
-                None => qkv,
-            };
-            let width = hq * d;
+            let qkv = h.matmul_bias(need("attn.c_attn.weight")?, w("attn.c_attn.bias"))?;
+            // `[N, 3C]` seen as `[B, T, 3, H, D]`: each of q, k, v a view of
+            // it, whose gradients come back as slices along the third
+            // dimension, joined by one copy.
+            let qkv = qkv.reshape(&[pass.rows, pass.length, 3, hq, d])?;
             let part = |i: usize| -> Result<Var<B>> {
-                let p = qkv.narrow(1, i * width, width)?;
-                heads(&p, hq)
+                qkv.narrow(2, i, 1)?
+                    .reshape(&[pass.rows, pass.length, hq, d])?
+                    .transpose(1, 2)
             };
             let y = part(0)?.attention(&part(1)?, &part(2)?, None, attention)?;
-            let mut a = merged(y)?.matmul(need("attn.c_proj.weight")?)?;
-            if let Some(b) = w("attn.c_proj.bias") {
-                a = a.add(b)?;
-            }
+            let a = merged(y)?.matmul_bias(need("attn.c_proj.weight")?, w("attn.c_proj.bias"))?;
             let x = x.add(&a)?;
             let h = norm(c, &x, w("ln_2.weight"), w("ln_2.bias"))?;
-            let mut fc = h.matmul(need("mlp.c_fc.weight")?)?;
-            if let Some(b) = w("mlp.c_fc.bias") {
-                fc = fc.add(b)?;
-            }
-            let mut out = fc.unary(c.activation)?.matmul(need("mlp.c_proj.weight")?)?;
-            if let Some(b) = w("mlp.c_proj.bias") {
-                out = out.add(b)?;
-            }
+            let fc = h.matmul_bias(need("mlp.c_fc.weight")?, w("mlp.c_fc.bias"))?;
+            let out = fc
+                .unary(c.activation)?
+                .matmul_bias(need("mlp.c_proj.weight")?, w("mlp.c_proj.bias"))?;
             x.add(&out)
         }
         Block::Sequential | Block::Sandwich => {
@@ -516,16 +531,16 @@ fn block<'a, B: Compute + 'a>(
                 .map(|m| need(&format!("self_attn.{m}.weight")))
                 .collect::<Result<_>>()?;
             let tape = x.tape();
-            let qkv = h.linear(&tape.concat(&weights, 0)?, None)?;
-            let qkv = if c.qkv_bias {
+            let bias = if c.qkv_bias {
                 let biases: Vec<&Var<B>> = names
                     .iter()
                     .map(|m| need(&format!("self_attn.{m}.bias")))
                     .collect::<Result<_>>()?;
-                qkv.add(&tape.concat(&biases, 0)?)?
+                Some(tape.concat(&biases, 0)?)
             } else {
-                qkv
+                None
             };
+            let qkv = h.linear(&tape.concat(&weights, 0)?, bias.as_ref())?;
             let (wq, wk) = (hq * d, hkv * d);
             let split = |start: usize, h: usize, norm_name: Option<&str>| -> Result<Var<B>> {
                 let mut p = qkv.narrow(1, start, h * d)?.reshape(&[n, h, d])?;

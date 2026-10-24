@@ -1,0 +1,50 @@
+# GPT-2 124M on FineWeb, with llm.c's settings (its reproduction of GPT-2:
+# `train_gpt2cu -b 64 -t 1024 -d 524288 -c 0.1 -l 0.0006 -q 0.0 -u 700`),
+# 10 billion tokens. The shards are llm.c's (dev/data/fineweb.sh), in
+# `fineweb/` next to this file; `kapel train recipes/gpt2-124m/train.toml`.
+
+[model]
+config = "config.json"
+init = "scratch"
+std = 0.02
+seed = 1
+
+[data]
+train = "fineweb/fineweb_train_*.bin"
+val = "fineweb/fineweb_val_*.bin"
+
+[batch]
+rows = 16
+length = 1024
+tokens = 524288
+
+[optimizer]
+kind = "adamw"
+lr = 6e-4
+beta1 = 0.9
+beta2 = 0.95
+eps = 1e-8
+weight_decay = 0.1
+
+[schedule]
+kind = "cosine"
+warmup = 700
+steps = 19073
+final = 0.0
+
+[training]
+device = "cuda"
+dtype = "bf16"
+clip = 1.0
+
+[eval]
+every = 250
+tokens = 10485760
+
+[checkpoint]
+dir = "run"
+every = 1000
+keep = 3
+
+[log]
+every = 10

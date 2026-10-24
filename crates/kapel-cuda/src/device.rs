@@ -23,7 +23,7 @@ const PTX: &str = include_str!("../kernels.ptx");
 
 /// Locks a mutex, even if a thread panicked while holding it: every value
 /// guarded here stays consistent between statements.
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -136,6 +136,10 @@ pub(crate) struct Inner {
     /// The last tables of rotary angles, by their constants and positions:
     /// the layers of a model's pass rotate by the same angles.
     recent_angles: Mutex<VecDeque<(Vec<u8>, Tensor)>>,
+    /// With `keep_attention`, the output and the statistics of the last
+    /// attentions, for their backward passes (`attention.rs`).
+    pub(crate) saved_attention: Mutex<VecDeque<crate::attention::Saved>>,
+    pub(crate) keep_attention: std::sync::atomic::AtomicBool,
     /// While a pass is recorded ([`kapel_ops::Record`]), where its buffers
     /// come from and go back to.
     pub(crate) capture: Mutex<Option<Arc<Arena>>>,
@@ -219,6 +223,8 @@ impl Cuda {
                     bytes: 0,
                 }),
                 recent_angles: Mutex::new(VecDeque::new()),
+                saved_attention: Mutex::new(VecDeque::new()),
+                keep_attention: std::sync::atomic::AtomicBool::new(false),
                 capture: Mutex::new(None),
                 shared: Arc::new(Shared {
                     ordinal,
@@ -237,6 +243,16 @@ impl Cuda {
     /// The device of this backend.
     pub fn device(&self) -> Device {
         Device::Cuda(self.inner.shared.ordinal)
+    }
+
+    /// The name of the device, as the driver gives it (`"NVIDIA GeForce RTX
+    /// 3090"`).
+    ///
+    /// # Errors
+    ///
+    /// If the driver fails.
+    pub fn name(&self) -> Result<String> {
+        self.inner._context.device_name().map_err(driver("name"))
     }
 
     /// The ordinal of the device.
@@ -339,6 +355,17 @@ impl Cuda {
             .store(shared.used.load(Ordering::Relaxed), Ordering::Relaxed);
     }
 
+    /// Whether each attention keeps its output and the statistics of its
+    /// softmax until its backward pass, which then does not compute them
+    /// again: for training, where the backward pass comes, at the cost of the
+    /// memory of the outputs. Off by default.
+    pub fn keep_attention_for_backward(&self, keep: bool) {
+        self.inner.keep_attention.store(keep, Ordering::Relaxed);
+        if !keep {
+            lock(&self.inner.saved_attention).clear();
+        }
+    }
+
     /// Frees the buffers kept for reuse, and the tables kept on the device.
     /// Freeing waits for the device.
     pub fn clear_pool(&self) {
@@ -348,6 +375,7 @@ impl Cuda {
     /// Frees the cached tables and the pool; whether there was anything.
     fn release(&self) -> bool {
         lock(&self.inner.recent_angles).clear();
+        lock(&self.inner.saved_attention).clear();
         // Tables first: those that no operation is using go back to the pool.
         let tables = {
             let mut tables = lock(&self.inner.tables);
@@ -829,6 +857,15 @@ impl Cuda {
                 return Ok(tensor.clone());
             }
         };
+        if let Some((pointer, words)) = self.pieces_16(op, tensor)? {
+            return self.output(tensor.shape(), false, |out, n| {
+                self.launch(
+                    "widen_16v",
+                    n / 8,
+                    Args::new().u32(kind).slice(pointer, words).slice(out, n),
+                )
+            });
+        }
         let x = self.any_arg(op, tensor, tensor.layout())?;
         self.output(tensor.shape(), false, |out, n| {
             self.launch(
@@ -858,9 +895,36 @@ impl Cuda {
             dtype => return Err(Error::UnsupportedDType { op, dtype }),
         };
         let x = self.flat(op, tensor)?;
+        if x.len.is_multiple_of(8) && x.ptr.is_multiple_of(16) {
+            return self.output_as(tensor.shape(), dtype, false, |out, n| {
+                self.launch(
+                    "narrow_16v",
+                    n / 8,
+                    Args::new().u32(kind).flat(&x).slice(out, n / 2),
+                )
+            });
+        }
         self.output_as(tensor.shape(), dtype, false, |out, n| {
             self.launch("narrow_16", n, Args::new().u32(kind).flat(&x).slice(out, n))
         })
+    }
+
+    /// A 16-bit tensor of this backend as whole 16-byte pieces of eight
+    /// values, for the kernels that read and write 128 bits at a time: its
+    /// address and its length in `u32` words, if it is row-major, aligned
+    /// and a whole number of pieces.
+    pub(crate) fn pieces_16(&self, op: &'static str, t: &Tensor) -> Result<Option<(u64, usize)>> {
+        if !matches!(t.dtype(), DType::BF16 | DType::F16)
+            || !t.is_contiguous()
+            || !t.numel().is_multiple_of(8)
+        {
+            return Ok(None);
+        }
+        let storage = self.storage(op, t)?;
+        let pointer = storage.pointer() + 2 * t.layout().offset() as u64;
+        Ok(pointer
+            .is_multiple_of(16)
+            .then_some((pointer, t.numel() / 2)))
     }
 
     /// An `f32` tensor of this backend as a row-major slice argument.

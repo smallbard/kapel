@@ -211,7 +211,7 @@ impl Cuda {
                     )
                 })?;
                 // The output has the activations' type: so has the product.
-                let part = self.matmul(&x, &piece.transpose(0, 1)?, &[rows, count])?;
+                let part = self.matmul(&x, &piece.transpose(0, 1)?, None, &[rows, count])?;
                 self.place(op, &part, &out, &out_layout.narrow(1, c0 + first, count)?)?;
                 first += count;
             }

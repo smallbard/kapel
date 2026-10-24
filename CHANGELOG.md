@@ -229,9 +229,36 @@ changelog says how.
   `tools/train/gradients.py`, which compares Kapel's gradients and peak memory
   with PyTorch's.
 - The Kapel Book: chapter 15, training.
+- `kapel train CONFIG.toml`: training runs described by a TOML file, checked
+  before they start (`kapel_train::config`): batches read in order from llm.c's
+  token files (`data`), gradient accumulation, clipping of the global norm,
+  warmup then cosine, constant or WSD schedules (`schedule`), evaluations, the
+  log of every step in `log.jsonl` with the model's FLOP utilization (`flops`)
+  and the card's peak memory; `--resume` goes on from the last checkpoint bit
+  for bit, `--steps` stops a run, `--profile` times each operation.
+- `kapel-train`: checkpoints written in the background and rotated, each a model
+  directory with the optimizer's state, the position in the data and the
+  configuration (`checkpoint`); Muon and Adafactor next to AdamW, and groups of
+  parameters with learning rates, decay and freezing of their own.
+- `kapel-ops`: `Update::adamw`, one AdamW step in place, on the reference, the
+  processor and the card; `Matmul` takes an optional bias, added in the product.
+- `kapel-cuda`: `Cuda::name`, and `Cuda::keep_attention_for_backward`, which keeps
+  each attention's output and statistics for its backward pass.
+- `recipes/gpt2-124m`: GPT-2 124M on FineWeb with llm.c's settings.
+- The examples `training_gemm` and `elementwise` of `kapel-cuda`.
 
 ### Changed
 
+- `kapel-cuda`: GPT-2 124M trains at 1.16 times llm.c's time on an RTX 3090,
+  from 2.3 times: the gradient of a weight (`xᵀ · g`) has a kernel of its own;
+  element-wise operations on 16-bit values go eight values a thread in 128-bit
+  loads and stores; the backward passes of element-wise functions, norms and
+  sums read 16-bit inputs in place; sums over the first or the last dimensions
+  need no table of offsets, and long ones go in as many stages as they need;
+  `CrossEntropy` takes a block per row; a product's bias is added in its kernel.
+- `kapel-train`: the fused loss pads the vocabulary to a multiple of 64 for its
+  products, and forms 4096 rows of logits at once by default; gradients stay
+  views instead of being made contiguous.
 - `kapel-cuda`: sums of more than 128 terms are computed in two stages, segments
   of adjacent terms for all results at once, then each result's segments, in a
   fixed order: faster, and more precise over millions of terms (a sum of 12.8

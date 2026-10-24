@@ -15,6 +15,7 @@
 | Cache (KV) | The keys and values of the positions already computed, per layer, so each new token only computes itself; in Kapel, kept by pages (`KvCache`) |
 | Cache by pages | A cache whose lines are handed out by pages of 16 positions from a common reserve, each sequence keeping the list of its pages: nothing is copied as a sequence grows, and its pages go back when it ends |
 | Calibration | Texts run through a model to measure the inputs of its projections before quantizing it with data |
+| Checkpoint (training) | A directory of a run with everything it needs to go on exactly: the parameters, the optimizer's moments, the position in the data, the configuration (`kapel_train::checkpoint`) |
 | Conformity | Agreement of a backend with the reference within the tolerance of the data type, forward and backward |
 | Constraint | The form an answer must take: a JSON schema, any JSON object, a regular expression, a Lark grammar, a list of texts; the tokens that cannot continue it get a logit of −∞ (`kapel_infer::Constraint`); OpenAI calls it a structured output |
 | Contiguous | Stored in row-major order without gaps |
@@ -34,10 +35,13 @@
 | llguidance | The library of structured outputs that compiles constraints into a parser over the bytes of the tokens, and gives the set of tokens allowed next |
 | Leaf | A value on a tape whose gradient is wanted: a parameter (`Tape::leaf`); a constant receives none |
 | Log-likelihood | The sum of the logarithms of the probabilities of a continuation's tokens after a context; what `kapel eval` ranks answers by (`Scorer`) |
+| MFU | Model FLOP utilization: the operations a step's definition asks for, over its time and the card's peak (`kapel_train::flops`) |
 | Micro-kernel | The innermost routine of the matrix product, holding a block of C in registers |
+| Muon | An optimizer of matrices: a momentum made orthogonal by Newton-Schulz's iterations, scaled to the size of an AdamW step (`kapel_train::optim::Muon`) |
 | Multi-token prediction | A layer trained with the model to predict the token after the next from the model's hidden state and the next token (MiMo, DeepSeek-V3); a proposer that costs one block (`Model::multi_token`) |
 | Packing | Copying a block of an operand into the contiguous order the micro-kernel reads |
 | Padding rows | Rows added to a smaller batch so that it fits a recorded pass of more rows; each writes a scratch line of its own and is read by no one |
+| Padding (of a vocabulary) | Rows of zeros added to an output table up to a multiple of 64 for the products, the logits of the padding not read |
 | Paged attention | Attention of new rows over a cache by pages, each row knowing its sequence and how many positions it sees (`PagedAttention`) |
 | Parity | Agreement with the Python libraries `transformers`, `tokenizers` or llama.cpp on real models and files |
 | Perplexity | The exponential of the mean negative log-likelihood of a text: how a quantization is judged |
@@ -102,6 +106,8 @@
 | The tape, losses, optimizers | `crates/kapel-train/src/{tape,loss,optim}.rs`, `crates/kapel-train/tests/{tape,optim}.rs` |
 | Decoders on a tape | `crates/kapel-train/src/model.rs`, `crates/kapel-train/tests/{model,cuda}.rs` |
 | The fused cross-entropy | `crates/kapel-ops/src/loss.rs`, `crates/kapel-{ref,cpu}/src/loss.rs`, `crates/kapel-cuda/src/ops.rs`, `kernels/src/lib.rs` (`cross_entropy_rows`) |
+| The training loop, its configuration and checkpoints | `crates/kapel-train/src/{trainer,config,data,schedule,checkpoint,flops}.rs`, `crates/kapel-cli/src/train.rs`, `crates/kapel-train/tests/trainer.rs`, `recipes/gpt2-124m/` |
+| Optimizers' steps in place | `crates/kapel-ops/src/update.rs`, `crates/kapel-{ref,cpu}/src/update.rs`, `crates/kapel-cuda/src/ops.rs` (`adamw`) |
 | Training measured against PyTorch, the time of each operation | `crates/kapel-train/examples/{gradients,steps}.rs`, `tools/train/gradients.py`, `crates/kapel-train/src/profile.rs` |
 | One model type for the bindings | `crates/kapel-runtime/src/lib.rs` |
 | The C API | `crates/kapel-capi/include/kapel.h`, `crates/kapel-capi/src/lib.rs`, `crates/kapel-capi/examples/c/` |

@@ -6,8 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-# Published once its first steps are done.
-publish = false
+publish.workspace = true
 
 [lints]
 workspace = true
@@ -22,6 +21,9 @@ kapel-ops.workspace = true
 kapel-models.workspace = true
 kapel-hub.workspace = true
 serde_json.workspace = true
+serde.workspace = true
+toml.workspace = true
+memmap2.workspace = true
 kapel-cpu.workspace = true
 kapel-cuda = { workspace = true, optional = true }
 

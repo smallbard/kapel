@@ -26,7 +26,7 @@ The work is organised in three plans, each a sequence of steps with a goal and a
 | --- | --- | --- | --- | --- |
 | Foundation | `PLAN-SOCLE.md` | Tensors, backends, model files, tooling | S0–S5 | All six steps done |
 | Inference | `PLAN-INFERENCE.md` | Load, quantize and serve small models on CPU and GPU | I0–I6 | I0 (correct generation), I1 (the CPU, but for ARM), I2 (the card), I3 (serving) I4 (speculative decoding, without several GPUs nor off-card tables) and I5 (quantizing one's own models) done on 23 October 2026; I6 (being used) done but for its first releases |
-| Training | `PLAN-ENTRAINEMENT.md` | Bit-reproducible training up to a few billion parameters, on one card (the steps that need several are set aside for now) | T0–T6 | T0 (differentiation) done on 24 October 2026 |
+| Training | `PLAN-ENTRAINEMENT.md` | Bit-reproducible training up to a few billion parameters, on one card (the steps that need several are set aside for now) | T0–T6 | T0 (differentiation) and T1 (training on one card) done on 24 October 2026 |
 
 The inference plan targets one sequence at a time on a CPU first. Smallem showed that a small int4 model generates faster on a Ryzen than on an RTX 3090: token-by-token generation waits on memory, and a well-programmed CPU uses nearly all of its bandwidth. Batched generation on a GPU, with a paged cache, came after, then a server that computes the requests of many clients together.
 
@@ -43,5 +43,5 @@ The inference plan targets one sequence at a time on a CPU first. Smallem showed
 - Quantization with data, by GPTQ and AWQ, and the `kapel quantize` command, which writes GGUF files that llama.cpp reads (chapter 13). Llama 3.2 1B in Q4\_0 by GPTQ loses 44 % less perplexity than llama.cpp's quantization with its importance matrix.
 - `kapel eval`, which replays tasks of lm-evaluation-harness (WikiText, HellaSwag, ARC, MMLU) and gives its perplexities within 0.001 % and its accuracies exactly (chapter 13).
 - A C library with a stable header, and a Python module (chapter 14).
-- A tape of gradients for training (chapter 15): the decoders of chapter 10 train with the same weights and operations. GPT-2 124M computes its gradients on an RTX 3090 for a batch of 16 × 1024 tokens with less than half of PyTorch's peak memory, and as close to PyTorch's f32 gradients as PyTorch's own in bf16.
+- A tape of gradients for training (chapter 15): the decoders of chapter 10 train with the same weights and operations. GPT-2 124M computes its gradients on an RTX 3090 for a batch of 16 × 1024 tokens with less than half of PyTorch's peak memory, and as close to PyTorch's f32 gradients as PyTorch's own in bf16. `kapel train` trains it from a TOML file at 1.16 times llm.c's time, and resumes a run bit for bit.
 - Fuzzing of every reader of untrusted files, and continuous integration on four platforms plus a GPU runner (chapters 16 and 17).

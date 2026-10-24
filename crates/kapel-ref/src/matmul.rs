@@ -37,7 +37,16 @@ fn product(a: &Array, b: &Array) -> Result<Array> {
 impl Run<Matmul> for Reference {
     fn forward(&self, op: &Matmul, inputs: &[&Tensor]) -> Result<Tensor> {
         op.infer(inputs)?;
-        product(&Array::of(inputs[0])?, &Array::of(inputs[1])?)?.tensor()
+        let mut y = product(&Array::of(inputs[0])?, &Array::of(inputs[1])?)?;
+        if let Some(bias) = inputs.get(2) {
+            let bias = bias.to_f64_vec()?;
+            for row in y.data.chunks_mut(bias.len().max(1)) {
+                for (v, b) in row.iter_mut().zip(&bias) {
+                    *v += b;
+                }
+            }
+        }
+        y.tensor()
     }
 
     /// `∂a = g · bᵀ` and `∂b = aᵀ · g`, summed over broadcast batch dimensions.
@@ -55,10 +64,22 @@ impl Run<Matmul> for Reference {
         );
         let ga = product(&g, &b.transpose_last())?;
         let gb = product(&a.transpose_last(), &g)?;
-        Ok(vec![
+        let mut grads = vec![
             Some(sum_to(&ga, &a.shape).tensor()?),
             Some(sum_to(&gb, &b.shape).tensor()?),
-        ])
+        ];
+        if inputs.len() == 3 {
+            // The bias's gradient: the output's, summed over every row.
+            let n = *g.shape.last().expect("a matrix");
+            let mut sum = vec![0.0; n];
+            for row in g.data.chunks(n.max(1)) {
+                for (s, v) in sum.iter_mut().zip(row) {
+                    *s += v;
+                }
+            }
+            grads.push(Some(Array::new(&[n], sum).tensor()?));
+        }
+        Ok(grads)
     }
 }
 

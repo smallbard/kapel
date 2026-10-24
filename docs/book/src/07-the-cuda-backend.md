@@ -30,6 +30,8 @@ Opening a backend creates a context and one stream, loads the PTX module, and pr
 
 **Free memory.** `Cuda::memory()` gives the free and total bytes of the device, as the driver counts them (other processes included); `kapel serve` sizes its cache with it, after `clear_pool`. `Cuda::memory_in_use()` counts the bytes held by the backend's live tensors, and `Cuda::peak_memory()` the most it has counted since `reset_peak_memory()`: what `torch.cuda.memory_allocated` and `max_memory_allocated` count, which training compares (chapter 15).
 
+**Attentions kept for training.** The backward pass of an attention needs its output and the statistics of its softmax, which a call of `backward` does not receive. Without more, it computes the forward pass again. With `Cuda::keep_attention_for_backward(true)`, which `kapel train` sets, each forward pass keeps them, with weak handles on its inputs' storages, and the backward pass of the same inputs, views and operation takes them: 6 ms of a step of GPT-2 124M, at the cost of the outputs' memory until then. An entry whose inputs are gone is dropped, so a pass without gradient keeps nothing for long.
+
 **What waits.** Most operations return as soon as their kernels are queued. The exceptions are `download` and `upload`, the first use of a shape by an operation that needs a table, index tensors made on the device and then needed on the host, and the operations that still go through the host: casts to or from non-float types, products and gathers by weights in Q2_K or Q3_K (dequantized on the host), and attention masks that are not `f32`.
 
 ## 7.3 Launching a thread kernel
@@ -61,13 +63,15 @@ The kernels follow two rules from their module documentation: no two threads wri
 | --- | --- |
 | `copy_view_*`, `copy_into_*` | strided copies by element size; `Contiguous` and `Concat` |
 | `widen_16`, `narrow_16`, `widen_8`, `narrow_8` | bf16, f16, f8 E4M3 and E5M2 to f32 and back, bit-exact with the host, NaN made quiet |
-| `unary_forward`, `unary_backward`, `affine`, `binary_forward`, `binary_backward` | element-wise operations through broadcast views |
+| `unary_forward`, `unary_backward`, `affine`, `binary_forward`, `binary_backward` | element-wise operations through broadcast views; `unary_backward` reads its inputs in their own types |
+| `widen_16v`, `narrow_16v`, `binary_16`, `unary_16`, `unary_backward_16` | the same on 16-bit values in whole aligned pieces, eight values a thread in 128-bit loads and stores (800–840 GB/s where one value a thread gave 290–435); `binary_16` takes a second operand of the same shape or a row repeated (a bias) |
 | `unary_any`, `affine_any`, `binary_any`, `glu_any`, `glu_backward` | the same, and `Glu`, reading and writing one type, 16-bit included |
-| `reduce_sum`, `reduce_sum_segments`, `spread` | sums and means, and their backward; beyond 128 terms, in two stages: segments of 128 adjacent terms for all results at once, then each result's segments, in a fixed order (chapter 15) |
+| `reduce_sum`, `reduce_sum_segments`, `reduce_sum_rows`, `reduce_sum_columns`, `spread` | sums and means of any float type, and their backward; beyond 128 terms, in stages of 128 adjacent terms for all results at once, until a stage has 128 or fewer, in a fixed order; over the last dimensions (`_rows`) or the first (`_columns`, the gradient of a bias), without a table of offsets (chapter 15) |
 | `line_max`, `place` | maximum with its first position, and its backward |
 | `softmax_lines`, `softmax_lines_backward` | one thread per line, softmax or log-softmax |
-| `norm_rows`, `norm_rows_backward` | LayerNorm and RMSNorm, one warp per row, weight gradients summed by the two stages of `reduce_sum` |
-| `cross_entropy_rows`, `cross_entropy_rows_backward` | `CrossEntropy`, one warp per row, the logits read in their type, the maximum and the sum of exponentials in one reading |
+| `norm_rows`, `norm_rows_backward` | LayerNorm and RMSNorm, one warp per row, the backward pass reading and writing the rows in their type, weight gradients summed by the stages of `reduce_sum` |
+| `cross_entropy_rows`, `cross_entropy_rows_backward` | `CrossEntropy`, one block of 256 threads per row, the logits read in their type by their rows' stride, the maximum and the sum of exponentials in one reading; the gradient in the padded layout of the logits when they are the first columns of wider rows |
+| `adamw` | `Update::adamw`: a parameter and its moments in place, one thread per element, the gradient read in its type through its view |
 | `norm_any`, `norm_block_any`, `norm_16` | norms in the rows' own type; `norm_16`, one block per row in 128-bit loads, up to 8192 columns |
 | `rope_table`, `rope`, `rope_any` | angles in f64, then the rotation, in f32 or in the rows' type |
 | `gather_rows`, `scatter_rows`, `write_rows_any` | row gather, a scatter-add that sums each target row's sources in order of appearance, and rows written in place |
@@ -87,7 +91,7 @@ for i in 0i32..num_tiles(&part_x, 2) { /* load tx, ty */ acc = mma(tx, ty, acc);
 let out: Tile<E, { [BM, BN] }> = convert_tile(acc);
 ```
 
-Out-of-bounds loads read zeros and out-of-bounds stores are dropped, so tile sizes need not divide the problem. Operands are read in place through their strides. The weights of a linear layer are stored `[N, K]` and multiplied transposed; reading them through swapped strides is five times slower, so a second kernel, `batched_matmul_nt`, loads each tile of `[N, K]` along `K`, its contiguous dimension, and transposes it in registers.
+Out-of-bounds loads read zeros and out-of-bounds stores are dropped, so tile sizes need not divide the problem. Operands are read in place through their strides. The weights of a linear layer are stored `[N, K]` and multiplied transposed; reading them through swapped strides is five times slower, so a second kernel, `batched_matmul_nt`, loads each tile of `[N, K]` along `K`, its contiguous dimension, and transposes it in registers. A third, `batched_matmul_tn`, does the same for a first factor read transposed, `xᵀ · g`, the gradient of a weight in training: through swapped strides it ran at 13 to 25 Top/s on GPT-2's shapes, and at 54 to 60 with its own kernel. Each starts its `f32` accumulator from a bias row `[1, N]`, loaded and repeated over the tile's rows, zeros when the product has none: a linear layer's bias costs no pass of its own.
 
 Tile sizes depend on the number of rows `m`, from sweeps on the RTX 3090 (`tiles_for` in `tile.rs`):
 

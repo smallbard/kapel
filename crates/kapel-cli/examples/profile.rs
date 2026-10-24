@@ -91,6 +91,19 @@ impl<B: kapel_ops::Record> kapel_ops::Record for Timed<B> {
     }
 }
 
+impl<B: kapel_ops::Update> kapel_ops::Update for Timed<B> {
+    fn adamw(
+        &self,
+        param: &mut Tensor,
+        m: &mut Tensor,
+        v: &mut Tensor,
+        grad: &Tensor,
+        step: &kapel_ops::AdamWStep,
+    ) -> kapel_core::Result<()> {
+        self.inner.adamw(param, m, v, grad, step)
+    }
+}
+
 impl<B: Transfer> Transfer for Timed<B> {
     fn upload(&self, tensor: &Tensor) -> Result<Tensor> {
         self.inner.upload(tensor)

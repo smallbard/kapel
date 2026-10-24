@@ -36,7 +36,7 @@ The rule is that every `forward` starts with `op.infer(inputs)?` and every `back
 - `Write` writes into a tensor in place: `zeros` makes a tensor to be written, `write_rows(table, index, rows)` writes `rows[i]` into row `index[i]` of `table`, converted to the table's type, and `copy_from_host` fills a tensor of the backend from a host tensor of the same shape and type. A tensor is written only through its only handle (`Tensor::storage_mut`), so no clone or view sees the change.
 - `Record` records a pass once and replays it. `record` takes a closure that queues the pass and returns a `Recording`, whose `replay` runs it again on the current contents of the tensors it read and rewrites its `output`. A backend that computes each operation when it is called answers `records() == false` and `record` gives `None`: the pass is simply run there. On the card, a recording is a CUDA graph (chapter 7).
 
-`Backend` is the supertrait of `Write`, `Record` and all twenty-three `Run` implementations, with a blanket implementation, so any type that implements them all is a backend:
+`Backend` is the supertrait of `Write`, `Record`, `Update` and all twenty-three `Run` implementations, with a blanket implementation, so any type that implements them all is a backend:
 
 ```rust
 let y = backend.forward(&Matmul, &[&x, &w.transpose(0, 1)?])?;   // y = x · wᵀ, w read in place
@@ -56,7 +56,7 @@ The shared checks are small private functions: `arity`, `float`, `indices` (the 
 | `Cast` | x → `dtype` | as `DType::encode`; the gradient passes between float types only | x if floats |
 | `Contiguous` | x → same | a row-major copy, bit for bit | x |
 | `Concat` | inputs → joined along `dim` | same type and shape except `dim` | each input |
-| `Matmul` | \[…, M, K\] · \[…, K, N\] | batch dimensions broadcast; strided inputs allowed | a, b |
+| `Matmul` | \[…, M, K\] · \[…, K, N\], optional bias \[N\] | batch dimensions broadcast; strided inputs allowed; a bias of the type of `a` added to every row before rounding (the bias of a linear layer, in the product) | a, b, bias |
 | `QuantizedMatmul` | x \[…, K\] · w₁ \[N₁, K\], w₂ … quantized | the weights, of any formats, at their exact dequantized value, their rows stacked into one `[ΣNᵢ, K]`; K a whole number of blocks | x only |
 | `Sum`, `Mean` | x → reduced | over a list of dims, `keepdim` | x |
 | `Max` | x → reduced | along one dim; the gradient goes to the first maximum | x |
@@ -72,6 +72,8 @@ The shared checks are small private functions: `arity`, `float`, `indices` (the 
 | `ScatterAddRows` | src, idx → \[rows, …\] | adjoint of gather; repeated rows are summed | src |
 
 Normalization weights and the attention mask may be in any float type, not necessarily that of the main input: a model with bf16 weights can normalize f32 activations, and the weight gradients come back in the weights' own type.
+
+**Updates in place.** The optimizers' steps are not operations: they have no gradient, and they write their tensors in place. The trait `Update`, which `Backend` requires with `Write` and `Record`, has one method, `adamw(param, m, v, grad, step)`: one AdamW step for one parameter, its moments updated with it, the arithmetic of `AdamWStep::apply` in `f32`, the gradient of any float type and layout. `check_adamw` holds its rules: the state in `f32`, row-major, and the only handle on its storage.
 
 ## 4.3 A closer look at attention
 

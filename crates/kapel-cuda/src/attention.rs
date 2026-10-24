@@ -24,7 +24,7 @@ use cutile::tile_kernel::{CompileOptions, TileKernel};
 use kapel_core::{DType, Error, Layout, Result, Tensor};
 use kapel_ops::{Attention, Operation, Transfer};
 
-use crate::device::{Cuda, CudaStorage};
+use crate::device::{Cuda, CudaStorage, lock};
 
 #[cutile::module]
 mod kernels {
@@ -623,6 +623,35 @@ fn device_error(e: impl std::fmt::Display) -> Error {
     }
 }
 
+/// The output and the statistics an attention kept for its backward pass:
+/// valid while its inputs live (weak handles on their storages), for the
+/// same views and the same operation.
+pub(crate) struct Saved {
+    inputs: Vec<(std::sync::Weak<dyn kapel_core::Storage>, Layout)>,
+    op: Attention,
+    y: Tensor,
+    stats: [CudaStorage; 2],
+}
+
+/// At most this many attentions are kept: those whose inputs are gone are
+/// dropped first.
+const SAVED: usize = 256;
+
+impl Saved {
+    fn matches(&self, op: &Attention, inputs: &[&Tensor]) -> bool {
+        self.op == *op
+            && self.inputs.len() == inputs.len()
+            && self.inputs.iter().zip(inputs).all(|((weak, layout), x)| {
+                weak.upgrade()
+                    .is_some_and(|s| Arc::ptr_eq(&s, x.storage()) && layout == x.layout())
+            })
+    }
+
+    fn alive(&self) -> bool {
+        self.inputs.iter().all(|(w, _)| w.strong_count() > 0)
+    }
+}
+
 /// An attention call, ready for the kernels: its sizes, its constants, and
 /// its inputs read in place (the mask in `f32`, broadcast, or a placeholder).
 struct Prepared {
@@ -766,7 +795,37 @@ impl Cuda {
     /// `[B, Hq, Tq, Dv]`.
     pub(crate) fn flash_forward(&self, op: &Attention, inputs: &[&Tensor]) -> Result<Tensor> {
         let a = self.prepare(op, inputs)?;
-        Ok(self.forward_prepared(&a)?.0)
+        let (y, stats) = self.forward_prepared(&a)?;
+        if self
+            .inner
+            .keep_attention
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let mut saved = lock(&self.inner.saved_attention);
+            saved.retain(Saved::alive);
+            while saved.len() >= SAVED {
+                saved.pop_front();
+            }
+            saved.push_back(Saved {
+                inputs: inputs
+                    .iter()
+                    .map(|x| (Arc::downgrade(x.storage()), x.layout().clone()))
+                    .collect(),
+                op: *op,
+                y: y.clone(),
+                stats,
+            });
+        }
+        Ok(y)
+    }
+
+    /// The output and statistics kept by the forward pass of this call, if
+    /// any.
+    fn take_saved(&self, op: &Attention, inputs: &[&Tensor]) -> Option<(Tensor, [CudaStorage; 2])> {
+        let mut saved = lock(&self.inner.saved_attention);
+        let at = saved.iter().rposition(|s| s.matches(op, inputs))?;
+        let s = saved.remove(at)?;
+        Some((s.y, s.stats))
     }
 
     /// The output, and for each query its statistics `m` and `log₂ l`, each
@@ -844,7 +903,10 @@ impl Cuda {
                 got: grad.dtype(),
             });
         }
-        let (y, stats) = self.forward_prepared(&a)?;
+        let (y, stats) = match self.take_saved(op, inputs) {
+            Some(kept) => kept,
+            None => self.forward_prepared(&a)?,
+        };
         let [b, hq, hkv, tq, tk, d, dv] = a.sizes;
         let size = a.dtype.block_bytes();
         // Without queries, keys or widths, every gradient is zero.

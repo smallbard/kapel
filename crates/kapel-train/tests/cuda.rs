@@ -120,3 +120,20 @@ fn checkpointing_on_the_card_changes_no_bit() {
         assert_eq!(plain, saved);
     }
 }
+
+#[test]
+fn attentions_kept_for_their_backward_change_no_bit() {
+    let cuda = kapel_cuda::Cuda::new(0).unwrap();
+    let config = &configs()[1];
+    let params = init(config, 0.1, 9).unwrap();
+    let options = Options {
+        dtype: DType::BF16,
+        chunk: 40,
+        ..Options::default()
+    };
+    let computed = run(cuda.clone(), config, &params, &options);
+    cuda.keep_attention_for_backward(true);
+    let kept = run(cuda.clone(), config, &params, &options);
+    cuda.keep_attention_for_backward(false);
+    assert_eq!(computed, kept);
+}

@@ -63,5 +63,13 @@ name = "recorded"
 required-features = ["cuda"]
 
 [[example]]
+name = "training_gemm"
+required-features = ["cuda"]
+
+[[example]]
+name = "elementwise"
+required-features = ["cuda"]
+
+[[example]]
 name = "quantized"
 required-features = ["cuda"]

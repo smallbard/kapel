@@ -63,9 +63,20 @@ impl Run<Matmul> for Cpu {
         let pairs = (0..count)
             .map(|t| Ok((matrix(&a, batch, t)?, matrix(&b, batch, t)?)))
             .collect::<Result<Vec<_>>>()?;
+        let bias = match inputs.get(2) {
+            Some(b) => Some(io::contiguous(Matmul::NAME, b)?),
+            None => None,
+        };
         io::output(&self.buffers, &signature.shape, signature.dtype, |out| {
             for (c, &(left, right)) in out.chunks_mut((m * n).max(1)).zip(&pairs) {
-                gemm::gemm(&self.pool, self.isa, left, right, c, false);
+                // With a bias, each row starts from it and the product adds
+                // to it.
+                if let Some(bias) = &bias {
+                    for row in c.chunks_mut(n.max(1)) {
+                        row.copy_from_slice(bias);
+                    }
+                }
+                gemm::gemm(&self.pool, self.isa, left, right, c, bias.is_some());
             }
         })
     }
@@ -111,6 +122,18 @@ impl Run<Matmul> for Cpu {
                 shape,
                 signature.dtype,
             )?));
+        }
+        if let Some(bias) = inputs.get(2) {
+            // The output's gradient summed over every row, in order.
+            let n = bias.shape()[0];
+            let g = io::contiguous(Matmul::NAME, grad)?;
+            let mut sum = vec![0.0f32; n];
+            for row in g.chunks(n.max(1)) {
+                for (s, v) in sum.iter_mut().zip(row) {
+                    *s += v;
+                }
+            }
+            grads.push(Some(io::write(&self.buffers, &sum, &[n], bias.dtype())?));
         }
         Ok(grads)
     }
