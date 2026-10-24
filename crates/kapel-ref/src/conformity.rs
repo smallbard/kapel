@@ -33,10 +33,10 @@ use std::panic::{self, AssertUnwindSafe};
 
 use kapel_core::{DType, Result, Tensor};
 use kapel_ops::{
-    Affine, ArgMax, Attention, Backend, Binary, BinaryKind, Cast, Concat, Contiguous, GatherRows,
-    Glu, LayerNorm, LogSoftmax, Matmul, Max, Mean, Operation, PagedAttention, QuantizedMatmul,
-    RmsNorm, Rope, RopeLayout, RopeScaling, Run, ScatterAddRows, Softmax, Sum, Transfer, Unary,
-    UnaryKind, WRITE_ROWS, Write,
+    Affine, ArgMax, Attention, Backend, Binary, BinaryKind, Cast, Concat, Contiguous, CrossEntropy,
+    GatherRows, Glu, LayerNorm, LogSoftmax, Matmul, Max, Mean, Operation, PagedAttention,
+    QuantizedMatmul, RmsNorm, Rope, RopeLayout, RopeScaling, Run, ScatterAddRows, Softmax, Sum,
+    Transfer, Unary, UnaryKind, WRITE_ROWS, Write,
 };
 
 use crate::Reference;
@@ -80,6 +80,41 @@ pub fn check<B: Backend + Transfer + Write>(backend: &B, dtype: DType) -> Vec<Fa
     cases(&mut visitor, dtype);
     let mut failures = visitor.failures;
     failures.extend(write_failures(backend, dtype));
+    failures.extend(refusal_failures(backend, dtype));
+    failures
+}
+
+/// The calls of operations that must be refused for the values of their
+/// inputs, which `infer` does not read.
+fn refusal_failures<B: Backend + Transfer>(backend: &B, dtype: DType) -> Vec<Failure> {
+    let mut failures = Vec::new();
+    let mut rng = Rng::new(13);
+    let logits = random(&mut rng, &[3, 5], dtype, -1.0, 1.0);
+    for (case, targets) in [
+        ("a target beyond the vocabulary", [1u32, 5, 0]),
+        ("a target below −1", [1u32, (-2i32) as u32, 0]),
+    ] {
+        let refused = (|| -> Result<Tensor> {
+            let t = if case.contains("−1") {
+                let signed: Vec<i32> = targets.iter().map(|&t| t as i32).collect();
+                Tensor::from_slice(&signed, &[3])?
+            } else {
+                Tensor::from_slice(&targets, &[3])?
+            };
+            let y = backend.forward(
+                &CrossEntropy,
+                &[&backend.upload(&logits)?, &backend.upload(&t)?],
+            )?;
+            backend.download(&y)
+        })();
+        if refused.is_ok() {
+            failures.push(Failure {
+                op: CrossEntropy::NAME,
+                case: case.into(),
+                message: "accepted".into(),
+            });
+        }
+    }
     failures
 }
 
@@ -519,6 +554,50 @@ fn cases<V: Visitor>(v: &mut V, dtype: DType) {
         &LogSoftmax { dim: 1 },
         "dim 1 of [3, 6], large values".into(),
         vec![large],
+    );
+    // Cross-entropy: targets of both integer types, rows that count in no
+    // loss, rows wider than a warp and not a multiple of it, strided
+    // logits, large logits.
+    let ignore = CrossEntropy::IGNORE;
+    v.visit(
+        &CrossEntropy,
+        "[4, 7], u32 targets, one ignored".into(),
+        vec![
+            x(rng, &[4, 7]),
+            plain(Tensor::from_slice(&[3u32, ignore, 0, 6], &[4]).expect("4 targets")),
+        ],
+    );
+    v.visit(
+        &CrossEntropy,
+        "[3, 100], i32 targets, one ignored".into(),
+        vec![
+            plain(random(rng, &[3, 100], dtype, -4.0, 4.0)),
+            plain(Tensor::from_slice(&[99i32, -1, 31], &[3]).expect("3 targets")),
+        ],
+    );
+    v.visit(
+        &CrossEntropy,
+        "[7, 5]ᵀ, strided".into(),
+        vec![
+            transposed(random(rng, &[7, 5], dtype, -1.0, 1.0)),
+            plain(Tensor::from_slice(&[0u32, 6, 2, 2, 5], &[5]).expect("5 targets")),
+        ],
+    );
+    v.visit(
+        &CrossEntropy,
+        "[2, 9], large values".into(),
+        vec![
+            plain(random(rng, &[2, 9], dtype, -30.0, 30.0)),
+            plain(Tensor::from_slice(&[8u32, 1], &[2]).expect("2 targets")),
+        ],
+    );
+    v.visit(
+        &CrossEntropy,
+        "[0, 5], empty".into(),
+        vec![
+            x(rng, &[0, 5]),
+            plain(Tensor::from_slice::<u32>(&[], &[0]).expect("none")),
+        ],
     );
     v.visit(
         &LayerNorm { eps: 1e-5 },

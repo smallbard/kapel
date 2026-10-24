@@ -65,7 +65,12 @@ pub(crate) const KERNELS: &[(&str, &[Param])] = &[
         "norm_rows_backward",
         &[U32, Slice, Slice, Slice, F32, F32, U32, Slice, Slice, Slice],
     ),
-    ("column_sum", &[Slice, U32, Slice]),
+    ("reduce_sum_segments", &[Slice, Slice, Slice, U32, Slice]),
+    ("cross_entropy_rows", &[U32, Slice, View, Slice, U32, Slice]),
+    (
+        "cross_entropy_rows_backward",
+        &[U32, Slice, View, Slice, Slice, U32, U32, Slice],
+    ),
     ("rope_table", &[Slice, U32, Slice, F32, Slice]),
     ("rope", &[Slice, Slice, Slice, U32, U32, U32, Slice]),
     ("gather_rows", &[Slice, Slice, U32, Slice]),

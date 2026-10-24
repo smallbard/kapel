@@ -90,7 +90,7 @@ Binary operations on two inputs of the output's shape, the residual sums and gat
 
 Sums and means are cut into blocks of 1,024 elements, summed with `math::sum`, then combined pairwise, so the error grows with the logarithm of the length. Blocks of all outputs are spread over the threads, so one huge sum uses every core: 16 million elements went from 64 ms to 0.8 ms when this was introduced, and became far more accurate.
 
-Softmax subtracts the row maximum, computes `exp(x − max)` and its sum in one pass, then scales. Norms process rows in tasks; their backward accumulates the weight and bias gradients in per-task buffers, then adds them in task order.
+Softmax subtracts the row maximum, computes `exp(x − max)` and its sum in one pass, then scales. `CrossEntropy` (`loss.rs`) gives each row the logarithm of that sum plus the maximum, minus its target's logit, and its backward pass writes the softmax scaled by the row's gradient, minus the gradient at the target, rows shared between threads. Norms process rows in tasks; their backward accumulates the weight and bias gradients in per-task buffers, then adds them in task order.
 
 ## 6.6 Attention
 

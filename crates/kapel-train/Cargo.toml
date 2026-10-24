@@ -6,8 +6,24 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-# Empty until the training plan starts.
+# Published once its first steps are done.
 publish = false
 
 [lints]
 workspace = true
+
+[features]
+# Trains on an NVIDIA card: needs the CUDA toolkit.
+cuda = ["dep:kapel-cuda", "kapel-cuda/cuda"]
+
+[dependencies]
+kapel-core.workspace = true
+kapel-ops.workspace = true
+kapel-models.workspace = true
+kapel-hub.workspace = true
+serde_json.workspace = true
+kapel-cpu.workspace = true
+kapel-cuda = { workspace = true, optional = true }
+
+[dev-dependencies]
+kapel-ref.workspace = true

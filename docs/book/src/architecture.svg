@@ -14,18 +14,21 @@
 <text x="648" y="108" font-size="11.5" fill="#5f5d57" text-anchor="middle">any device, one type</text>
 <rect x="24" y="144" width="712" height="80" rx="8" fill="#efeeea"/>
 <text x="40" y="188" font-size="13" font-weight="600" fill="#5f5d57" text-anchor="start">Applications</text>
-<rect x="168" y="156" width="127" height="56" rx="8" fill="none" stroke="#a8a59b" stroke-width="1.25"/>
-<text x="231.5" y="180" font-size="13" font-weight="600" fill="#1f1e1b" text-anchor="middle">kapel-cli</text>
-<text x="231.5" y="196" font-size="11.5" fill="#5f5d57" text-anchor="middle">run, serve, quantize</text>
-<rect x="315" y="156" width="127" height="56" rx="8" fill="none" stroke="#a8a59b" stroke-width="1.25"/>
-<text x="378.5" y="180" font-size="13" font-weight="600" fill="#1f1e1b" text-anchor="middle">kapel-infer</text>
-<text x="378.5" y="196" font-size="11.5" fill="#5f5d57" text-anchor="middle">generation, scores</text>
-<rect x="462" y="156" width="127" height="56" rx="8" fill="none" stroke="#a8a59b" stroke-width="1.25"/>
-<text x="525.5" y="180" font-size="13" font-weight="600" fill="#1f1e1b" text-anchor="middle">kapel-serve</text>
-<text x="525.5" y="196" font-size="11.5" fill="#5f5d57" text-anchor="middle">OpenAI API</text>
-<rect x="609" y="156" width="127" height="56" rx="8" fill="none" stroke="#a8a59b" stroke-width="1.25"/>
-<text x="672.5" y="180" font-size="13" font-weight="600" fill="#1f1e1b" text-anchor="middle">kapel-quant</text>
-<text x="672.5" y="196" font-size="11.5" fill="#5f5d57" text-anchor="middle">GPTQ, AWQ</text>
+<rect x="140" y="156" width="112" height="56" rx="8" fill="none" stroke="#a8a59b" stroke-width="1.25"/>
+<text x="196" y="180" font-size="13" font-weight="600" fill="#1f1e1b" text-anchor="middle">kapel-cli</text>
+<text x="196" y="196" font-size="11.5" fill="#5f5d57" text-anchor="middle">run, serve, eval</text>
+<rect x="258" y="156" width="112" height="56" rx="8" fill="none" stroke="#a8a59b" stroke-width="1.25"/>
+<text x="314" y="180" font-size="13" font-weight="600" fill="#1f1e1b" text-anchor="middle">kapel-infer</text>
+<text x="314" y="196" font-size="11.5" fill="#5f5d57" text-anchor="middle">generate, score</text>
+<rect x="376" y="156" width="112" height="56" rx="8" fill="none" stroke="#a8a59b" stroke-width="1.25"/>
+<text x="432" y="180" font-size="13" font-weight="600" fill="#1f1e1b" text-anchor="middle">kapel-serve</text>
+<text x="432" y="196" font-size="11.5" fill="#5f5d57" text-anchor="middle">OpenAI API</text>
+<rect x="494" y="156" width="112" height="56" rx="8" fill="none" stroke="#a8a59b" stroke-width="1.25"/>
+<text x="550" y="180" font-size="13" font-weight="600" fill="#1f1e1b" text-anchor="middle">kapel-quant</text>
+<text x="550" y="196" font-size="11.5" fill="#5f5d57" text-anchor="middle">GPTQ, AWQ</text>
+<rect x="612" y="156" width="112" height="56" rx="8" fill="none" stroke="#a8a59b" stroke-width="1.25"/>
+<text x="668" y="180" font-size="13" font-weight="600" fill="#1f1e1b" text-anchor="middle">kapel-train</text>
+<text x="668" y="196" font-size="11.5" fill="#5f5d57" text-anchor="middle">gradients, AdamW</text>
 <rect x="24" y="232" width="712" height="80" rx="8" fill="#efeeea"/>
 <text x="40" y="276" font-size="13" font-weight="600" fill="#5f5d57" text-anchor="start">Inputs, models</text>
 <rect x="168" y="244" width="176" height="56" rx="8" fill="none" stroke="#a8a59b" stroke-width="1.25"/>
@@ -52,7 +55,7 @@
 <text x="40" y="452" font-size="13" font-weight="600" fill="#5f5d57" text-anchor="start">Contract</text>
 <rect x="168" y="420" width="568" height="56" rx="8" fill="#2f6fd6" fill-opacity="0.12" stroke="#2f6fd6" stroke-width="2"/>
 <text x="452" y="444" font-size="13" font-weight="600" fill="#1f1e1b" text-anchor="middle">kapel-ops</text>
-<text x="452" y="460" font-size="11.5" fill="#1f1e1b" text-anchor="middle">22 operations: infer, Run (forward, backward), Backend</text>
+<text x="452" y="460" font-size="11.5" fill="#1f1e1b" text-anchor="middle">23 operations: infer, Run (forward, backward), Backend</text>
 <rect x="24" y="496" width="712" height="80" rx="8" fill="#efeeea"/>
 <text x="40" y="540" font-size="13" font-weight="600" fill="#5f5d57" text-anchor="start">Data</text>
 <rect x="168" y="508" width="568" height="56" rx="8" fill="none" stroke="#a8a59b" stroke-width="1.25"/>

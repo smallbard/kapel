@@ -70,6 +70,7 @@ mod io;
 mod isa;
 pub mod kernels;
 mod lines;
+mod loss;
 pub mod math;
 mod matmul;
 mod norm;

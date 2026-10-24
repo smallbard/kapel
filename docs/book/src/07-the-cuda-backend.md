@@ -28,7 +28,7 @@ Opening a backend creates a context and one stream, loads the PTX module, and pr
 
 **Host mirrors.** An upload of at most 1 MiB keeps a copy of its bytes on the host, next to the device buffer. Token ids, positions and page tables are such uploads, and an operation that needs their values on the host (the rows of a scatter, the prompts of a paged attention) reads the copy instead of waiting for the stream. A gather reads its row indices in place on the device when they are contiguous `u32` or `i32`. A kernel that writes into a storage drops its mirror.
 
-**Free memory.** `Cuda::memory()` gives the free and total bytes of the device, as the driver counts them (other processes included); `kapel serve` sizes its cache with it, after `clear_pool`.
+**Free memory.** `Cuda::memory()` gives the free and total bytes of the device, as the driver counts them (other processes included); `kapel serve` sizes its cache with it, after `clear_pool`. `Cuda::memory_in_use()` counts the bytes held by the backend's live tensors, and `Cuda::peak_memory()` the most it has counted since `reset_peak_memory()`: what `torch.cuda.memory_allocated` and `max_memory_allocated` count, which training compares (chapter 15).
 
 **What waits.** Most operations return as soon as their kernels are queued. The exceptions are `download` and `upload`, the first use of a shape by an operation that needs a table, index tensors made on the device and then needed on the host, and the operations that still go through the host: casts to or from non-float types, products and gathers by weights in Q2_K or Q3_K (dequantized on the host), and attention masks that are not `f32`.
 
@@ -63,10 +63,11 @@ The kernels follow two rules from their module documentation: no two threads wri
 | `widen_16`, `narrow_16`, `widen_8`, `narrow_8` | bf16, f16, f8 E4M3 and E5M2 to f32 and back, bit-exact with the host, NaN made quiet |
 | `unary_forward`, `unary_backward`, `affine`, `binary_forward`, `binary_backward` | element-wise operations through broadcast views |
 | `unary_any`, `affine_any`, `binary_any`, `glu_any`, `glu_backward` | the same, and `Glu`, reading and writing one type, 16-bit included |
-| `reduce_sum`, `spread` | sums and means, terms added in order, and their backward |
+| `reduce_sum`, `reduce_sum_segments`, `spread` | sums and means, and their backward; beyond 128 terms, in two stages: segments of 128 adjacent terms for all results at once, then each result's segments, in a fixed order (chapter 15) |
 | `line_max`, `place` | maximum with its first position, and its backward |
 | `softmax_lines`, `softmax_lines_backward` | one thread per line, softmax or log-softmax |
-| `norm_rows`, `norm_rows_backward`, `column_sum` | LayerNorm and RMSNorm, one warp per row, weight gradients summed in order |
+| `norm_rows`, `norm_rows_backward` | LayerNorm and RMSNorm, one warp per row, weight gradients summed by the two stages of `reduce_sum` |
+| `cross_entropy_rows`, `cross_entropy_rows_backward` | `CrossEntropy`, one warp per row, the logits read in their type, the maximum and the sum of exponentials in one reading |
 | `norm_any`, `norm_block_any`, `norm_16` | norms in the rows' own type; `norm_16`, one block per row in 128-bit loads, up to 8192 columns |
 | `rope_table`, `rope`, `rope_any` | angles in f64, then the rotation, in f32 or in the rows' type |
 | `gather_rows`, `scatter_rows`, `write_rows_any` | row gather, a scatter-add that sums each target row's sources in order of appearance, and rows written in place |
@@ -175,7 +176,7 @@ Served by `kapel serve` (chapter 12) with requests of 16 to 128 prompt tokens an
 
 Speculative decoding (chapter 11) takes Qwen3 8B in bf16 from 49.9 to 85.6 tokens per second with Qwen3 0.6B proposing four tokens per pass, the greedy answers unchanged, and MiMo-7B-RL from 54.7 to 83.8 with its own multi-token layer.
 
-Llama 3.2 1B decodes at 425 tokens per second in Q4_K_M, 412 in Q8_0 and 272 in bf16; Llama 3.2 3B at 166 in int8, 179 in int4 and 204 in Q4_0. Q4_0, the format `kapel quantize` writes by default (chapter 13), went through the generic kernel at 28 tokens per second until the tracked measures (chapter 16) showed it.
+Llama 3.2 1B decodes at 425 tokens per second in Q4_K_M, 412 in Q8_0 and 272 in bf16; Llama 3.2 3B at 166 in int8, 179 in int4 and 204 in Q4_0. Q4_0, the format `kapel quantize` writes by default (chapter 13), went through the generic kernel at 28 tokens per second until the tracked measures (chapter 17) showed it.
 
 The limits are known. At one sequence, products alone reach 92 % of the bandwidth, but the small kernels between them (norms, RoPE, cache writes, attention) take the rest of the time. Quantized weights with 9 to a few hundred rows of activations are dequantized at every pass. 4-bit formats are limited by the instructions that decode them, not by bandwidth, and `qgemv` with 2 to 8 rows is slower than it should be.
 

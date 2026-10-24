@@ -16,6 +16,7 @@ mod attention;
 mod copy;
 mod elementwise;
 mod index;
+mod loss;
 mod matmul;
 mod norm;
 mod paged;
@@ -31,6 +32,7 @@ pub use copy::{Concat, Contiguous};
 pub use elementwise::{Affine, Binary, BinaryKind, Cast, Glu, Unary, UnaryKind};
 pub use index::{GatherRows, ScatterAddRows};
 use kapel_core::{DType, Error, Result, Tensor};
+pub use loss::CrossEntropy;
 pub use matmul::{Matmul, QuantizedMatmul};
 pub use norm::{LayerNorm, LogSoftmax, RmsNorm, Softmax};
 pub use paged::{
@@ -167,6 +169,7 @@ pub trait Backend:
     + Run<ArgMax>
     + Run<Softmax>
     + Run<LogSoftmax>
+    + Run<CrossEntropy>
     + Run<LayerNorm>
     + Run<RmsNorm>
     + Run<Attention>
@@ -195,6 +198,7 @@ impl<B> Backend for B where
         + Run<ArgMax>
         + Run<Softmax>
         + Run<LogSoftmax>
+        + Run<CrossEntropy>
         + Run<LayerNorm>
         + Run<RmsNorm>
         + Run<Attention>

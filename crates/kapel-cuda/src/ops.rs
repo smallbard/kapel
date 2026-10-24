@@ -16,14 +16,17 @@ use std::sync::Arc;
 use kapel_core::{DType, Error, HostStorage, Layout, Result, Tensor};
 use kapel_cuda_abi::{binary, unary};
 use kapel_ops::{
-    Affine, ArgMax, Attention, Binary, BinaryKind, Cast, Concat, Contiguous, GatherRows, Glu,
-    LayerNorm, LogSoftmax, Matmul, Max, Mean, Operation, QuantizedMatmul, RmsNorm, Rope,
-    RopeLayout, Run, ScatterAddRows, Softmax, Sum, Transfer, Unary, UnaryKind,
+    Affine, ArgMax, Attention, Binary, BinaryKind, Cast, Concat, Contiguous, CrossEntropy,
+    GatherRows, Glu, LayerNorm, LogSoftmax, Matmul, Max, Mean, Operation, QuantizedMatmul, RmsNorm,
+    Rope, RopeLayout, Run, ScatterAddRows, Softmax, Sum, Transfer, Unary, UnaryKind,
 };
 
 use crate::device::{
     Args, Cuda, CudaStorage, Flat, FloatArg, Table, float_code, small, smalls, view_of,
 };
+
+/// The terms a thread adds in one stage of a long sum.
+const SEGMENT: usize = 128;
 
 fn unary_code(op: &'static str, kind: UnaryKind) -> Result<u32> {
     Ok(match kind {
@@ -119,15 +122,72 @@ impl Cuda {
         scale: f32,
         out_shape: &[usize],
     ) -> Result<Tensor> {
+        self.reduce_raw(op, x.ptr, x.len, shape, dims, scale, out_shape)
+    }
+
+    /// [`Cuda::reduce`] of the `len` `f32` values at `ptr`.
+    ///
+    /// A result of more than [`SEGMENT`] terms is summed in two stages, for
+    /// speed and precision: segments of `SEGMENT` terms each, all at once
+    /// (`reduce_sum_segments`), then the segments of each result
+    /// (`reduce_sum`). The order of the additions is fixed: the same bits
+    /// on every run.
+    #[allow(clippy::too_many_arguments)]
+    fn reduce_raw(
+        &self,
+        op: &'static str,
+        ptr: u64,
+        len: usize,
+        shape: &[usize],
+        dims: &[usize],
+        scale: f32,
+        out_shape: &[usize],
+    ) -> Result<Tensor> {
         let (b, i) = self.reduction_tables(op, shape, dims)?;
+        let (results, terms) = (b.len, i.len);
+        if terms <= SEGMENT || results == 0 {
+            return self.output(out_shape, false, |out, n| {
+                self.launch(
+                    "reduce_sum",
+                    n,
+                    Args::new()
+                        .slice(ptr, len)
+                        .table(&b)
+                        .table(&i)
+                        .f32(scale)
+                        .slice(out, n),
+                )
+            });
+        }
+        let segments = terms.div_ceil(SEGMENT);
+        let parts = self.output(&[segments, results], false, |out, n| {
+            self.launch(
+                "reduce_sum_segments",
+                n,
+                Args::new()
+                    .slice(ptr, len)
+                    .table(&b)
+                    .table(&i)
+                    .u32(small(op, SEGMENT)?)
+                    .slice(out, n),
+            )
+        })?;
+        let parts = self.flat(op, &parts)?;
+        let key = [results, segments];
+        let bases = self.table("segment bases", &key, || {
+            smalls(op, &(0..results).collect::<Vec<_>>())
+        })?;
+        let inner = self.table("segment offsets", &key, || {
+            smalls(op, &(0..segments).map(|s| s * results).collect::<Vec<_>>())
+        })?;
         self.output(out_shape, false, |out, n| {
             self.launch(
                 "reduce_sum",
                 n,
                 Args::new()
-                    .flat(x)
-                    .table(&b)
-                    .table(&i)
+                    .flat(&parts)
+                    .table(&bases)
+                    .table(&inner)
                     .f32(scale)
                     .slice(out, n),
             )
@@ -1358,16 +1418,15 @@ impl Cuda {
             )
         })?;
         let column_sum = |rows_of: &CudaStorage| {
-            self.output(&[width], false, |out, n| {
-                self.launch(
-                    "column_sum",
-                    n,
-                    Args::new()
-                        .list(rows_of, x.len)
-                        .u32(small(op, rows)?)
-                        .slice(out, n),
-                )
-            })
+            self.reduce_raw(
+                op,
+                rows_of.pointer(),
+                x.len,
+                &[rows, width],
+                &[0],
+                1.0,
+                &[width],
+            )
         };
         Ok((gx, column_sum(&gw_rows)?, column_sum(&gb_rows)?))
     }
@@ -1812,5 +1871,93 @@ impl InF32<ScatterAddRows> for Cuda {
             inputs[0].shape(),
         )?;
         Ok(vec![Some(out), None])
+    }
+}
+
+impl Cuda {
+    /// The targets of a cross-entropy, read on the host (from the copy an
+    /// upload keeps, without waiting) and checked, as `u32` bits on the
+    /// device: those of `targets` in place when they are row-major.
+    fn targets(
+        &self,
+        targets: &Tensor,
+        vocab: usize,
+    ) -> Result<(u64, Arc<dyn kapel_core::Storage>)> {
+        let op = CrossEntropy::NAME;
+        let host = match self.storage(op, targets)?.host() {
+            Some(bytes) => Tensor::from_storage(
+                Arc::new(HostStorage::from_bytes(bytes)),
+                targets.layout().clone(),
+                targets.dtype(),
+            )?,
+            None => self.download(targets)?,
+        };
+        let values = host.to_f64_vec()?;
+        for &v in &values {
+            CrossEntropy::target(v as i64, vocab)?;
+        }
+        if targets.is_contiguous() {
+            // `u32` and `i32` alike: −1 has the bits of `IGNORE`.
+            let storage = self.storage(op, targets)?;
+            let pointer = storage.pointer() + targets.layout().offset() as u64 * 4;
+            return Ok((pointer, Arc::clone(targets.storage())));
+        }
+        let bits: Vec<u32> = values.iter().map(|&v| v as i64 as u32).collect();
+        let uploaded = self.upload_u32(&bits)?;
+        Ok((uploaded.pointer(), Arc::new(uploaded)))
+    }
+}
+
+/// One warp per row; the logits are read in their own type, through their
+/// view, and their gradient written in it.
+impl Run<CrossEntropy> for Cuda {
+    fn forward(&self, op: &CrossEntropy, inputs: &[&Tensor]) -> Result<Tensor> {
+        let name = CrossEntropy::NAME;
+        let signature = op.infer(inputs)?;
+        let (n, vocab) = (inputs[0].shape()[0], inputs[0].shape()[1]);
+        let (t, _keep) = self.targets(inputs[1], vocab)?;
+        let x = self.float_arg(name, inputs[0], inputs[0].layout())?;
+        self.output(&signature.shape, false, |out, len| {
+            self.launch(
+                "cross_entropy_rows",
+                warps(name, n)?,
+                Args::new()
+                    .float(&x)
+                    .slice(t, n)
+                    .u32(small(name, vocab)?)
+                    .slice(out, len),
+            )
+        })
+    }
+
+    fn backward(
+        &self,
+        op: &CrossEntropy,
+        inputs: &[&Tensor],
+        grad: &Tensor,
+    ) -> Result<Vec<Option<Tensor>>> {
+        let name = CrossEntropy::NAME;
+        op.infer_backward(inputs, grad)?;
+        let (n, vocab) = (inputs[0].shape()[0], inputs[0].shape()[1]);
+        let (t, _keep) = self.targets(inputs[1], vocab)?;
+        let x = self.float_arg(name, inputs[0], inputs[0].layout())?;
+        let g = self.widened(name, grad)?;
+        let g = self.flat(name, &g)?;
+        let dtype = inputs[0].dtype();
+        let ko = float_code(name, dtype)?;
+        let gx = self.output_as(inputs[0].shape(), dtype, false, |out, len| {
+            self.launch(
+                "cross_entropy_rows_backward",
+                warps(name, n)?,
+                Args::new()
+                    .float(&x)
+                    .slice(t, n)
+                    .flat(&g)
+                    .u32(small(name, vocab)?)
+                    .u32(ko)
+                    .slice(out, dtype.storage_bytes(len)?),
+            )
+        })?;
+        Ok(vec![Some(gx), None])
     }
 }

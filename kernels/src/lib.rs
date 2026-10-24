@@ -469,6 +469,32 @@ pub fn reduce_sum(x: &[f32], bases: &[u32], inner: &[u32], scale: f32, mut out: 
     }
 }
 
+/// The first stage of a long sum: `out[s · O + o] = Σ x[bases[o] + inner[r]]`
+/// over the `seg` terms `r` of segment `s`, in order, for the `O` results
+/// `o` of `bases`. Adjacent threads take adjacent results, whose terms are
+/// often adjacent too (the sums over the rows of a matrix): the reads are
+/// coalesced. `reduce_sum` then adds the segments of each result, in order.
+#[kernel]
+#[launch_bounds(256)]
+pub fn reduce_sum_segments(x: &[f32], bases: &[u32], inner: &[u32], seg: u32, mut out: DisjointSlice<f32>) {
+    let idx = thread::index_1d();
+    let j = idx.get();
+    let results = bases.len();
+    if results > 0 {
+        if let Some(y) = out.get_mut(idx) {
+            let (s, o) = (j / results, j % results);
+            let base = bases[o] as usize;
+            let start = s * seg as usize;
+            let end = (start + seg as usize).min(inner.len());
+            let mut total = 0.0f32;
+            for r in start..end {
+                total += x[base + inner[r] as usize];
+            }
+            *y = total;
+        }
+    }
+}
+
 /// `out[i] = scale · g[owner[i]]`: each element receives its result's gradient.
 #[kernel]
 #[launch_bounds(256)]
@@ -666,7 +692,7 @@ pub fn norm_rows(rms: u32, x: &[f32], w: &[f32], b: &[f32], offset: f32, eps: f3
 
 /// The backward pass of `norm_rows`, one warp per row as it: the gradient of
 /// `x`, and for every row its contributions `g·x̂` and `g` to the gradients of
-/// the weight and the bias, summed over rows afterwards by `column_sum`.
+/// the weight and the bias, summed over rows afterwards by `reduce_sum_segments` and `reduce_sum`.
 #[kernel]
 #[launch_bounds(256)]
 pub fn norm_rows_backward(
@@ -737,19 +763,96 @@ pub fn norm_rows_backward(
     }
 }
 
-/// `out[c] = Σ_r x[r·width + c]`, the rows added in order.
+/// The target of a cross-entropy row that counts in no loss: all bits set
+/// (`kapel_ops::CrossEntropy::IGNORE`, or −1 as an `i32`).
+const IGNORE: u32 = u32::MAX;
+
+/// The logarithm of `Σⱼ e^(x[j])` over row `row` of `x` (float type `kx`, seen
+/// through `vx`), `vocab` wide, computed by the warp: each lane keeps a
+/// running maximum and its sum over columns `lane, lane + 32, …`, in one
+/// reading, then the lanes are combined. The same on every lane.
+#[inline(always)]
+fn row_log_sum_exp(kx: u32, x: &[u8], vx: View, row: usize, vocab: usize, lane: usize) -> f32 {
+    let (mut m, mut s) = (f32::NEG_INFINITY, 0.0f32);
+    let mut c = lane;
+    while c < vocab {
+        let v = read(kx, x, vx.at((row * vocab + c) as u32) as usize);
+        if v > m {
+            s = s * (m - v).exp() + 1.0;
+            m = v;
+        } else {
+            s += (v - m).exp();
+        }
+        c += 32;
+    }
+    let top = warp_max(m);
+    let part = if m == f32::NEG_INFINITY { 0.0 } else { s * (m - top).exp() };
+    top + warp_sum(part).ln()
+}
+
+/// The cross-entropy of every row of logits (`kapel_ops::CrossEntropy`), one
+/// warp per row: `out[n] = ln Σⱼ e^(x[n, j]) − x[n, t[n]]`, 0 for a target
+/// `IGNORE`. The targets are checked by the backend.
 #[kernel]
 #[launch_bounds(256)]
-pub fn column_sum(x: &[f32], rows: u32, mut out: DisjointSlice<f32>) {
+pub fn cross_entropy_rows(kx: u32, x: &[u8], vx: View, targets: &[u32], vocab: u32, mut out: DisjointSlice<f32>) {
     let idx = thread::index_1d();
-    let c = idx.get();
-    let width = out.len();
-    if let Some(y) = out.get_mut(idx) {
-        let mut total = 0.0f32;
-        for r in 0..rows as usize {
-            total += x[r * width + c];
+    let row = idx.get() / 32;
+    let lane = idx.get() % 32;
+    // The same for every lane of the warp: whole warps go on or stop.
+    if row < targets.len() && row < out.len() {
+        let vocab = vocab as usize;
+        let lse = row_log_sum_exp(kx, x, vx, row, vocab, lane);
+        let t = targets[row];
+        if lane == 0 {
+            let y = if t == IGNORE {
+                0.0
+            } else {
+                lse - read(kx, x, vx.at((row * vocab + t as usize) as u32) as usize)
+            };
+            // SAFETY: `row < out.len()` (checked above); lane 0 of the row's
+            // warp alone writes it.
+            unsafe { *out.as_mut_ptr().add(row) = y };
         }
-        *y = total;
+    }
+}
+
+/// The backward pass of `cross_entropy_rows`, one warp per row:
+/// `out[n, j] = g[n] · (softmax(x[n])[j] − [j = t[n]])` in float type `ko`,
+/// zeros on the rows whose target is `IGNORE`.
+#[kernel]
+#[launch_bounds(256)]
+pub fn cross_entropy_rows_backward(
+    kx: u32,
+    x: &[u8],
+    vx: View,
+    targets: &[u32],
+    g: &[f32],
+    vocab: u32,
+    ko: u32,
+    mut out: DisjointSlice<u8>,
+) {
+    let idx = thread::index_1d();
+    let row = idx.get() / 32;
+    let lane = idx.get() % 32;
+    let vocab = vocab as usize;
+    if row < targets.len() && row < g.len() && (row + 1) * vocab <= elements(ko, out.len()) {
+        let t = targets[row];
+        let lse = if t == IGNORE { 0.0 } else { row_log_sum_exp(kx, x, vx, row, vocab, lane) };
+        let scale = g[row];
+        let mut c = lane;
+        while c < vocab {
+            let value = if t == IGNORE {
+                0.0
+            } else {
+                let p = (read(kx, x, vx.at((row * vocab + c) as u32) as usize) - lse).exp();
+                scale * (p - if c == t as usize { 1.0 } else { 0.0 })
+            };
+            // SAFETY: `row · vocab + c` is below the output's elements
+            // (checked above); the row is this warp's, the column this lane's.
+            unsafe { write(ko, out.as_mut_ptr(), row * vocab + c, value) };
+            c += 32;
+        }
     }
 }
 

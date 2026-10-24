@@ -210,9 +210,32 @@ changelog says how.
   binaries and wheels for a tag, and CI builds the book and the guide.
 - `kapel-python`: the Python module `kapel` (PyO3, stable ABI from Python 3.9): load,
   generate, chat, serve. CI builds both and tests them on Linux, macOS and Windows.
+- `kapel-train`: reverse-mode differentiation on any backend (`Tape`, `Var`): values
+  let go as soon as no derivative needs them, each derivative keeping only what it
+  reads; activation checkpointing (`Tape::checkpoint`); gradients of slices joined
+  without padding; gradients of table rows kept as rows for sparse leaves;
+  derivatives written by hand (`Tape::custom`).
+- `kapel-train`: losses (`cross_entropy`, and `linear_cross_entropy`, which never
+  forms the logits of a large vocabulary whole), AdamW dense and by rows, the
+  decoders of `kapel-models` on a tape (`Decoder`, `Parameters`, `init`), and a
+  backend that times each operation (`profile::Profiled`).
+- `kapel-ops`: `CrossEntropy`, the loss of each row of logits with its gradient
+  written by hand, on the reference, the processor and the card.
+- `kapel-cuda`: the bytes held by live tensors and their peak
+  (`Cuda::memory_in_use`, `Cuda::peak_memory`, `Cuda::reset_peak_memory`).
+- `kapel-models`: `Model::new`, `Model::with_weights` and `Model::raw_config`, to
+  make a model of trained weights.
+- The examples `gradients` and `steps` of `kapel-train`, and
+  `tools/train/gradients.py`, which compares Kapel's gradients and peak memory
+  with PyTorch's.
+- The Kapel Book: chapter 15, training.
 
 ### Changed
 
+- `kapel-cuda`: sums of more than 128 terms are computed in two stages, segments
+  of adjacent terms for all results at once, then each result's segments, in a
+  fixed order: faster, and more precise over millions of terms (a sum of 12.8
+  million values was off by 5e-5). The weight gradients of norms use them.
 - `kapel-cuda`: cuda-oxide's crates (`cuda-core`, `cuda-bindings`, `cutile`) come from
   crates.io (0.4.0) instead of a Git revision: every crate but the bindings can be
   published.
@@ -261,6 +284,9 @@ changelog says how.
 
 ### Fixed
 
+- `kapel-models`: GPT-2's first checkpoints (`openai-community/gpt2`) load: their
+  weights get the names of `GPT2LMHeadModel`, and the causal masks stored among
+  them are left out.
 - `kapel-cuda`: products by Q4_0 and Q4_1 weights have kernels of their own; they
   went through the generic kernel, seven times slower (Llama 3.2 3B in Q4_0: 28 to
   204 tokens per second).

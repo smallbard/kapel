@@ -4,6 +4,7 @@ use std::any::Any;
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::fmt;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use cuda_core::{
@@ -90,6 +91,17 @@ fn take_or_alloc<B, E>(
 pub(crate) struct Shared {
     ordinal: u32,
     pool: Mutex<Pool<DeviceBuffer<u8>>>,
+    /// The bytes held by live storages, and the most they have been.
+    used: AtomicUsize,
+    peak: AtomicUsize,
+}
+
+impl Shared {
+    /// Counts `bytes` more held by a storage.
+    fn hold(&self, bytes: usize) {
+        let now = self.used.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        self.peak.fetch_max(now, Ordering::Relaxed);
+    }
 }
 
 /// Tables that depend only on shapes (the offsets of a reduction, the lines of
@@ -211,6 +223,8 @@ impl Cuda {
                 shared: Arc::new(Shared {
                     ordinal,
                     pool: Mutex::new(Pool::new()),
+                    used: AtomicUsize::new(0),
+                    peak: AtomicUsize::new(0),
                 }),
                 stream,
                 functions,
@@ -302,6 +316,27 @@ impl Cuda {
             });
         }
         Ok((free, total))
+    }
+
+    /// The bytes of device memory held by this backend's live tensors (its
+    /// cached tables included), as `torch.cuda.memory_allocated` counts
+    /// them: the buffers kept for reuse are not.
+    pub fn memory_in_use(&self) -> usize {
+        self.inner.shared.used.load(Ordering::Relaxed)
+    }
+
+    /// The most bytes [`Cuda::memory_in_use`] has counted since the backend
+    /// opened or [`Cuda::reset_peak_memory`]: `torch.cuda.max_memory_allocated`.
+    pub fn peak_memory(&self) -> usize {
+        self.inner.shared.peak.load(Ordering::Relaxed)
+    }
+
+    /// Starts the count of [`Cuda::peak_memory`] again from the bytes in use.
+    pub fn reset_peak_memory(&self) {
+        let shared = &self.inner.shared;
+        shared
+            .peak
+            .store(shared.used.load(Ordering::Relaxed), Ordering::Relaxed);
     }
 
     /// Frees the buffers kept for reuse, and the tables kept on the device.
@@ -407,6 +442,7 @@ impl Cuda {
                 });
             }
         }
+        self.inner.shared.hold(buffer.len());
         Ok(CudaStorage {
             buffer: Some(buffer),
             shared: Arc::clone(&self.inner.shared),
@@ -423,6 +459,7 @@ impl Cuda {
                 .copy_from_host(&self.inner.stream, bytes)
                 .map_err(driver("upload"))?;
         }
+        self.inner.shared.hold(buffer.len());
         Ok(CudaStorage {
             buffer: Some(buffer),
             shared: Arc::clone(&self.inner.shared),
@@ -955,6 +992,7 @@ impl CudaStorage {
 impl Drop for CudaStorage {
     fn drop(&mut self) {
         if let Some(buffer) = self.buffer.take() {
+            self.shared.used.fetch_sub(buffer.len(), Ordering::Relaxed);
             match &self.arena {
                 Some(arena) => lock(&arena.free).push(buffer.len(), buffer),
                 None => lock(&self.shared.pool).push(buffer.len(), buffer),

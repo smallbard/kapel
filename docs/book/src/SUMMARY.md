@@ -16,7 +16,8 @@
 - [12. Serving: kapel-serve](12-serving.md)
 - [13. Quantizing and evaluating: kapel-quant and kapel eval](13-quantizing-and-evaluating.md)
 - [14. Kapel from C and Python: kapel-runtime, kapel-capi and kapel-python](14-bindings.md)
-- [15. Safety and security](15-safety-and-security.md)
-- [16. Working on Kapel](16-working-on-kapel.md)
+- [15. Training: kapel-train](15-training.md)
+- [16. Safety and security](16-safety-and-security.md)
+- [17. Working on Kapel](17-working-on-kapel.md)
 
 [Appendix](appendix.md)

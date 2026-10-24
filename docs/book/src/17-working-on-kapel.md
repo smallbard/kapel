@@ -1,8 +1,8 @@
-# 16. Working on Kapel
+# 17. Working on Kapel
 
 This chapter is the practical companion to the rest of the book: how to build and test Kapel, how correctness and speed are verified, what continuous integration checks, and where the project goes next.
 
-## 16.1 Building and testing
+## 17.1 Building and testing
 
 ```
 cargo fmt --all
@@ -19,7 +19,7 @@ cargo test -p kapel-cuda --features cuda
 
 Rebuilding the thread kernels after changing `kernels/src/lib.rs` needs the nightly toolchain pinned in `kernels/rust-toolchain.toml` and `cargo oxide`: run `kernels/build.sh`, and commit the regenerated `crates/kapel-cuda/kernels.ptx`.
 
-## 16.2 The layers of testing
+## 17.2 The layers of testing
 
 | Layer | What it proves | Where |
 | --- | --- | --- |
@@ -34,7 +34,7 @@ The server has a check of its own: `tools/serve/openai_client.py` drives a runni
 
 Parity tests need reference data produced by the Python scripts in `tools/parity/` and stored in `data/parity/`, which is not in git. Without it they print that they were skipped; with `KAPEL_REQUIRE_PARITY=1` they fail instead, which is what a machine that has the data should set.
 
-## 16.3 Measuring performance
+## 17.3 Measuring performance
 
 The rule "every optimization comes with a measurement" is applied with example programs that live next to the code they measure:
 
@@ -45,12 +45,13 @@ The rule "every optimization comes with a measurement" is applied with example p
 | `kapel-tokenizers` | `encode` |
 | `kapel-cli` | `throughput`, `perplexity`, `profile`, `speculative` (decoding alone against each proposer), `bench` (the tracked measures) |
 | `kapel-serve` | `load`: a Poisson load on a server, the latencies of the first token and between tokens |
+| `kapel-train` | `gradients`: the loss, gradients, time and peak memory of one batch, against PyTorch with `tools/train/gradients.py`, and the time of each operation with `--profile`; `steps`: a few steps of AdamW |
 
 Run them with `cargo run --release -p <crate> --example <name>`, on an idle machine. They report the best of several runs after a warm-up, in Gop/s, GB/s or tokens per second. The CUDA examples count operations conventionally, for instance two operations per multiply-add, and only the visible half of causal attention scores.
 
 **Tracked measures.** A few numbers are watched on every change, so that a regression is seen when it lands rather than months later. The example `bench` of `kapel-cli` measures one setup (a model, a device, a type): the speed of a prompt of 512 random tokens computed at once, the speed of decoding 128 tokens of one sequence (greedy, past the end tokens, the first token aside), on request a batch of sequences of 128 + 256 tokens, and the perplexity of eight chunks of wikitext-2 as `llama-perplexity` computes it. Each speed is the best of three runs after one that warms up. `tools/bench/run.sh` runs the fixed list of setups, three on the processor and three on the card, into one JSON report, and `tools/bench/compare.py` compares it with the baseline in `tools/bench/baselines/`, measured on the same machine. A speed more than 10 % below the baseline fails, and so does a perplexity that moved by more than 0.01 %: since results do not depend on threads, a perplexity changes only when the arithmetic does, and the change that did it must say why and update the baseline. The workflow `measures` runs them on the self-hosted machine at every push to `main` and every Monday; the guide publishes the numbers and their method.
 
-## 16.4 Continuous integration
+## 17.4 Continuous integration
 
 | Job | When | What |
 | --- | --- | --- |
@@ -66,7 +67,7 @@ Run them with `cargo run --release -p <crate> --example <name>`, on an idle mach
 
 The GPU job never runs code from forks, because anyone can open a pull request and the runner is a real machine; it also runs with read-only permissions and no stored credentials.
 
-## 16.5 Contributing
+## 17.5 Contributing
 
 The rules of chapter 1 are also the review checklist:
 
@@ -77,9 +78,9 @@ The rules of chapter 1 are also the review checklist:
 - Every `unsafe` block has a `// SAFETY:` comment.
 - Code, documentation and messages are in English, and `CHANGELOG.md` gets a line under *Unreleased*.
 
-## 16.6 The road ahead
+## 17.6 The road ahead
 
-The foundation plan is complete. The first inference step, correct generation, landed on 21 October 2026; the second, the CPU, on 22 October, but for its ARM kernels and a cache of keys and values in int8; and the third, the card, the same day. Its targets were 70 % of vLLM's throughput for batches, met at 90 %, and 90 % of the card's bandwidth for one sequence, missed at 81 %: the products alone reach 92 %, and the rest of a token goes to the small kernels between them. The fourth, the server, landed on 23 October 2026. Its targets were a first token within 500 ms for 99 % of the requests up to 80 % of the maximal throughput, met up to 90 % (83 ms there, 63 ms at 80 %), and OpenAI's official clients working unchanged, met. The validation needs no other server: the load is drawn as Smallem's simulator drew it, and the maximal throughput is the server's own. The fifth, speculative decoding, landed the same day, without its two other parts: tensor parallelism over several GPUs was left out, and the tables kept off the card waits for a model with a memory of n-grams that Kapel can read (the published ones are a mixture of experts far too large for one card, or architectures of their own). Its target, greedy Qwen3 8B 1.5 times faster with Qwen3 0.6B proposing and the same answers, was met at 1.72 times. The sixth, quantizing one's own models, landed the same day. Its targets were perplexities within 0.5 % of lm-evaluation-harness's, met at 0.001 %, and an int4 model that loses less than the same quantization by llama.cpp: by GPTQ, Llama 3.2 1B in Q4\_0 loses 0.41 of perplexity, against 0.74 for llama.cpp with its importance matrix and 1.31 without (chapter 13). The rest of the inference plan and the whole training plan are ahead:
+The foundation plan is complete. The first inference step, correct generation, landed on 21 October 2026; the second, the CPU, on 22 October, but for its ARM kernels and a cache of keys and values in int8; and the third, the card, the same day. Its targets were 70 % of vLLM's throughput for batches, met at 90 %, and 90 % of the card's bandwidth for one sequence, missed at 81 %: the products alone reach 92 %, and the rest of a token goes to the small kernels between them. The fourth, the server, landed on 23 October 2026. Its targets were a first token within 500 ms for 99 % of the requests up to 80 % of the maximal throughput, met up to 90 % (83 ms there, 63 ms at 80 %), and OpenAI's official clients working unchanged, met. The validation needs no other server: the load is drawn as Smallem's simulator drew it, and the maximal throughput is the server's own. The fifth, speculative decoding, landed the same day, without its two other parts: tensor parallelism over several GPUs was left out, and the tables kept off the card waits for a model with a memory of n-grams that Kapel can read (the published ones are a mixture of experts far too large for one card, or architectures of their own). Its target, greedy Qwen3 8B 1.5 times faster with Qwen3 0.6B proposing and the same answers, was met at 1.72 times. The sixth, quantizing one's own models, landed the same day. Its targets were perplexities within 0.5 % of lm-evaluation-harness's, met at 0.001 %, and an int4 model that loses less than the same quantization by llama.cpp: by GPTQ, Llama 3.2 1B in Q4\_0 loses 0.41 of perplexity, against 0.74 for llama.cpp with its importance matrix and 1.31 without (chapter 13). The seventh, being used, landed the same day but for its first releases. The training plan began on 24 October 2026 with its first step, the differentiation; its targets were the gradients of GPT-2 124M equal to PyTorch's within the tolerance of bf16, met (16.9 % from PyTorch's f32 gradients, against 16.6 % for PyTorch's own in bf16), and a peak memory at most 10 % above PyTorch's, met at 47 % of it (chapter 15). The steps of the training plan that need several cards are set aside, as tensor parallelism was in I4. What is ahead:
 
 | Step | Goal | Main pieces |
 | --- | --- | --- |
@@ -89,6 +90,7 @@ The foundation plan is complete. The first inference step, correct generation, l
 | I4 | Faster without changing the distribution | done (chapters 7, 10 and 11): speculative decoding with a smaller model, prompt lookup or a multi-token layer (MiMo); left: tensor parallelism over two to four GPUs, tables kept off the card |
 | I5 | Quantizing one's own models | done (chapter 13): GPTQ and AWQ, writing GGUF, perplexity and tasks of lm-evaluation-harness replayed; left: FineWeb-Edu, a faster AWQ |
 | I6 | Being used | done but for the releases (chapter 14): a C API, a Python module, *The Kapel Guide* (`docs/guide`), measures published and tracked in CI; left: the first releases on crates.io and PyPI, prepared |
-| T0–T6 | Bit-reproducible training | a gradient tape, a single-GPU loop with AdamW and Muon, data pipelines, multi-GPU and multi-node, SFT, LoRA, DPO and GRPO, experiment tools for scaling laws |
+| T0 | Differentiation | done (chapter 15): a tape that keeps only what the gradients need, checkpointing, a fused cross-entropy over a large vocabulary, gradients by rows and AdamW by rows, the decoders of chapter 10 on a tape |
+| T1–T6 | Bit-reproducible training | a single-GPU loop with AdamW and Muon as fast as llm.c, data pipelines, multi-GPU and multi-node (set aside), SFT, LoRA, DPO and GRPO, experiment tools for scaling laws |
 
 The targets are concrete: on the CPU, 90 % of llama.cpp's speed; on the GPU, 70 % of vLLM's; for training, nanoGPT, torchtitan and TRL. Each step has its validation criterion written in the plan, and each will add a chapter's worth of material to this book.

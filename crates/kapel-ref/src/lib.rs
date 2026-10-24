@@ -30,6 +30,7 @@ mod elementwise;
 #[cfg(test)]
 mod golden;
 mod index;
+mod loss;
 mod matmul;
 mod norm;
 pub(crate) mod paged;
@@ -166,6 +167,7 @@ mod tests {
         kapel_ops::ArgMax,
         Softmax,
         kapel_ops::LogSoftmax,
+        kapel_ops::CrossEntropy,
         kapel_ops::LayerNorm,
         kapel_ops::RmsNorm,
         Attention,

@@ -7,6 +7,7 @@
 | Acceptance rate | The share of the proposals of speculative decoding that the model accepts (`SpeculationStats::acceptance`) |
 | Activations in bytes | Quantizing the input of a quantized product too, by blocks of 32, so that the product is a sum of products of bytes; chosen explicitly, as it changes the result a little |
 | AWQ | Activation-aware weight quantization: input channels with large activations scaled up in the weights (and down in the operation before) so that rounding spares them, then blocks clipped (`kapel-quant`, chapter 13) |
+| Activation checkpointing | Keeping only the inputs of a region of the forward pass and computing it again during the backward pass, memory traded for time (`Tape::checkpoint`) |
 | Backend | A type implementing `Run` for every operation of the catalogue: `Reference`, `Cpu` or `Cuda` |
 | Batch | Several sequences computed in the same pass, one row per new token of each, so the weights are read once for all of them (`Model::step_batch`, `kapel_infer::Batch`) |
 | Block (quantized) | The unit a quantized type stores: a scale, sometimes a minimum, and packed codes for 32 or 256 elements |
@@ -19,6 +20,7 @@
 | Contiguous | Stored in row-major order without gaps |
 | Continuous batching | Serving requests that come and go in the same passes: each pass computes a token of every request in progress and pieces of new prompts, a request entering as soon as there is room and leaving as soon as it ends (`kapel_infer::Engine`) |
 | CUDA graph | A pass recorded once and replayed in one launch, its kernels and buffers fixed; the `Record` trait, and `Model::record_step` |
+| Cross-entropy (fused) | The loss of each row of logits, `ln Σ eˣ − x[target]`, with its gradient `softmax − onehot` written by hand, the softmax never formed (`CrossEntropy`); over a large vocabulary, by pieces of rows without the logits whole (`linear_cross_entropy`) |
 | Decoding | Generating one token at a time after the prompt, bound by memory bandwidth |
 | Determinism | The same bits whatever the number of threads, achieved by splitting work by shape |
 | f8 | The 8-bit floats E4M3 and E5M2, used by Kapel for caches of keys and values half the size of bf16 |
@@ -30,6 +32,7 @@
 | `infer` | The validation and shape computation shared by every backend for an operation |
 | `Isa` | A proof that the processor has the instructions a code path uses |
 | llguidance | The library of structured outputs that compiles constraints into a parser over the bytes of the tokens, and gives the set of tokens allowed next |
+| Leaf | A value on a tape whose gradient is wanted: a parameter (`Tape::leaf`); a constant receives none |
 | Log-likelihood | The sum of the logarithms of the probabilities of a continuation's tokens after a context; what `kapel eval` ranks answers by (`Scorer`) |
 | Micro-kernel | The innermost routine of the matrix product, holding a block of C in registers |
 | Multi-token prediction | A layer trained with the model to predict the token after the next from the model's hidden state and the next token (MiMo, DeepSeek-V3); a proposer that costs one block (`Model::multi_token`) |
@@ -49,10 +52,12 @@
 | Server-sent events | The streaming format of OpenAI's API over HTTP: one `data:` line per chunk of the answer, then `data: [DONE]` |
 | Site | A group of projections that read one input (`Attention`, `Output`, `Mlp`, `Down`), as `Model::block` shows it |
 | Softcap | A smooth bound on scores or logits, `cap · tanh(x / cap)`, used by Gemma 2 |
+| Sparse gradient | The gradient of a table of which few rows were read, kept as those rows and what to add to them (`Grad::Rows`), and the AdamW that updates only them |
 | Speculative decoding | A proposer guesses several tokens, the model checks them in one pass, accepting each by the rule that keeps its distribution exactly (`Pipeline::speculate`) |
 | Stable ABI (abi3) | CPython's interface that does not change between versions: one wheel of the Python module serves every Python from 3.9 |
 | Stride | The distance in the buffer between two consecutive elements of a dimension |
 | Suspension (preemption) | Taking the pages of the request admitted last when the cache runs out, to compute its tokens again later |
+| Tape | The record of a computation, run backwards to get the gradients of a loss (`kapel_train::Tape`) |
 | Thread kernel / tile kernel | A CUDA kernel with one thread per element, written for cuda-oxide / a kernel over tiles of a matrix, written for cutile-rs |
 | Throughput | Tokens generated per second for a batch of requests, compared with vLLM's `vllm bench throughput` |
 | Time to first token | From the arrival of a request at the server to its first token: what a user waits before the answer starts |
@@ -94,6 +99,10 @@
 | Block-by-block passes | `crates/kapel-models/src/model.rs` (`embed`, `block`, `Site`) |
 | Writing GGUF | `crates/kapel-hub/src/gguf.rs` (`write`), `crates/kapel-models/src/gguf.rs` (`to_gguf`), `crates/kapel-infer/src/gguf.rs` (`save_gguf`) |
 | Evaluation | `crates/kapel-infer/src/score.rs`, `crates/kapel-cli/src/eval.rs`, `tools/eval/` |
+| The tape, losses, optimizers | `crates/kapel-train/src/{tape,loss,optim}.rs`, `crates/kapel-train/tests/{tape,optim}.rs` |
+| Decoders on a tape | `crates/kapel-train/src/model.rs`, `crates/kapel-train/tests/{model,cuda}.rs` |
+| The fused cross-entropy | `crates/kapel-ops/src/loss.rs`, `crates/kapel-{ref,cpu}/src/loss.rs`, `crates/kapel-cuda/src/ops.rs`, `kernels/src/lib.rs` (`cross_entropy_rows`) |
+| Training measured against PyTorch, the time of each operation | `crates/kapel-train/examples/{gradients,steps}.rs`, `tools/train/gradients.py`, `crates/kapel-train/src/profile.rs` |
 | One model type for the bindings | `crates/kapel-runtime/src/lib.rs` |
 | The C API | `crates/kapel-capi/include/kapel.h`, `crates/kapel-capi/src/lib.rs`, `crates/kapel-capi/examples/c/` |
 | The Python module | `crates/kapel-python/src/lib.rs`, `crates/kapel-python/kapel.pyi`, `crates/kapel-python/tests/` |

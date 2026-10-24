@@ -2,7 +2,7 @@
 
 This book takes you from the shape of Kapel as a whole down to the loops inside its kernels. It is written for people who will read, change or extend the code: contributors, reviewers, and engineers who want to know exactly what their model runs on.
 
-Kapel is a Rust library for running and, later, training transformer models. Its distinctive trait is discipline rather than size: every fast path is checked against a slow, exact reference; results do not depend on the number of threads; and no input, however malformed, should make it panic. Most chapters show how one of those promises is kept in code.
+Kapel is a Rust library for running and training transformer models. Its distinctive trait is discipline rather than size: every fast path is checked against a slow, exact reference; results do not depend on the number of threads; and no input, however malformed, should make it panic. Most chapters show how one of those promises is kept in code.
 
 **How the book is organised.**
 
@@ -24,6 +24,7 @@ Kapel is a Rust library for running and, later, training transformer models. Its
 - To serve models, read chapters 11 and 12.
 - To quantize or evaluate models, read chapters 10 and 13.
 - To call Kapel from another language, read chapters 11 and 14.
-- To review a change, read chapter 15 and the testing part of chapter 16.
+- To train models, read chapters 4, 10 and 15.
+- To review a change, read chapter 16 and the testing part of chapter 17.
 
 **Conventions.** Shapes are written in brackets, outermost first: `[B, H, T, D]` is batch, heads, positions, head width. File references are relative to the repository root, such as `crates/kapel-ops/src/lib.rs`. Code identifiers are in `monospace`. The book describes the repository as of 23 October 2026; where code and book disagree, the code wins, and the book should be fixed.

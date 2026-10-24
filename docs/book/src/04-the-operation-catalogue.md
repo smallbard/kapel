@@ -1,6 +1,6 @@
 # 4. The operation catalogue: kapel-ops
 
-`kapel-ops` is the contract of the whole library. It lists the twenty-two operations a transformer needs, gives each an exact mathematical definition, and checks every call in one place, so that every backend accepts and rejects the same calls with the same errors. It computes nothing itself.
+`kapel-ops` is the contract of the whole library. It lists the twenty-three operations a transformer needs, to run and to train, gives each an exact mathematical definition, and checks every call in one place, so that every backend accepts and rejects the same calls with the same errors. It computes nothing itself.
 
 ## 4.1 The traits
 
@@ -36,7 +36,7 @@ The rule is that every `forward` starts with `op.infer(inputs)?` and every `back
 - `Write` writes into a tensor in place: `zeros` makes a tensor to be written, `write_rows(table, index, rows)` writes `rows[i]` into row `index[i]` of `table`, converted to the table's type, and `copy_from_host` fills a tensor of the backend from a host tensor of the same shape and type. A tensor is written only through its only handle (`Tensor::storage_mut`), so no clone or view sees the change.
 - `Record` records a pass once and replays it. `record` takes a closure that queues the pass and returns a `Recording`, whose `replay` runs it again on the current contents of the tensors it read and rewrites its `output`. A backend that computes each operation when it is called answers `records() == false` and `record` gives `None`: the pass is simply run there. On the card, a recording is a CUDA graph (chapter 7).
 
-`Backend` is the supertrait of `Write`, `Record` and all twenty-two `Run` implementations, with a blanket implementation, so any type that implements them all is a backend:
+`Backend` is the supertrait of `Write`, `Record` and all twenty-three `Run` implementations, with a blanket implementation, so any type that implements them all is a backend:
 
 ```rust
 let y = backend.forward(&Matmul, &[&x, &w.transpose(0, 1)?])?;   // y = x · wᵀ, w read in place
@@ -62,6 +62,7 @@ The shared checks are small private functions: `arity`, `float`, `indices` (the 
 | `Max` | x → reduced | along one dim; the gradient goes to the first maximum | x |
 | `ArgMax` | x → reduced, `U32` | the position of the maximum along one dim, the first on a tie; NaN is never the maximum | none |
 | `Softmax`, `LogSoftmax` | x → same | along `dim`; log-softmax computed without forming the softmax | x |
+| `CrossEntropy` | x \[N, V\], targets \[N\] → \[N\], f32 | ln Σⱼ e^(x\[n, j\]) − x\[n, t\[n\]\], 0 for the target `IGNORE` (all bits set); the softmax never formed (chapter 15) | x |
 | `LayerNorm` | x \[…, C\], weight \[C\], bias \[C\] | (x − μ) / √(σ² + eps) · w + b, biased variance | all |
 | `RmsNorm` | x \[…, C\], weight \[C\] | x / √(mean x² + eps) · (offset + w); offset 1 for Gemma | all |
 | `Attention` | q, k, v, optional mask | scaled dot-product, grouped heads, causal, window, softcap | q, k, v |

@@ -280,10 +280,13 @@ impl Model {
     pub fn load(checkpoint: &Checkpoint) -> Result<Self> {
         let raw_config = checkpoint.config()?;
         let config = Config::from_json(&raw_config)?;
-        let weights = checkpoint
+        let mut weights: BTreeMap<String, Tensor> = checkpoint
             .names()
             .map(|name| Ok((name.to_string(), checkpoint.tensor(name)?)))
             .collect::<std::result::Result<_, kapel_hub::HubError>>()?;
+        if config.block == Block::Gpt2 {
+            weights = gpt2_names(weights);
+        }
         Ok(Self {
             config,
             raw_config,
@@ -307,6 +310,38 @@ impl Model {
     /// The configuration.
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// A model of the configuration `config.json` holds, `raw_config`, and
+    /// of `weights`, by their names in the checkpoint: a model made or
+    /// trained in memory. The weights are not checked against the
+    /// configuration.
+    ///
+    /// # Errors
+    ///
+    /// For a configuration [`Config::from_json`] refuses.
+    pub fn new(raw_config: serde_json::Value, weights: BTreeMap<String, Tensor>) -> Result<Self> {
+        let config = Config::from_json(&raw_config)?;
+        Ok(Self::from_parts(config, raw_config, weights))
+    }
+
+    /// The same configuration with other weights: a model trained from
+    /// this one.
+    ///
+    /// # Errors
+    ///
+    /// Never for now; kept for the checks of the weights to come.
+    pub fn with_weights(&self, weights: BTreeMap<String, Tensor>) -> Result<Self> {
+        Ok(Self::from_parts(
+            self.config.clone(),
+            self.raw_config.clone(),
+            weights,
+        ))
+    }
+
+    /// `config.json` as it was read.
+    pub fn raw_config(&self) -> &serde_json::Value {
+        &self.raw_config
     }
 
     /// The model with its weights on `backend`'s device, ready for
@@ -1527,6 +1562,24 @@ impl Model {
     }
 }
 
+/// GPT-2's weights under the names of `GPT2LMHeadModel`: the first
+/// checkpoints (`openai-community/gpt2`) name them after `GPT2Model`,
+/// without `transformer.`, and keep the causal masks of the attention
+/// (`attn.bias`, `attn.masked_bias`), which are not weights.
+fn gpt2_names(weights: BTreeMap<String, Tensor>) -> BTreeMap<String, Tensor> {
+    weights
+        .into_iter()
+        .filter(|(name, _)| !name.ends_with(".attn.bias") && !name.ends_with(".attn.masked_bias"))
+        .map(|(name, w)| {
+            if name.starts_with("transformer.") || name.starts_with("lm_head.") {
+                (name, w)
+            } else {
+                (format!("transformer.{name}"), w)
+            }
+        })
+        .collect()
+}
+
 /// `value` rounded to `dtype`, as a float of that type holds it.
 /// A weight `[N, K]` quantized to `dtype`, by pieces of rows on every core.
 fn quantized(w: &Tensor, dtype: DType) -> kapel_core::Result<Tensor> {
@@ -1573,6 +1626,34 @@ fn rounded(dtype: DType, value: f64) -> Result<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_first_gpt2_checkpoints_get_the_names_of_gpt2_lm_head_model() {
+        let w = || Tensor::zeros(DType::F32, &[1]).unwrap();
+        let weights: BTreeMap<String, Tensor> = [
+            "wte.weight",
+            "h.0.attn.bias",
+            "h.0.attn.masked_bias",
+            "h.0.attn.c_attn.bias",
+            "h.0.attn.c_proj.weight",
+            "transformer.ln_f.weight",
+            "lm_head.weight",
+        ]
+        .into_iter()
+        .map(|n| (n.to_string(), w()))
+        .collect();
+        let names: Vec<String> = gpt2_names(weights).into_keys().collect();
+        assert_eq!(
+            names,
+            [
+                "lm_head.weight",
+                "transformer.h.0.attn.c_attn.bias",
+                "transformer.h.0.attn.c_proj.weight",
+                "transformer.ln_f.weight",
+                "transformer.wte.weight",
+            ]
+        );
+    }
 
     /// `resave d d`: a model saved over the directory it was loaded from.
     #[test]

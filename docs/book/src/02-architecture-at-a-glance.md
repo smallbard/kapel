@@ -26,7 +26,7 @@ Models sit above the catalogue, never above a particular backend: swapping the r
 | Bindings | `kapel-runtime` | A model on whichever device, behind one type | core, ops, cpu, cuda, hub, models, tokenizers, infer, serve |
 |  | `kapel-capi` | The C library `libkapel` and its header `kapel.h` | runtime |
 |  | `kapel-python` | The Python module `kapel` (PyO3) | runtime |
-|  | `kapel-train` | A placeholder for training | none yet |
+|  | `kapel-train` | Training: the tape of gradients, losses, optimizers, the decoders on a tape (chapter 15) | core, ops, hub, models, cpu (cuda with its feature) |
 
 Outside the workspace, `kernels/` holds the simple CUDA kernels written in Rust for the nightly compiler. They are compiled once to PTX and the result, `crates/kapel-cuda/kernels.ptx`, is checked in, so the published crates build on stable Rust. `fuzz/` holds the fuzzing targets, `tools/parity/` the Python scripts that produce reference outputs from `transformers`, and `tools/eval/` the script that exports the tasks of lm-evaluation-harness for `kapel eval`.
 
@@ -34,7 +34,7 @@ Two dependency choices are deliberate. `kapel-tokenizers` depends on no other Ka
 
 ## One trait, three backends
 
-The central idea is the split between *what* an operation computes and *how*. `kapel-ops` defines each operation as a small struct with a documented mathematical definition and an `infer` method that checks inputs and computes the output's shape and type. A backend implements `Run<Op>` for each operation: a `forward` and a `backward`. The trait `Backend` is simply the set of all twenty-two `Run` implementations, plus two traits for generation: `Write`, which writes rows into a cache in place, and `Record`, which records a pass once and replays it (a CUDA graph on the card).
+The central idea is the split between *what* an operation computes and *how*. `kapel-ops` defines each operation as a small struct with a documented mathematical definition and an `infer` method that checks inputs and computes the output's shape and type. A backend implements `Run<Op>` for each operation: a `forward` and a `backward`. The trait `Backend` is simply the set of all twenty-three `Run` implementations, plus two traits for generation: `Write`, which writes rows into a cache in place, and `Record`, which records a pass once and replays it (a CUDA graph on the card).
 
 Because every backend calls the same `infer` first, every backend accepts and rejects the same calls with the same errors. Because the reference defines the numbers, the CPU and CUDA backends can be tested operation by operation against it, forward and backward, with tolerances that depend only on the data type.
 
