@@ -121,6 +121,7 @@ mod kernels {
         k: &Tensor<E, { [-1, -1, -1, -1] }>,
         v: &Tensor<E, { [-1, -1, -1, -1] }>,
         mask: &Tensor<f32, { [-1, -1, -1, -1] }>,
+        docs: &Tensor<i32, { [-1, -1] }>,
         scale: f32,
         softcap: f32,
         heads: i32,
@@ -154,7 +155,19 @@ mod kernels {
         let mut acc: Tile<f32, { [BM, DV] }> = constant(0.0f32, shape![BM, DV]);
         let first: i32 = tk - tq + qi * BM;
         let tiles: (i32, i32, i32, i32) = key_tiles::<BM, BN>(first, tk, ahead, window);
-        let start: i32 = tiles.0;
+        let mut start: i32 = tiles.0;
+        let docs_q: Tile<i32, { [BM, 1] }> = docs
+            .partition(shape![1, BM])
+            .load([b * (MASKED / 2i32), qi * (MASKED / 2i32)])
+            .reshape(shape![BM, 1]);
+        let docs_k = docs.partition(shape![1, BN]);
+        if MASKED == 2i32 {
+            // No query of the tile sees the keys before its first query's
+            // document.
+            let d: Tile<i32, { [1, 1] }> = docs.partition(shape![1, 1]).load([b, first]);
+            let d: i32 = tile_to_scalar(d.reshape(shape![]));
+            start = max(start, d / BN);
+        }
         let end: i32 = tiles.1;
         let full_lo: i32 = tiles.2;
         let full_hi: i32 = tiles.3;
@@ -172,6 +185,15 @@ mod kernels {
                 let m: Tile<f32, { [BM, BN] }> =
                     mask_part.load([b, h, qi, jt]).reshape(shape![BM, BN]);
                 s = s + m;
+            }
+            if MASKED == 2i32 {
+                let dk: Tile<i32, { [1, BN] }> = docs_k.load([b, jt]).reshape(shape![1, BN]);
+                let same: Tile<bool, { [BM, BN] }> = eq_tile(
+                    docs_q.broadcast(shape![BM, BN]),
+                    dk.broadcast(shape![BM, BN]),
+                );
+                let hidden: Tile<f32, { [BM, BN] }> = constant(f32::NEG_INFINITY, shape![BM, BN]);
+                s = select(same, s, hidden);
             }
             if jt < full_lo || jt >= full_hi || queries_end > tq {
                 s = hide(
@@ -210,7 +232,8 @@ mod kernels {
         out.store(y.reshape(shape![1, BM, DV]));
         let above: Tile<f32, { [BM, 1] }> = constant(f32::INFINITY, shape![BM, 1]);
         let mut first_stat: Tile<f32, { [BM, 1] }> = select(some, m_i, above);
-        if MASKED == 0i32 {
+        // Documents hide with −∞ only: the statistic of the unmasked case.
+        if MASKED == 0i32 || MASKED == 2i32 {
             first_stat = (first_stat + log(l_safe)) * log2e_col;
         }
         rowmax.store(first_stat.reshape(shape![1, BM, 1]));
@@ -268,6 +291,7 @@ mod kernels {
         k: &Tensor<E, { [-1, -1, -1, -1] }>,
         v: &Tensor<E, { [-1, -1, -1, -1] }>,
         mask: &Tensor<f32, { [-1, -1, -1, -1] }>,
+        docs: &Tensor<i32, { [-1, -1] }>,
         g: &Tensor<E, { [-1, -1, -1, -1] }>,
         rowmax: &Tensor<f32, { [-1, -1, -1] }>,
         log_sum: &Tensor<f32, { [-1, -1, -1] }>,
@@ -314,7 +338,19 @@ mod kernels {
         let mut acc: Tile<f32, { [BM, D] }> = constant(0.0f32, shape![BM, D]);
         let first: i32 = tk - tq + qi * BM;
         let tiles: (i32, i32, i32, i32) = key_tiles::<BM, BN>(first, tk, ahead, window);
-        let start: i32 = tiles.0;
+        let mut start: i32 = tiles.0;
+        let docs_q: Tile<i32, { [BM, 1] }> = docs
+            .partition(shape![1, BM])
+            .load([b * (MASKED / 2i32), qi * (MASKED / 2i32)])
+            .reshape(shape![BM, 1]);
+        let docs_k = docs.partition(shape![1, BN]);
+        if MASKED == 2i32 {
+            // No query of the tile sees the keys before its first query's
+            // document.
+            let d: Tile<i32, { [1, 1] }> = docs.partition(shape![1, 1]).load([b, first]);
+            let d: i32 = tile_to_scalar(d.reshape(shape![]));
+            start = max(start, d / BN);
+        }
         let end: i32 = tiles.1;
         let full_lo: i32 = tiles.2;
         let full_hi: i32 = tiles.3;
@@ -336,6 +372,15 @@ mod kernels {
                 let m: Tile<f32, { [BM, BN] }> =
                     mask_part.load([b, h, qi, jt]).reshape(shape![BM, BN]);
                 s = s + m;
+            }
+            if MASKED == 2i32 {
+                let dk: Tile<i32, { [1, BN] }> = docs_k.load([b, jt]).reshape(shape![1, BN]);
+                let same: Tile<bool, { [BM, BN] }> = eq_tile(
+                    docs_q.broadcast(shape![BM, BN]),
+                    dk.broadcast(shape![BM, BN]),
+                );
+                let hidden: Tile<f32, { [BM, BN] }> = constant(f32::NEG_INFINITY, shape![BM, BN]);
+                s = select(same, s, hidden);
             }
             if jt < full_lo || jt >= full_hi || queries_end > tq {
                 s = hide(
@@ -387,6 +432,7 @@ mod kernels {
         k: &Tensor<E, { [-1, -1, -1, -1] }>,
         v: &Tensor<E, { [-1, -1, -1, -1] }>,
         mask: &Tensor<f32, { [-1, -1, -1, -1] }>,
+        docs: &Tensor<i32, { [-1, -1] }>,
         g: &Tensor<E, { [-1, -1, -1, -1] }>,
         rowmax: &Tensor<f32, { [-1, -1, -1] }>,
         log_sum: &Tensor<f32, { [-1, -1, -1] }>,
@@ -438,60 +484,88 @@ mod kernels {
         let widest: i32 = max(-1i32, window - shift - BM + kj * BN);
         let full_hi: i32 = min((widest + BM) / BM, tq / BM);
         let keys_end: i32 = (kj + 1i32) * BN;
+        let docs_q = docs.partition(shape![1, BM]);
+        let docs_one = docs.partition(shape![1, 1]);
+        let docs_k: Tile<i32, { [BN, 1] }> = docs
+            .partition(shape![1, BN])
+            .load([b * (MASKED / 2i32), kj * (MASKED / 2i32)])
+            .reshape(shape![BN, 1]);
         for gh in 0i32..group {
             let h: i32 = kv * group + gh;
             let bh: i32 = b * heads + h;
             for qi in start..end {
-                let tile_q: Tile<E, { [BM, D] }> =
-                    q_part.load([b, h, qi, 0i32]).reshape(shape![BM, D]);
-                // Rows are keys, columns queries.
-                let raw: Tile<f32, { [BN, BM] }> = mma(tile_k, tile_q.transpose(), zeros);
-                let mut s: Tile<f32, { [BN, BM] }> = raw * scale_tile;
-                let mut ds_scale: Tile<f32, { [BN, BM] }> = scale_tile;
-                if CAPPED == 1i32 {
-                    let cap: Tile<f32, { [BN, BM] }> = broadcast_scalar(softcap, shape![BN, BM]);
-                    let t: Tile<f32, { [BN, BM] }> = tanh(true_div(s, cap));
-                    s = cap * t;
-                    let ones: Tile<f32, { [BN, BM] }> = constant(1.0f32, shape![BN, BM]);
-                    ds_scale = scale_tile * (ones - t * t);
+                // With documents, a query tile whose first query's document
+                // starts after these keys sees none of them.
+                let mut seen: bool = true;
+                if MASKED == 2i32 {
+                    let d: Tile<i32, { [1, 1] }> = docs_one.load([b, shift + qi * BM]);
+                    let d: i32 = tile_to_scalar(d.reshape(shape![]));
+                    seen = d < keys_end;
                 }
-                if MASKED == 1i32 {
-                    let m: Tile<f32, { [BM, BN] }> =
-                        mask_part.load([b, h, qi, kj]).reshape(shape![BM, BN]);
-                    s = s + m.transpose();
+                if seen {
+                    let tile_q: Tile<E, { [BM, D] }> =
+                        q_part.load([b, h, qi, 0i32]).reshape(shape![BM, D]);
+                    // Rows are keys, columns queries.
+                    let raw: Tile<f32, { [BN, BM] }> = mma(tile_k, tile_q.transpose(), zeros);
+                    let mut s: Tile<f32, { [BN, BM] }> = raw * scale_tile;
+                    let mut ds_scale: Tile<f32, { [BN, BM] }> = scale_tile;
+                    if CAPPED == 1i32 {
+                        let cap: Tile<f32, { [BN, BM] }> =
+                            broadcast_scalar(softcap, shape![BN, BM]);
+                        let t: Tile<f32, { [BN, BM] }> = tanh(true_div(s, cap));
+                        s = cap * t;
+                        let ones: Tile<f32, { [BN, BM] }> = constant(1.0f32, shape![BN, BM]);
+                        ds_scale = scale_tile * (ones - t * t);
+                    }
+                    if MASKED == 1i32 {
+                        let m: Tile<f32, { [BM, BN] }> =
+                            mask_part.load([b, h, qi, kj]).reshape(shape![BM, BN]);
+                        s = s + m.transpose();
+                    }
+                    if MASKED == 2i32 {
+                        let dq: Tile<i32, { [1, BM] }> =
+                            docs_q.load([b, qi]).reshape(shape![1, BM]);
+                        let same: Tile<bool, { [BN, BM] }> = eq_tile(
+                            docs_k.broadcast(shape![BN, BM]),
+                            dq.broadcast(shape![BN, BM]),
+                        );
+                        let hidden: Tile<f32, { [BN, BM] }> =
+                            constant(f32::NEG_INFINITY, shape![BN, BM]);
+                        s = select(same, s, hidden);
+                    }
+                    if qi < full_lo || qi >= full_hi || keys_end > tk {
+                        s = hide(
+                            s,
+                            column_index::<BN, BM>(shift + qi * BM),
+                            row_index::<BN, BM>(kj * BN),
+                            tk,
+                            ahead,
+                            window,
+                        );
+                    }
+                    let tile_m: Tile<f32, { [1, BM] }> =
+                        m_part.load([bh, 0i32, qi]).reshape(shape![1, BM]);
+                    let mut e: Tile<f32, { [BN, BM] }> =
+                        s * log2e_tile - tile_m.broadcast(shape![BN, BM]);
+                    if MASKED == 1i32 {
+                        let tile_l2: Tile<f32, { [1, BM] }> =
+                            l2_part.load([bh, 0i32, qi]).reshape(shape![1, BM]);
+                        e = (s - tile_m.broadcast(shape![BN, BM])) * log2e_tile
+                            - tile_l2.broadcast(shape![BN, BM]);
+                    }
+                    let w: Tile<f32, { [BN, BM] }> = exp2(e, ftz::Enabled);
+                    let tile_g: Tile<E, { [BM, DV] }> =
+                        g_part.load([b, h, qi, 0i32]).reshape(shape![BM, DV]);
+                    let we: Tile<E, { [BN, BM] }> = convert_tile(w);
+                    acc_v = mma(we, tile_g, acc_v);
+                    let dw: Tile<f32, { [BN, BM] }> = mma(tile_v, tile_g.transpose(), zeros);
+                    let tile_delta: Tile<f32, { [1, BM] }> =
+                        delta_part.load([bh, 0i32, qi]).reshape(shape![1, BM]);
+                    let ds: Tile<f32, { [BN, BM] }> =
+                        w * (dw - tile_delta.broadcast(shape![BN, BM])) * ds_scale;
+                    let ds: Tile<E, { [BN, BM] }> = convert_tile(ds);
+                    acc_k = mma(ds, tile_q, acc_k);
                 }
-                if qi < full_lo || qi >= full_hi || keys_end > tk {
-                    s = hide(
-                        s,
-                        column_index::<BN, BM>(shift + qi * BM),
-                        row_index::<BN, BM>(kj * BN),
-                        tk,
-                        ahead,
-                        window,
-                    );
-                }
-                let tile_m: Tile<f32, { [1, BM] }> =
-                    m_part.load([bh, 0i32, qi]).reshape(shape![1, BM]);
-                let mut e: Tile<f32, { [BN, BM] }> =
-                    s * log2e_tile - tile_m.broadcast(shape![BN, BM]);
-                if MASKED == 1i32 {
-                    let tile_l2: Tile<f32, { [1, BM] }> =
-                        l2_part.load([bh, 0i32, qi]).reshape(shape![1, BM]);
-                    e = (s - tile_m.broadcast(shape![BN, BM])) * log2e_tile
-                        - tile_l2.broadcast(shape![BN, BM]);
-                }
-                let w: Tile<f32, { [BN, BM] }> = exp2(e, ftz::Enabled);
-                let tile_g: Tile<E, { [BM, DV] }> =
-                    g_part.load([b, h, qi, 0i32]).reshape(shape![BM, DV]);
-                let we: Tile<E, { [BN, BM] }> = convert_tile(w);
-                acc_v = mma(we, tile_g, acc_v);
-                let dw: Tile<f32, { [BN, BM] }> = mma(tile_v, tile_g.transpose(), zeros);
-                let tile_delta: Tile<f32, { [1, BM] }> =
-                    delta_part.load([bh, 0i32, qi]).reshape(shape![1, BM]);
-                let ds: Tile<f32, { [BN, BM] }> =
-                    w * (dw - tile_delta.broadcast(shape![BN, BM])) * ds_scale;
-                let ds: Tile<E, { [BN, BM] }> = convert_tile(ds);
-                acc_k = mma(ds, tile_q, acc_k);
             }
         }
         let out_k: Tile<E, { [BN, D] }> = convert_tile(acc_k);
@@ -662,14 +736,18 @@ struct Prepared {
     softcap: f32,
     ahead: i32,
     window: i32,
-    masked: bool,
+    /// 0 without a mask, 1 with an additive mask, 2 with documents.
+    masked: usize,
     tiles: Tiles,
     q: Heads,
     k: Heads,
     v: Heads,
     mask: Heads,
-    // Keeps the mask's storage alive when it is a converted copy.
+    docs: Heads,
+    // Keep the storages of the mask and the documents alive when they are
+    // converted copies or placeholders.
     _mask: Tensor,
+    _docs: Tensor,
 }
 
 impl Prepared {
@@ -680,7 +758,7 @@ impl Prepared {
             bn,
             t.d,
             t.dv,
-            usize::from(self.masked),
+            self.masked,
             usize::from(self.softcap > 0.0),
         ]
         .iter()
@@ -753,7 +831,13 @@ impl Cuda {
         };
         let [b, hq, tq, d] = [q.shape()[0], q.shape()[1], q.shape()[2], q.shape()[3]];
         let (hkv, tk, dv) = (k.shape()[1], k.shape()[2], v.shape()[3]);
+        let documents = inputs.get(3).filter(|m| kapel_ops::is_documents(m));
+        let docs = match documents {
+            Some(d) => (*d).clone(),
+            None => self.upload(&Tensor::from_slice(&[0i32], &[1, 1])?)?,
+        };
         let mask = match inputs.get(3) {
+            _ if documents.is_some() => self.filled(Attention::NAME, 0.0, &[1, 1, 1, 1])?,
             Some(m) if m.dtype() == DType::F32 => (*m).clone(),
             Some(m) => {
                 let values: Vec<f32> = self
@@ -766,8 +850,12 @@ impl Cuda {
             }
             None => self.filled(Attention::NAME, 0.0, &[1, 1, 1, 1])?,
         };
-        let masked = inputs.len() == 4;
-        let mask_layout = if masked {
+        let masked = match (inputs.len(), documents) {
+            (4, Some(_)) => 2,
+            (4, None) => 1,
+            _ => 0,
+        };
+        let mask_layout = if masked == 1 {
             mask.layout().broadcast_to(&[b, hq, tq, tk])?
         } else {
             mask.layout().clone()
@@ -787,7 +875,9 @@ impl Cuda {
             k: self.heads(k, k.layout())?,
             v: self.heads(v, v.layout())?,
             mask: self.heads(&mask, &mask_layout)?,
+            docs: self.heads(&docs, docs.layout())?,
             _mask: mask,
+            _docs: docs,
         })
     }
 
@@ -869,6 +959,7 @@ impl Cuda {
                 Arc::new(borrow::<T>(o, &a.k)),
                 Arc::new(borrow::<T>(o, &a.v)),
                 Arc::new(borrow::<f32>(o, &a.mask)),
+                Arc::new(borrow::<i32>(o, &a.docs)),
                 a.scale,
                 a.softcap,
                 int(hq)?,
@@ -982,6 +1073,7 @@ impl Cuda {
                 Arc::new(borrow::<T>(o, &a.k)),
                 Arc::new(borrow::<T>(o, &a.v)),
                 Arc::new(borrow::<f32>(o, &a.mask)),
+                Arc::new(borrow::<i32>(o, &a.docs)),
                 Arc::new(borrow::<T>(o, g)),
                 Arc::new(borrow::<f32>(o, m)),
                 Arc::new(borrow::<f32>(o, l2)),
@@ -1011,6 +1103,7 @@ impl Cuda {
                 Arc::new(borrow::<T>(o, &a.k)),
                 Arc::new(borrow::<T>(o, &a.v)),
                 Arc::new(borrow::<f32>(o, &a.mask)),
+                Arc::new(borrow::<i32>(o, &a.docs)),
                 Arc::new(borrow::<T>(o, g)),
                 Arc::new(borrow::<f32>(o, m)),
                 Arc::new(borrow::<f32>(o, l2)),

@@ -33,6 +33,7 @@ fn run<B: Compute>(
     config: &Config,
     params: &Parameters,
     options: &Options,
+    segments: Option<&[u32]>,
 ) -> (f64, BTreeMap<String, Vec<f64>>) {
     let params = params.to(&backend, DType::F32).unwrap();
     let decoder = Decoder::new(config.clone()).unwrap();
@@ -45,6 +46,7 @@ fn run<B: Compute>(
         ids: &ids,
         targets: &targets,
         rows: 3,
+        segments,
     };
     let loss = decoder.loss(&leaves, &batch, options).unwrap();
     let value = backend
@@ -75,24 +77,28 @@ fn the_card_gives_the_gradients_of_the_processor() {
             chunk: 40,
             ..Options::default()
         };
-        let (a, ga) = run(kapel_cpu::Cpu::new(), &config, &params, &options);
-        let (b, gb) = run(cuda.clone(), &config, &params, &options);
-        assert!((a - b).abs() < 1e-5 * a.abs(), "{a} and {b}");
-        assert_eq!(ga.len(), gb.len());
-        for (name, x) in &ga {
-            let y = &gb[name];
-            let norm = x.iter().map(|v| v * v).sum::<f64>().sqrt();
-            let diff = x
-                .iter()
-                .zip(y)
-                .map(|(p, q)| (p - q).powi(2))
-                .sum::<f64>()
-                .sqrt();
-            assert!(
-                diff <= 1e-4 * norm.max(1e-6),
-                "{}: {name}: {diff} of {norm}",
-                config.model_type
-            );
+        // Rows of 32 tokens, in documents of 10 that start anywhere.
+        let documents: Vec<u32> = (0..96).map(|i| i / 10).collect();
+        for segments in [None, Some(documents.as_slice())] {
+            let (a, ga) = run(kapel_cpu::Cpu::new(), &config, &params, &options, segments);
+            let (b, gb) = run(cuda.clone(), &config, &params, &options, segments);
+            assert!((a - b).abs() < 1e-5 * a.abs(), "{a} and {b}");
+            assert_eq!(ga.len(), gb.len());
+            for (name, x) in &ga {
+                let y = &gb[name];
+                let norm = x.iter().map(|v| v * v).sum::<f64>().sqrt();
+                let diff = x
+                    .iter()
+                    .zip(y)
+                    .map(|(p, q)| (p - q).powi(2))
+                    .sum::<f64>()
+                    .sqrt();
+                assert!(
+                    diff <= 1e-4 * norm.max(1e-6),
+                    "{}: {name}: {diff} of {norm}",
+                    config.model_type
+                );
+            }
         }
     }
 }
@@ -107,7 +113,7 @@ fn checkpointing_on_the_card_changes_no_bit() {
             chunk: 40,
             ..Options::default()
         };
-        let plain = run(cuda.clone(), &config, &params, &options);
+        let plain = run(cuda.clone(), &config, &params, &options, None);
         let saved = run(
             cuda.clone(),
             &config,
@@ -116,6 +122,7 @@ fn checkpointing_on_the_card_changes_no_bit() {
                 checkpoint: true,
                 ..options
             },
+            None,
         );
         assert_eq!(plain, saved);
     }
@@ -131,9 +138,9 @@ fn attentions_kept_for_their_backward_change_no_bit() {
         chunk: 40,
         ..Options::default()
     };
-    let computed = run(cuda.clone(), config, &params, &options);
+    let computed = run(cuda.clone(), config, &params, &options, None);
     cuda.keep_attention_for_backward(true);
-    let kept = run(cuda.clone(), config, &params, &options);
+    let kept = run(cuda.clone(), config, &params, &options, None);
     cuda.keep_attention_for_backward(false);
     assert_eq!(computed, kept);
 }

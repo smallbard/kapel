@@ -246,6 +246,24 @@ changelog says how.
   each attention's output and statistics for its backward pass.
 - `recipes/gpt2-124m`: GPT-2 124M on FineWeb with llm.c's settings.
 - The examples `training_gemm` and `elementwise` of `kapel-cuda`.
+- `kapel prepare`: Parquet, JSONL and text files tokenized on every core into
+  shards of llm.c's format with the index of their documents and a manifest
+  (`kapel_train::prepare`, `kapel_train::dataset`); exact duplicates and empty
+  documents left out, one document in `n` set aside for validation; the same
+  files whatever the number of threads.
+- `kapel-train`: training data from several weighted sources, shuffled by epoch
+  from a seed, cut as a stream or packed as whole documents, with attention
+  kept within documents and positions from each document's start; batches read
+  ahead by a thread; datasets read from `http(s)://` URLs, each shard downloaded
+  while the one before is read, checked and removed once read. The position in
+  every source is part of a checkpoint. `data_ms` in the log.
+- `kapel-ops`: `Attention` takes the documents of its keys (`[B, T]` integers,
+  where each document starts) in place of a mask; the card skips the keys
+  before each document instead of reading a mask of `T²` values.
+- `kapel-tokenizers`: `Tokenizer::encode_ordinary`, a text encoded without
+  reading its added tokens.
+- `kapel-hub`: `download::fetch_url`, a file downloaded and checked.
+- The example `loader` of `kapel-train`.
 
 ### Changed
 
@@ -310,6 +328,10 @@ changelog says how.
   runs on pull requests from this repository.
 
 ### Fixed
+
+- `kapel-tokenizers`: a `tokenizer.json` whose model has no type but merges is
+  read as a BPE, as `tokenizers` does; GPT-2's file on the Hub is so.
+- `kapel-hub`: `HF_TOKEN` is sent to the Hub only.
 
 - `kapel-models`: GPT-2's first checkpoints (`openai-community/gpt2`) load: their
   weights get the names of `GPT2LMHeadModel`, and the causal masks stored among

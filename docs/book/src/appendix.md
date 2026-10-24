@@ -106,7 +106,8 @@
 | The tape, losses, optimizers | `crates/kapel-train/src/{tape,loss,optim}.rs`, `crates/kapel-train/tests/{tape,optim}.rs` |
 | Decoders on a tape | `crates/kapel-train/src/model.rs`, `crates/kapel-train/tests/{model,cuda}.rs` |
 | The fused cross-entropy | `crates/kapel-ops/src/loss.rs`, `crates/kapel-{ref,cpu}/src/loss.rs`, `crates/kapel-cuda/src/ops.rs`, `kernels/src/lib.rs` (`cross_entropy_rows`) |
-| The training loop, its configuration and checkpoints | `crates/kapel-train/src/{trainer,config,data,schedule,checkpoint,flops}.rs`, `crates/kapel-cli/src/train.rs`, `crates/kapel-train/tests/trainer.rs`, `recipes/gpt2-124m/` |
+| The training loop, its configuration and checkpoints | `crates/kapel-train/src/{trainer,config,schedule,checkpoint,flops}.rs`, `crates/kapel-cli/src/train.rs`, `crates/kapel-train/tests/trainer.rs`, `recipes/gpt2-124m/` |
+| Preparing and reading the data | `crates/kapel-train/src/{prepare,dataset,data}.rs`, `crates/kapel-cli/src/prepare.rs`, `crates/kapel-train/tests/prepare.rs`, `crates/kapel-train/examples/loader.rs` |
 | Optimizers' steps in place | `crates/kapel-ops/src/update.rs`, `crates/kapel-{ref,cpu}/src/update.rs`, `crates/kapel-cuda/src/ops.rs` (`adamw`) |
 | Training measured against PyTorch, the time of each operation | `crates/kapel-train/examples/{gradients,steps}.rs`, `tools/train/gradients.py`, `crates/kapel-train/src/profile.rs` |
 | One model type for the bindings | `crates/kapel-runtime/src/lib.rs` |

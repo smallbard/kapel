@@ -131,9 +131,24 @@ fn weights(
     }
 }
 
-/// The mask, broadcast to `[B, Hq, Tq, Tk]` without copying.
-fn mask<'a>(inputs: &[&'a Tensor], dims: &Dims) -> Result<Option<Strided<'a>>> {
-    let Some(mask) = inputs.get(3) else {
+/// The documents of the keys as the additive mask they amount to, if the
+/// fourth input is that.
+fn documents(inputs: &[&Tensor]) -> Result<Option<Tensor>> {
+    inputs
+        .get(3)
+        .filter(|m| kapel_ops::is_documents(m))
+        .map(|m| kapel_ops::documents_mask(m))
+        .transpose()
+}
+
+/// The mask, broadcast to `[B, Hq, Tq, Tk]` without copying; `converted`,
+/// the documents made a mask.
+fn mask<'a>(
+    inputs: &[&'a Tensor],
+    converted: Option<&'a Tensor>,
+    dims: &Dims,
+) -> Result<Option<Strided<'a>>> {
+    let Some(mask) = converted.or(inputs.get(3).copied()) else {
         return Ok(None);
     };
     let mut strided = io::strided(Attention::NAME, mask)?;
@@ -160,7 +175,8 @@ impl Run<Attention> for Cpu {
         let q = io::contiguous(Attention::NAME, inputs[0])?;
         let k = io::contiguous(Attention::NAME, inputs[1])?;
         let v = io::contiguous(Attention::NAME, inputs[2])?;
-        let mask = mask(inputs, &dims)?;
+        let converted = documents(inputs)?;
+        let mask = mask(inputs, converted.as_ref(), &dims)?;
         let Dims {
             b,
             hq,
@@ -236,7 +252,8 @@ impl Run<Attention> for Cpu {
         let k = io::contiguous(Attention::NAME, inputs[1])?;
         let v = io::contiguous(Attention::NAME, inputs[2])?;
         let g = io::contiguous(Attention::NAME, grad)?;
-        let mask = mask(inputs, &dims)?;
+        let converted = documents(inputs)?;
+        let mask = mask(inputs, converted.as_ref(), &dims)?;
         let Dims {
             b,
             hq,

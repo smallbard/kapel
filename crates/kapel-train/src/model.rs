@@ -252,6 +252,27 @@ pub struct Batch<'a> {
     pub targets: &'a [u32],
     /// The number of sequences.
     pub rows: usize,
+    /// The document of each token, if attention stays within documents:
+    /// a token attends to the earlier tokens of its row with its number,
+    /// and its position counts from the first of them. `None`: the whole
+    /// row is one sequence.
+    pub segments: Option<&'a [u32]>,
+}
+
+/// The position of each of the `n` tokens of rows of `length`: from the
+/// row's start, or from its document's first token.
+fn positions(n: usize, length: usize, segments: Option<&[u32]>) -> Vec<u32> {
+    let mut out = Vec::with_capacity(n);
+    let mut first = 0;
+    for i in 0..n {
+        let new_row = i % length == 0;
+        let new_document = segments.is_some_and(|s| i > 0 && s[i] != s[i - 1]);
+        if new_row || new_document {
+            first = i;
+        }
+        out.push((i - first) as u32);
+    }
+    out
 }
 
 /// The forward pass of a decoder on a tape.
@@ -266,6 +287,10 @@ struct Pass {
     length: usize,
     /// The position of each token, `[rows · length, 1]`.
     positions: Tensor,
+    /// With segments, where the document of each token starts in its row,
+    /// `[rows, length]` in `i32`: attention stays within documents
+    /// ([`Attention`]'s documents).
+    mask: Option<Tensor>,
 }
 
 impl Decoder {
@@ -350,7 +375,11 @@ impl Decoder {
     ) -> Result<(Var<B>, Var<B>)> {
         let c = &*self.config;
         let n = batch.ids.len();
-        if batch.rows == 0 || !n.is_multiple_of(batch.rows) || batch.targets.len() != n {
+        if batch.rows == 0
+            || !n.is_multiple_of(batch.rows)
+            || batch.targets.len() != n
+            || batch.segments.is_some_and(|s| s.len() != n)
+        {
             return Err(Error::InvalidArgument {
                 op: "Decoder",
                 message: format!(
@@ -367,7 +396,7 @@ impl Decoder {
             backend.upload(&Tensor::from_slice(data, shape)?)
         };
         let ids = upload(batch.ids, &[n])?;
-        let positions: Vec<u32> = (0..n).map(|i| (i % length) as u32).collect();
+        let positions = positions(n, length, batch.segments);
         let dtype = options.dtype;
         let embed = leaves.get(self.embed_name())?;
         // The rows of the table, gathered from the parameter itself: its
@@ -384,6 +413,17 @@ impl Decoder {
             rows: batch.rows,
             length,
             positions: upload(&positions, &[n, 1])?,
+            mask: batch
+                .segments
+                .map(|_| {
+                    let starts: Vec<i32> = positions
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &p)| (i % length) as i32 - p as i32)
+                        .collect();
+                    backend.upload(&Tensor::from_slice(&starts, &[batch.rows, length])?)
+                })
+                .transpose()?,
         });
         let prefix = match c.block {
             Block::Gpt2 => "transformer.h",
@@ -511,7 +551,7 @@ fn block<'a, B: Compute + 'a>(
                     .reshape(&[pass.rows, pass.length, hq, d])?
                     .transpose(1, 2)
             };
-            let y = part(0)?.attention(&part(1)?, &part(2)?, None, attention)?;
+            let y = part(0)?.attention(&part(1)?, &part(2)?, pass.mask.as_ref(), attention)?;
             let a = merged(y)?.matmul_bias(need("attn.c_proj.weight")?, w("attn.c_proj.bias"))?;
             let x = x.add(&a)?;
             let h = norm(c, &x, w("ln_2.weight"), w("ln_2.bias"))?;
@@ -567,7 +607,7 @@ fn block<'a, B: Compute + 'a>(
             let y = as_heads(&q, hq)?.attention(
                 &as_heads(&k, hkv)?,
                 &heads(&v, hkv)?,
-                None,
+                pass.mask.as_ref(),
                 attention,
             )?;
             let bias = if c.out_bias {

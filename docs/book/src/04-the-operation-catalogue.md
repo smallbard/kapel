@@ -65,7 +65,7 @@ The shared checks are small private functions: `arity`, `float`, `indices` (the 
 | `CrossEntropy` | x \[N, V\], targets \[N\] → \[N\], f32 | ln Σⱼ e^(x\[n, j\]) − x\[n, t\[n\]\], 0 for the target `IGNORE` (all bits set); the softmax never formed (chapter 15) | x |
 | `LayerNorm` | x \[…, C\], weight \[C\], bias \[C\] | (x − μ) / √(σ² + eps) · w + b, biased variance | all |
 | `RmsNorm` | x \[…, C\], weight \[C\] | x / √(mean x² + eps) · (offset + w); offset 1 for Gemma | all |
-| `Attention` | q, k, v, optional mask | scaled dot-product, grouped heads, causal, window, softcap | q, k, v |
+| `Attention` | q, k, v, optional mask or documents | scaled dot-product, grouped heads, causal, window, softcap | q, k, v |
 | `PagedAttention` | q \[R, Hq, D\], keys, values \[L, Hkv, D\], pages \[S, P\], rows \[R, 2\] | attention of new rows over a cache kept by pages (section 4.3) | none |
 | `Rope` | x \[…, D\], positions | rotary embeddings with five scalings | x |
 | `GatherRows` | src \[R, …\], idx | y\[i\] = src\[idx\[i\]\]; out-of-range index is an error; a quantized table gives its rows in f32 | src, unless quantized |
@@ -85,7 +85,9 @@ Attention carries most of the subtle rules, and all of them are fixed in its doc
 - The score is `s = scale · q·k + mask`, with `scale` defaulting to 1/√D. With a softcap (Gemma 2), `scale · q·k` becomes `softcap · tanh(scale · q·k / softcap)` before the mask is added.
 - A query that sees no key, or whose visible keys are all masked with −∞, gives zeros and passes no gradient. Finite scores, however low, take part in the softmax: a padding mask of `f32::MIN`, as `transformers` uses, gives uniform weights rather than zeros.
 
-`infer` rejects D = 0 (the default scale would be 1/√0), more queries than keys, a window of 0, and a mask that does not broadcast to `[B, Hq, Tq, Tk]`.
+- The fourth input may instead be the documents of the keys: `[B, Tk]` in `i32` or `u32`, for each key the position where its document starts, with as many queries as keys. Query i then also needs `documents[j] = documents[i]`: each token of a packed row attends to its own document only (section 15.13). The reference and the processor make it the equivalent additive mask (`documents_mask`); the card reads it directly and skips the keys before each tile's document (section 7.6).
+
+`infer` rejects D = 0 (the default scale would be 1/√0), more queries than keys, a window of 0, a mask that does not broadcast to `[B, Hq, Tq, Tk]`, and documents that are not `[B, Tk]` or come with fewer queries than keys.
 
 ### Attention over pages
 

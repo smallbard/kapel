@@ -115,7 +115,10 @@ fn request(agent: &ureq::Agent, url: &str) -> Result<ureq::Response> {
 
 fn call(agent: &ureq::Agent, url: &str) -> std::result::Result<ureq::Response, Box<ureq::Error>> {
     let mut request = agent.get(url);
-    if let Ok(token) = std::env::var("HF_TOKEN") {
+    // The token goes to the Hub only, never to another host.
+    if url.starts_with(&format!("{ENDPOINT}/"))
+        && let Ok(token) = std::env::var("HF_TOKEN")
+    {
         request = request.set("Authorization", &format!("Bearer {token}"));
     }
     request.call().map_err(Box::new)
@@ -259,6 +262,41 @@ fn fetch(
         return Ok(());
     }
     let url = format!("{ENDPOINT}/{repo}/resolve/{revision}/{name}");
+    fetch_to(agent, &url, sha256, target)
+}
+
+/// Downloads `url` into `target`, through `target.part` renamed once
+/// complete, checking its SHA-256 when one is given. Nothing identifies the
+/// user in the request: the user agent is `kapel/VERSION`, and `HF_TOKEN`
+/// is sent to the Hub only. Nothing is done if `target` exists.
+///
+/// # Errors
+///
+/// If the URL cannot be read, `KAPEL_OFFLINE=1` or `HF_HUB_OFFLINE=1` is
+/// set, the file cannot be written, or the checksum does not match.
+pub fn fetch_url(url: &str, sha256: Option<&str>, target: &Path) -> Result<()> {
+    if target.exists() {
+        return Ok(());
+    }
+    if offline() {
+        return Err(HubError::io(
+            url,
+            std::io::Error::other(
+                "offline (KAPEL_OFFLINE or HF_HUB_OFFLINE), and not in the cache",
+            ),
+        ));
+    }
+    if let Some(dir) = target.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| HubError::io(dir, e))?;
+    }
+    fetch_to(&agent(), url, sha256, target)
+}
+
+fn fetch_to(agent: &ureq::Agent, url: &str, sha256: Option<&str>, target: &Path) -> Result<()> {
+    if target.exists() {
+        return Ok(());
+    }
+    let url = url.to_string();
     let mut partial = target.as_os_str().to_owned();
     partial.push(".part");
     let partial = PathBuf::from(partial);

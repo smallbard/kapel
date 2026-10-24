@@ -33,7 +33,13 @@ impl Inputs {
         let (hkv, tk, dv) = (k.shape[1], k.shape[2], v.shape[3]);
         let mask = match inputs.get(3) {
             Some(mask) => {
-                let mask = Array::of(mask)?;
+                let converted;
+                let mask = if kapel_ops::is_documents(mask) {
+                    converted = kapel_ops::documents_mask(mask)?;
+                    Array::of(&converted)?
+                } else {
+                    Array::of(mask)?
+                };
                 let map = broadcast_map(&mask.shape, &[b, hq, tq, tk]);
                 Some(map.into_iter().map(|at| mask.data[at]).collect())
             }

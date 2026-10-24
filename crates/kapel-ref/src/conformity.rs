@@ -1304,6 +1304,51 @@ fn masked_attention_cases<V: Visitor>(v: &mut V, rng: &mut Rng, dtype: DType) {
         "not causal, f32 padding mask of f32::MIN, one query fully masked: uniform".into(),
         args,
     );
+    // Documents: for each key, where its document starts.
+    let documents = |starts: &[i32], b: usize, dtype: DType| {
+        let shape = [b, starts.len() / b];
+        plain(if dtype == DType::U32 {
+            let unsigned: Vec<u32> = starts.iter().map(|&s| s as u32).collect();
+            Tensor::from_slice(&unsigned, &shape).expect("sizes agree")
+        } else {
+            Tensor::from_slice(starts, &shape).expect("sizes agree")
+        })
+    };
+    v.visit(
+        &Attention::causal(),
+        "causal, documents [2, 6] in i32, grouped keys".into(),
+        vec![
+            plain(r(rng, &[2, 2, 6, 8])),
+            plain(r(rng, &[2, 1, 6, 8])),
+            plain(r(rng, &[2, 1, 6, 6])),
+            documents(&[0, 0, 0, 3, 3, 5, 0, 1, 1, 1, 1, 1], 2, DType::I32),
+        ],
+    );
+    // Longer than the tiles of the card: documents that start inside a tile,
+    // on a tile's edge, of one token, and one over a whole row. Too large for
+    // finite differences.
+    let t = 200;
+    let mut starts = Vec::with_capacity(2 * t);
+    for i in 0..t {
+        let s = [0, 64, 70, 130, 131, 199]
+            .iter()
+            .rev()
+            .find(|&&s| s <= i)
+            .copied()
+            .unwrap_or(0);
+        starts.push(s as i32);
+    }
+    starts.extend(std::iter::repeat_n(0, t));
+    v.visit_rounded(
+        &Attention::causal(),
+        "causal, documents [2, 200] in u32, starts in and on the edges of tiles".into(),
+        vec![
+            plain(r(rng, &[2, 4, t, 16])),
+            plain(r(rng, &[2, 2, t, 16])),
+            plain(r(rng, &[2, 2, t, 16])),
+            documents(&starts, 2, DType::U32),
+        ],
+    );
 }
 
 /// Compares a backend to the reference.

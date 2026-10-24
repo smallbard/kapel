@@ -28,6 +28,15 @@ use crate::{Operation, Signature, arity, float, rank, same_device, shape};
 ///
 /// The mask may be in any float type, not necessarily that of `q`; it
 /// receives no gradient.
+///
+/// The fourth input may instead be the documents of the keys: `[B, Tk]` in
+/// `i32` or `u32`, for each key the position where its document starts,
+/// with as many queries as keys (training on packed rows). Query `i` then
+/// also needs `documents[j] = documents[i]`: each token attends to its own
+/// document only. A document being contiguous, its start is the same for all
+/// its tokens and at most their positions; the values are otherwise
+/// unchecked. Backends can skip whole blocks of keys before a query's
+/// document instead of reading an additive mask of `B · Tq · Tk` values.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Attention {
     /// Hide the keys after each query's position.
@@ -55,6 +64,38 @@ impl Attention {
     pub fn scale_for(&self, d: usize) -> f64 {
         self.scale.unwrap_or(1.0 / (d as f64).sqrt())
     }
+}
+
+/// Whether the fourth input of an attention is the documents of its keys
+/// rather than an additive mask.
+pub fn is_documents(mask: &Tensor) -> bool {
+    matches!(
+        mask.dtype(),
+        kapel_core::DType::I32 | kapel_core::DType::U32
+    )
+}
+
+/// The additive mask `[B, 1, T, T]` in `f32` equivalent to `documents
+/// [B, T]`: 0 where the query and the key share a document, −∞ elsewhere.
+///
+/// # Errors
+///
+/// If `documents` is not an integer tensor in host memory.
+pub fn documents_mask(documents: &Tensor) -> Result<Tensor> {
+    let values = documents.to_f64_vec()?;
+    let (b, t) = (documents.shape()[0], documents.shape()[1]);
+    let mut mask = vec![f32::NEG_INFINITY; b * t * t];
+    for r in 0..b {
+        let row = &values[r * t..(r + 1) * t];
+        for (i, &di) in row.iter().enumerate() {
+            for (j, &dj) in row.iter().enumerate() {
+                if di == dj {
+                    mask[(r * t + i) * t + j] = 0.0;
+                }
+            }
+        }
+    }
+    Tensor::from_slice(&mask, &[b, 1, t, t])
 }
 
 impl Operation for Attention {
@@ -106,7 +147,14 @@ impl Operation for Attention {
         if self.window == Some(0) {
             return Err(invalid("a window of 0 positions hides every key".into()));
         }
-        if let Some(mask) = inputs.get(3) {
+        if let Some(documents) = inputs.get(3).filter(|m| is_documents(m)) {
+            if documents.shape() != [b, tk] || tq != tk {
+                return Err(invalid(format!(
+                    "documents [B, Tk] = [{b}, {tk}] with as many queries as keys, got {:?} and {tq} queries",
+                    documents.shape()
+                )));
+            }
+        } else if let Some(mask) = inputs.get(3) {
             float(op, mask)?;
             let target = [b, hq, tq, tk];
             if shape::broadcast(op, mask.shape(), &target)? != target {

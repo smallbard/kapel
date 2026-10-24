@@ -139,6 +139,74 @@ fn a_resumed_run_computes_the_bits_of_an_uninterrupted_one() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// Two weighted sources, shuffled, whole documents kept apart by the mask:
+/// a run killed and resumed still reads the rows it would have read.
+#[test]
+fn a_resumed_run_over_mixed_shuffled_documents_computes_the_same_bits() {
+    let dir = setup("mixed");
+    let mixed = |run: &str| {
+        let mut c = config(&dir, run, "adamw", 7);
+        c.data.train = None;
+        c.data.sources = ["train_000.bin", "train_001.bin"]
+            .iter()
+            .zip([2.0, 1.0])
+            .map(|(n, weight)| kapel_train::config::SourceConfig {
+                path: dir.join(n).to_string_lossy().into_owned(),
+                weight,
+            })
+            .collect();
+        c.data.seed = 5;
+        c.data.shuffle = true;
+        c.data.pack = kapel_train::data::Pack::Documents;
+        c.data.mask = true;
+        c.data.separator = Some(0);
+        c.validate().unwrap();
+        c
+    };
+    let whole = run(&mixed("whole"), &QUIET).unwrap();
+    let again = run(&mixed("again"), &QUIET).unwrap();
+    assert_eq!(
+        whole.loss.to_bits(),
+        again.loss.to_bits(),
+        "the same seed, the same run"
+    );
+    let cut = mixed("cut");
+    run(
+        &cut,
+        &RunOptions {
+            stop_after: Some(3),
+            ..QUIET
+        },
+    )
+    .unwrap();
+    let second = run(
+        &cut,
+        &RunOptions {
+            resume: true,
+            ..QUIET
+        },
+    )
+    .unwrap();
+    assert_eq!(second.loss.to_bits(), whole.loss.to_bits());
+    assert_eq!(second.val_loss, whole.val_loss);
+    for (name, w) in &whole.params {
+        assert_eq!(
+            w.to_f64_vec().unwrap(),
+            second.params[name].to_f64_vec().unwrap(),
+            "{name}"
+        );
+    }
+    let mut other = mixed("other");
+    other.data.seed = 6;
+    let other = run(&other, &QUIET).unwrap();
+    assert_ne!(
+        other.loss.to_bits(),
+        whole.loss.to_bits(),
+        "another seed, other rows"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[test]
 fn the_loss_goes_down_and_the_checkpoint_is_a_model() {
     let dir = setup("learns");

@@ -15,10 +15,12 @@
 pub mod checkpoint;
 pub mod config;
 pub mod data;
+pub mod dataset;
 pub mod flops;
 pub mod loss;
 pub mod model;
 pub mod optim;
+pub mod prepare;
 pub mod profile;
 pub mod schedule;
 pub mod tape;

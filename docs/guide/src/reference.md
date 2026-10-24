@@ -8,6 +8,7 @@
 | `kapel serve MODEL` | serves the model behind OpenAI's API | `kapel --help` |
 | `kapel quantize MODEL --output PATH` | quantizes and writes a model | `kapel quantize --help` |
 | `kapel eval MODEL --tasks FILE` | scores tasks of lm-evaluation-harness | `kapel eval --help` |
+| `kapel prepare INPUT... --tokenizer PATH --output DIR` | tokenizes Parquet, JSONL or text files into shards for training, the exact duplicates left out (*The Kapel Book*, section 15.13) | `kapel prepare --help` |
 | `kapel train CONFIG.toml` | trains a model as a TOML file describes it (`recipes/gpt2-124m/train.toml`; *The Kapel Book*, chapter 15) | `kapel train --help` |
 
 ## Loading options
@@ -37,7 +38,8 @@ Every command that loads a model takes these; the bindings take them in the same
 | Variable | Effect |
 | --- | --- |
 | `KAPEL_CACHE` | where models from the Hub are kept (default `~/.cache/kapel/hub`) |
-| `HF_TOKEN` | the Hub token for gated models |
+| `HF_TOKEN` | the Hub token for gated models (sent to the Hub only) |
+| `KAPEL_DATA_CACHE` | where `kapel train` keeps the shards of a remote dataset while it reads them (default `~/.cache/kapel/data`) |
 | `KAPEL_OFFLINE=1`, `HF_HUB_OFFLINE=1` | never contact the Hub; use the models already downloaded |
 | `KAPEL_THREADS` | the threads computing on the processor (default one per physical core) |
 | `CUDA_HOME` | the CUDA toolkit, when building with the `cuda` feature |

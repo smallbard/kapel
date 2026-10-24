@@ -24,6 +24,9 @@ serde_json.workspace = true
 serde.workspace = true
 toml.workspace = true
 memmap2.workspace = true
+parquet.workspace = true
+sha2.workspace = true
+kapel-tokenizers.workspace = true
 kapel-cpu.workspace = true
 kapel-cuda = { workspace = true, optional = true }
 

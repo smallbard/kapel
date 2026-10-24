@@ -4,7 +4,7 @@
 
 ## 9.1 What is supported
 
-Kapel implements the BPE model, which covers the GPT-2 family (byte-level BPE, as in GPT-2, Llama 3, Qwen) and SentencePiece-style tokenizers written as BPE with byte fallback (Llama 2, Mistral, Gemma). WordPiece and Unigram models are not supported, and a file that uses them is rejected with an error.
+Kapel implements the BPE model, which covers the GPT-2 family (byte-level BPE, as in GPT-2, Llama 3, Qwen) and SentencePiece-style tokenizers written as BPE with byte fallback (Llama 2, Mistral, Gemma). WordPiece and Unigram models are not supported, and a file that uses them is rejected with an error. A model without a `type` but with merges is a BPE, as `tokenizers` reads it: GPT-2's own file on the Hub is written so.
 
 `Tokenizer::from_file` reads the six parts of a `tokenizer.json`: the model, the added tokens, the normalizer, the pre-tokenizer, the post-processor and the decoder.
 
@@ -15,6 +15,8 @@ Kapel implements the BPE model, which covers the GPT-2 family (byte-level BPE, a
 3. **Pre-tokenize** the segment into pieces. *ByteLevel* applies the GPT-2 regular expression, then maps every byte to a printable character (a space becomes `Ġ`, a newline `Ċ`). *Split* cuts on a string or a regular expression, with the behaviours of `tokenizers` (removed, isolated, merged with the previous or next piece). *Metaspace* replaces spaces with `▁`. *Digits* isolates numbers.
 4. **Apply BPE** to each piece (9.3).
 5. **Post-process**: add the special tokens of the template, such as a beginning-of-sequence token, when the caller asks for special tokens.
+
+`encode_ordinary` skips the first and the last steps: the whole text is plain text, and an added token it spells, such as `<|endoftext|>`, is encoded as its characters (tiktoken's `encode_ordinary`). Training corpora are encoded this way (section 15.13): a document that quotes a special token cannot inject it.
 
 Regular expressions are compiled once, when the tokenizer is loaded, with `fancy-regex`, which supports the look-ahead that some tokenizers use. If an expression gives up on a pathological input because it hits its backtracking limit, the text is rejected with an error rather than silently cut in the wrong place.
 

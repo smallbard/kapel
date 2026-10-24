@@ -2,6 +2,7 @@
 
 mod args;
 mod eval;
+mod prepare;
 mod quantize;
 mod train;
 
@@ -22,6 +23,7 @@ usage: kapel run MODEL [options]
        kapel serve MODEL [options]
        kapel quantize MODEL --output PATH [options]   (kapel quantize --help)
        kapel eval MODEL --tasks FILE [options]        (kapel eval --help)
+       kapel prepare INPUT... --tokenizer PATH --output DIR   (kapel prepare --help)
        kapel train CONFIG.toml [options]              (kapel train --help)
 
 Generates text with MODEL: a model directory, a GGUF file, or a repository of the
@@ -97,6 +99,11 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("eval") => exit(eval::execute(&args[1..])),
+        Some("prepare") if args.get(1).is_some_and(|a| a == "--help" || a == "-h") => {
+            print!("{}", prepare::USAGE);
+            ExitCode::SUCCESS
+        }
+        Some("prepare") => exit(prepare::execute(&args[1..])),
         Some("train") if args.get(1).is_some_and(|a| a == "--help" || a == "-h") => {
             print!("{}", train::USAGE);
             ExitCode::SUCCESS

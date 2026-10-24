@@ -7,6 +7,9 @@
 //! is computed every `eval.every` steps, and a checkpoint taken every
 //! `checkpoint.every`.
 //!
+//! The batches are read ahead by a thread ([`crate::data::Prefetched`]);
+//! `data_ms` in the log is the time a step waited for them.
+//!
 //! A run resumed from a checkpoint goes on with the parameters, the
 //! optimizer's moments and steps, and the position in the data it had: on
 //! the same machine, it computes the bits an uninterrupted run computes.
@@ -23,7 +26,7 @@ use serde_json::{Value, json};
 
 use crate::checkpoint::{self, Checkpoint, State, Writer};
 use crate::config::{TrainConfig, matches};
-use crate::data::{self, Loader};
+use crate::data::{self, Loader, Prefetched, Source};
 use crate::flops;
 use crate::model::{Batch, Decoder, Options, Parameter, Parameters, init};
 use crate::optim::{Optimizer, OptimizerState, global_norm};
@@ -220,7 +223,7 @@ struct Run<'a, B: Compute> {
     params: Parameters,
     optimizer: Optimizer,
     schedule: Schedule,
-    train: Loader,
+    train: Prefetched,
     val: Option<Vec<data::Tokens>>,
     step: usize,
     tokens: u64,
@@ -250,12 +253,39 @@ impl<'a, B: Compute> Run<'a, B> {
         let mut params = start(config, &model_config)?;
         let mut optimizer = Optimizer::new(&config.optimizer);
         let b = &config.batch;
-        let mut train = Loader::new(data::files(&config.data.train)?, b.rows, b.length)?;
+        let reading = config.data.reading(b.rows, b.length);
+        let open = |path: &str, split: &str| -> Result<Source> {
+            let source = Source::open(path, split, &reading.cache)?;
+            if let Some(v) = source.vocab()
+                && v > model_config.vocab
+            {
+                return Err(TrainError(format!(
+                    "{path}: tokens of a vocabulary of {v}, the model has {}",
+                    model_config.vocab
+                )));
+            }
+            Ok(source)
+        };
+        let sources = config
+            .data
+            .training_sources()
+            .iter()
+            .map(|(path, weight)| Ok((open(path, "train")?, *weight)))
+            .collect::<Result<Vec<_>>>()?;
+        let mut train = Loader::new(sources, reading.clone())?;
         let val = match &config.data.val {
-            Some(pattern) if config.eval.tokens > 0 => {
-                let mut loader = Loader::new(data::files(pattern)?, b.rows, b.length)?;
+            Some(path) if config.eval.tokens > 0 => {
+                // In order, whatever the training's order: the same rows at
+                // every evaluation.
+                let mut r = reading.clone();
+                r.shuffle = false;
+                let mut loader = Loader::new(vec![(open(path, "val")?, 1.0)], r)?;
                 let passes = config.eval.tokens / b.pass();
-                Some((0..passes).map(|_| loader.next_batch()).collect())
+                Some(
+                    (0..passes)
+                        .map(|_| loader.next_batch())
+                        .collect::<std::result::Result<_, _>>()?,
+                )
             }
             _ => None,
         };
@@ -294,7 +324,7 @@ impl<'a, B: Compute> Run<'a, B> {
                 steps: saved.state.optimizer_steps,
                 tensors,
             })?;
-            train.seek(saved.state.position)?;
+            train.seek(&saved.state.position)?;
             step = saved.state.step;
             tokens = saved.state.tokens;
             if !options.quiet {
@@ -323,7 +353,7 @@ impl<'a, B: Compute> Run<'a, B> {
             params,
             optimizer,
             schedule: Schedule::new(&config.schedule),
-            train,
+            train: train.prefetch(config.data.prefetch),
             val,
             step,
             tokens,
@@ -353,6 +383,7 @@ impl<'a, B: Compute> Run<'a, B> {
             ids: &tokens.ids,
             targets: &tokens.targets,
             rows: self.config.batch.rows,
+            segments: tokens.segments.as_deref(),
         };
         let loss = self.decoder.loss(&leaves, &batch, &self.options())?;
         let value = loss.value();
@@ -425,6 +456,7 @@ impl<'a, B: Compute> Run<'a, B> {
                 ids: &tokens.ids,
                 targets: &tokens.targets,
                 rows: self.config.batch.rows,
+                segments: tokens.segments.as_deref(),
             };
             let loss = self.decoder.loss(&leaves, &batch, &self.options())?;
             total += self.backend.download(&loss.value())?.to_f64_vec()?[0];
@@ -465,7 +497,7 @@ impl<'a, B: Compute> Run<'a, B> {
                 step: self.step,
                 optimizer_steps: steps,
                 optimizer: self.config.optimizer.kind.clone(),
-                position: self.train.position(),
+                position: self.train.position().clone(),
                 tokens: self.tokens,
             },
             params,
@@ -505,7 +537,7 @@ impl<'a, B: Compute> Run<'a, B> {
             let mut sum: Option<BTreeMap<String, Grad>> = None;
             let mut losses = Vec::with_capacity(accumulate);
             for _ in 0..accumulate {
-                let tokens = self.train.next_batch();
+                let tokens = self.train.next_batch()?;
                 let (l, grads) = self.pass(&tokens)?;
                 losses.push(l);
                 sum = Some(match sum {
@@ -547,6 +579,7 @@ impl<'a, B: Compute> Run<'a, B> {
             loss = values.iter().sum::<f64>() / values.len() as f64;
             (self.synchronize)();
             let seconds = start.elapsed().as_secs_f64();
+            let data_ms = self.train.take_waited().as_secs_f64() * 1e3;
             self.step += 1;
             self.tokens += step_tokens;
             let mfu = self
@@ -559,6 +592,7 @@ impl<'a, B: Compute> Run<'a, B> {
                 "norm": norm,
                 "tokens": self.tokens,
                 "ms": seconds * 1e3,
+                "data_ms": data_ms,
                 "tokens_per_s": step_tokens as f64 / seconds,
                 "mfu": mfu,
                 "peak_gib": self.peak_memory.as_ref().map(|p| p() as f64 / (1u64 << 30) as f64),

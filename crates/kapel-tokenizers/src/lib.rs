@@ -330,23 +330,7 @@ impl Tokenizer {
         for part in self.split_added(text) {
             match part {
                 Err(id) => ids.push(id),
-                Ok((offset, segment)) => {
-                    let normalized = match &self.normalizer {
-                        Some(n) => n.apply(segment)?,
-                        None => segment.to_string(),
-                    };
-                    let pieces = vec![Piece {
-                        text: normalized,
-                        first: offset == 0,
-                    }];
-                    let pieces = match &self.pre_tokenizer {
-                        Some(p) => p.apply(pieces)?,
-                        None => pieces,
-                    };
-                    for piece in pieces {
-                        ids.extend(self.model.encode(&piece.text));
-                    }
-                }
+                Ok((offset, segment)) => self.encode_plain(offset, segment, &mut ids)?,
             }
         }
         Ok(match (&self.template, add_special_tokens) {
@@ -359,6 +343,48 @@ impl Tokenizer {
                 .collect(),
             _ => ids,
         })
+    }
+
+    /// The ids of `text` taken as plain text: the added tokens it spells,
+    /// such as `<|endoftext|>`, are encoded as their characters, never as
+    /// the tokens themselves, and no template is applied. A corpus that
+    /// quotes a special token thus cannot inject it (`encode_ordinary` of
+    /// tiktoken).
+    ///
+    /// # Errors
+    ///
+    /// As [`Tokenizer::encode`].
+    pub fn encode_ordinary(&self, text: &str) -> Result<Vec<u32>, TokenizerError> {
+        let mut ids = Vec::new();
+        if !text.is_empty() {
+            self.encode_plain(0, text, &mut ids)?;
+        }
+        Ok(ids)
+    }
+
+    /// Appends the ids of `segment`, plain text at byte `offset` of its text.
+    fn encode_plain(
+        &self,
+        offset: usize,
+        segment: &str,
+        ids: &mut Vec<u32>,
+    ) -> Result<(), TokenizerError> {
+        let normalized = match &self.normalizer {
+            Some(n) => n.apply(segment)?,
+            None => segment.to_string(),
+        };
+        let pieces = vec![Piece {
+            text: normalized,
+            first: offset == 0,
+        }];
+        let pieces = match &self.pre_tokenizer {
+            Some(p) => p.apply(pieces)?,
+            None => pieces,
+        };
+        for piece in pieces {
+            ids.extend(self.model.encode(&piece.text));
+        }
+        Ok(())
     }
 
     /// The text of `ids`; with `skip_special_tokens`, special tokens are left out.
@@ -432,6 +458,22 @@ mod tests {
         assert_eq!(tokenizer.token_to_id("abc"), Some(11));
         assert_eq!(tokenizer.token_to_id("e"), Some(4));
         assert_eq!(encode(""), Vec::<u32>::new());
+    }
+
+    /// `encode_ordinary` reads added tokens as text; a model without a type
+    /// but with merges is a BPE, as in GPT-2's file on the Hub.
+    #[test]
+    fn ordinary_text_spells_the_added_tokens() {
+        let tokenizer = Tokenizer::from_json(&serde_json::json!({
+            "model": { "vocab": { "a": 0, "b": 1, "c": 2, "d": 3, "e": 4, " ": 5 }, "merges": [] },
+            "added_tokens": [{ "id": 10, "content": "ab" }],
+        }))
+        .unwrap();
+        assert_eq!(tokenizer.encode("cab", false).unwrap(), [2, 10]);
+        assert_eq!(tokenizer.encode_ordinary("cab").unwrap(), [2, 0, 1]);
+        assert_eq!(tokenizer.encode_ordinary("").unwrap(), Vec::<u32>::new());
+        let unknown = serde_json::json!({ "model": { "type": "WordPiece", "vocab": {} } });
+        assert!(Tokenizer::from_json(&unknown).is_err());
     }
 
     /// The search by automaton cuts texts exactly as a scan of every added

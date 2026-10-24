@@ -117,6 +117,8 @@ The exponentials are computed in base 2, a single multiply-add per score when th
 
 Visibility is cheap to apply. A helper computes, for a query tile, the range of key tiles to visit and, inside it, the range that is fully visible to every query; only the edge tiles pay for the causal, window and bounds tests. Head widths are padded to a power of two, and a tile needed transposed is loaded then transposed, because reading through swapped strides is about three times slower.
 
+With documents (section 4's `Attention`), each kernel reads, instead of a mask of `Tq × Tk` values, where the document of each token starts: a query and a key are compared by these starts, a tile of each, and the scores of other documents become −∞. Documents being contiguous, no query of a tile sees the keys before its first query's document: the forward kernel and the one of ∂q begin at that key tile, read as a scalar (`tile_to_scalar`), and the one of ∂k and ∂v leaves out the query tiles whose first query's document starts after its keys. Only −∞ hides a score, so the statistics are those of attention without a mask. On GPT-2 124M with documents of FineWeb-Edu (about a thousand tokens each), a step costs 317.6 ms with documents and 315.9 without; an additive mask of the same documents, `[16, 1, 1024, 1024]` in `f32`, cost 441 ms. Two rules of the tile compiler showed on the way: a helper that takes a tensor fails its type inference (the documents are read in the kernels' bodies), and a tile loaded at an index beyond a tensor faults, even for a placeholder never used (the placeholder's index is multiplied by zero).
+
 The backward pass reruns the forward to obtain the output and the per-row statistics, then runs three kernels:
 
 1. `attention_delta`: δ = rowsum(g ⊙ y).

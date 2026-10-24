@@ -28,7 +28,8 @@
 //! final = 0.0
 //! ```
 //!
-//! Every field but `model.config`, `data.train` and `schedule.steps` has a
+//! Every field but `model.config`, `data.train` (or `data.sources`) and
+//! `schedule.steps` has a
 //! default; an unknown field is an error, so that a misspelt setting does not
 //! go unnoticed.
 
@@ -108,16 +109,101 @@ fn one() -> u64 {
     1
 }
 
-/// The token files.
+/// The tokens: where they are, and how they are read ([`crate::data`]).
+///
+/// `train` names one source; `sources`, several, each with its weight. A
+/// source is a directory of `kapel prepare` or its `dataset.json`, either
+/// local or at an `http(s)://` URL, or a pattern of llm.c files.
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DataConfig {
-    /// The training files: a path, or a pattern with `*` in its file name,
-    /// read in the sorted order of their names.
-    pub train: String,
-    /// The validation files, likewise.
+    /// The training source: a path, a URL, or a pattern with `*` in its
+    /// file name, read in the sorted order of their names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub train: Option<String>,
+    /// Several training sources, each row drawn from one of them with the
+    /// probability of its weight.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<SourceConfig>,
+    /// The validation source: a dataset's `val` split, or files.
     #[serde(default)]
     pub val: Option<String>,
+    /// The seed of the mixing and of the orders drawn.
+    #[serde(default)]
+    pub seed: u64,
+    /// Read the shards, and the rows of each, in an order drawn anew for
+    /// each epoch.
+    #[serde(default)]
+    pub shuffle: bool,
+    /// `"stream"`: the tokens cut every `batch.length`; `"documents"`:
+    /// whole documents in each row, padded.
+    #[serde(default)]
+    pub pack: crate::data::Pack,
+    /// Each token attends to its own document only, and positions start
+    /// again at each document.
+    #[serde(default)]
+    pub mask: bool,
+    /// The token that starts each document, for files that have neither
+    /// an index nor a manifest (50256 for llm.c's GPT-2 shards).
+    #[serde(default)]
+    pub separator: Option<u32>,
+    /// The batches read ahead by a thread of their own.
+    #[serde(default = "prefetch_default")]
+    pub prefetch: usize,
+    /// Where remote shards are kept while they are read; absent,
+    /// `$KAPEL_DATA_CACHE` or `~/.cache/kapel/data`.
+    #[serde(default)]
+    pub cache: Option<PathBuf>,
+}
+
+fn prefetch_default() -> usize {
+    4
+}
+
+/// One of several training sources.
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceConfig {
+    /// As [`DataConfig::train`].
+    pub path: String,
+    /// Its weight: its share of the rows is its weight over their sum.
+    #[serde(default = "weight_default")]
+    pub weight: f64,
+}
+
+fn weight_default() -> f64 {
+    1.0
+}
+
+impl DataConfig {
+    /// The training sources with their weights.
+    pub fn training_sources(&self) -> Vec<(String, f64)> {
+        match &self.train {
+            Some(t) => vec![(t.clone(), 1.0)],
+            None => self
+                .sources
+                .iter()
+                .map(|s| (s.path.clone(), s.weight))
+                .collect(),
+        }
+    }
+
+    /// How batches of `rows × length` are read.
+    pub fn reading(&self, rows: usize, length: usize) -> crate::data::Reading {
+        crate::data::Reading {
+            rows,
+            length,
+            seed: self.seed,
+            shuffle: self.shuffle,
+            pack: self.pack,
+            mask: self.mask,
+            separator: self.separator,
+            cache: self
+                .cache
+                .clone()
+                .unwrap_or_else(crate::data::default_cache),
+        }
+    }
 }
 
 /// The size of a step.
@@ -467,14 +553,20 @@ impl TrainConfig {
         };
         self.model.config = join(&self.model.config);
         self.checkpoint.dir = join(&self.checkpoint.dir);
-        self.data.train = join(Path::new(&self.data.train))
-            .to_string_lossy()
-            .into_owned();
-        self.data.val = self
-            .data
-            .val
-            .as_deref()
-            .map(|p| join(Path::new(p)).to_string_lossy().into_owned());
+        // A URL stays as written.
+        let place = |p: &str| {
+            if p.starts_with("http://") || p.starts_with("https://") {
+                p.to_string()
+            } else {
+                join(Path::new(p)).to_string_lossy().into_owned()
+            }
+        };
+        self.data.train = self.data.train.as_deref().map(place);
+        self.data.val = self.data.val.as_deref().map(place);
+        for source in &mut self.data.sources {
+            source.path = place(&source.path);
+        }
+        self.data.cache = self.data.cache.as_deref().map(join);
     }
 
     /// Checks the values.
@@ -504,6 +596,20 @@ impl TrainConfig {
                 "batch.tokens: a positive multiple of rows × length = {}, got {t}",
                 b.pass()
             ));
+        }
+        let d = &self.data;
+        if d.train.is_some() == !d.sources.is_empty() {
+            return fail("data: either train or sources, not both".into());
+        }
+        if let Some(s) = d
+            .sources
+            .iter()
+            .find(|s| !(s.weight > 0.0 && s.weight.is_finite()))
+        {
+            return fail(format!("data.sources {:?}: weight {}", s.path, s.weight));
+        }
+        if d.prefetch == 0 {
+            return fail("data.prefetch: at least 1".into());
         }
         let o = &self.optimizer;
         if !matches!(o.kind.as_str(), "adamw" | "muon" | "adafactor") {

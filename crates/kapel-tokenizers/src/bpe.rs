@@ -25,7 +25,10 @@ pub(crate) struct Bpe {
 
 impl Bpe {
     pub(crate) fn from_json(json: &Value) -> Result<Self, TokenizerError> {
-        if json.get("type").and_then(Value::as_str) != Some("BPE") {
+        // Older files (GPT-2's on the Hub) give no type: `tokenizers` takes
+        // a model with merges for a BPE.
+        let kind = json.get("type").and_then(Value::as_str);
+        if !(kind == Some("BPE") || kind.is_none() && json.get("merges").is_some()) {
             return Err(bad("only BPE models are supported"));
         }
         let vocab: HashMap<String, u32> = json

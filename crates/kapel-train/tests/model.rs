@@ -69,6 +69,7 @@ fn compare_with_inference(raw: Value) {
         ids: &IDS,
         targets: &t,
         rows: 2,
+        segments: None,
     };
     let logits = decoder
         .logits(&leaves, &batch, &Options::default())
@@ -93,6 +94,47 @@ fn the_decoders_give_the_logits_of_inference() {
     compare_with_inference(qwen3());
 }
 
+/// Three documents in one row, kept apart: the logits of each are those of
+/// the inference pass on that document alone, positions from 0.
+fn documents_apart(raw: Value) {
+    let config = Config::from_json(&raw).unwrap();
+    let params = init(&config, 0.2, 1).unwrap();
+    let model = Model::new(raw, weights(&params, DType::F32)).unwrap();
+    let cpu = kapel_cpu::Cpu::new();
+    let decoder = Decoder::new(config).unwrap();
+    let tape = Tape::new(cpu.clone());
+    let leaves = params.leaves(&tape);
+    let t = targets();
+    let segments = [4, 4, 4, 4, 9, 9, 9, 2, 2, 2];
+    let batch = Batch {
+        ids: &IDS,
+        targets: &t,
+        rows: 1,
+        segments: Some(&segments),
+    };
+    let logits = decoder
+        .logits(&leaves, &batch, &Options::default())
+        .unwrap()
+        .value()
+        .to_f64_vec()
+        .unwrap();
+    let mut expected = Vec::new();
+    for document in [&IDS[..4], &IDS[4..7], &IDS[7..]] {
+        expected.extend(model.forward(&cpu, document).unwrap().to_f64_vec().unwrap());
+    }
+    assert_eq!(logits.len(), expected.len());
+    for (a, b) in logits.iter().zip(&expected) {
+        assert!((a - b).abs() < 1e-5, "{a} and {b}");
+    }
+}
+
+#[test]
+fn documents_of_one_row_see_only_themselves() {
+    documents_apart(gpt2());
+    documents_apart(llama());
+    documents_apart(qwen3());
+}
+
 /// The loss and the gradients of every parameter on `backend`, dense.
 fn loss_and_gradients<B: Compute>(
     backend: B,
@@ -108,6 +150,7 @@ fn loss_and_gradients<B: Compute>(
         ids: &IDS,
         targets: &t,
         rows: 2,
+        segments: None,
     };
     let loss = decoder.loss(&leaves, &batch, options).unwrap();
     let value = backend

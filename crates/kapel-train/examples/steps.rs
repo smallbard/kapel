@@ -107,6 +107,7 @@ fn train<B: Compute>(
             ids: &tokens[at..at + n],
             targets: &tokens[at + 1..=at + n],
             rows: a.rows,
+            segments: None,
         };
         sync();
         let start = Instant::now();

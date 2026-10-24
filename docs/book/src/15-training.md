@@ -2,7 +2,7 @@
 
 Every operation of the catalogue has had a backward pass since chapter 4: `Run::backward` turns the gradient of an output into the gradients of the inputs, and the conformity suite checks it on every backend. This chapter is about putting those derivatives to work. `kapel-train` records a computation on a tape, runs it backwards to get the gradient of a loss with respect to the parameters, and moves the parameters with an optimizer. The decoders of chapter 10 train on it without a second implementation: the same weights, by the same names, through the same operations.
 
-Sections 15.1 to 15.7 are step T0 of the training plan, the differentiation; sections 15.8 to 15.12 are step T1, a training run on one card as fast as llm.c, with everything around it. The data, post-training and the tools of experiments come in the steps after them.
+Sections 15.1 to 15.7 are step T0 of the training plan, the differentiation; sections 15.8 to 15.12 are step T1, a training run on one card as fast as llm.c, with everything around it; section 15.13 is step T2, the data. Post-training and the tools of experiments come in the steps after them.
 
 ## 15.1 The tape
 
@@ -127,7 +127,7 @@ final = 0.0
 
 `kapel_train::trainer::run` does each step this way:
 
-1. **Batches.** The `Loader` (`data.rs`) reads llm.c's token files, mapped: the next `rows × length + 1` tokens of the current file, the last one only as a target, then the next file when one has not enough, the last handing over to the first. FineWeb as llm.c and modded-nanogpt publish it is in this format (GPT-2's tokens in `u16`, Llama 3's in `u32`).
+1. **Batches.** A thread reads them ahead (section 15.13): rows of `length` tokens from the training sources, each with the token after it as its last target. `data_ms` in the log is the time a step waited for them.
 2. **Accumulation.** Each of the step's passes computes its loss and its gradients on a tape of its own; the gradients are added up across passes, those by rows joined.
 3. **Clipping.** The global norm of the gradients, `√Σ g²` over all of them, divided by the passes, is read back; above `training.clip`, the gradients are scaled down to it. The scale goes to the optimizer with `1 / passes`: no gradient is rewritten.
 4. **The step**, at the learning rate of the schedule (`schedule.rs`): a linear warmup from zero, `(step + 1) / warmup` as llm.c's, then half a cosine down to `final` (llm.c, nanoGPT), a constant, or WSD's plateau then a straight decay over the last part of the run.
@@ -155,7 +155,7 @@ The parameters and the optimizer's moments are `f32`, the master weights. Each p
 
 ## 15.11 Checkpoints and resuming
 
-A checkpoint is a directory `step-NNNNNNNN` in the run's (`checkpoint.rs`): `model.safetensors`, the parameters in `f32` under the names of `transformers`, with `config.json` (the directory is a model that `transformers` and `kapel run` load); `optimizer.safetensors`, the moments; `state.json`, the step, the optimizer's steps, the position in the training files and the tokens seen; and `config.toml`, the run's configuration. The tensors are copied to host memory when the checkpoint is taken, and a thread writes them while the next steps compute, under a temporary name renamed once complete: a run killed while writing leaves the previous checkpoints whole. The oldest are removed beyond `checkpoint.keep`. (On the processor, a download is the tensor itself: the checkpoint takes copies, since the next steps update the tensors in place.)
+A checkpoint is a directory `step-NNNNNNNN` in the run's (`checkpoint.rs`): `model.safetensors`, the parameters in `f32` under the names of `transformers`, with `config.json` (the directory is a model that `transformers` and `kapel run` load); `optimizer.safetensors`, the moments; `state.json`, the step, the optimizer's steps, the position in the data (the rows read, and for each source its epoch, shard and row) and the tokens seen; and `config.toml`, the run's configuration. The tensors are copied to host memory when the checkpoint is taken, and a thread writes them while the next steps compute, under a temporary name renamed once complete: a run killed while writing leaves the previous checkpoints whole. The oldest are removed beyond `checkpoint.keep`. (On the processor, a download is the tensor itself: the checkpoint takes copies, since the next steps update the tensors in place.)
 
 `kapel train --resume` goes on from the last complete checkpoint: the parameters, the moments and steps of the optimizer, the position in the data. Nothing else in a step depends on the past: on the same machine, the run computes the bits of a run that was not interrupted. The tests `a_resumed_run_computes_the_bits_of_an_uninterrupted_one` (on the processor, with each optimizer, accumulation and clipping) and `a_resumed_run_on_the_card_computes_the_same_bits` (bf16 on the card) kill a run after three steps (`--steps 3` does it), resume it, and compare every parameter with those of a run of seven steps, bit for bit.
 
@@ -202,3 +202,32 @@ The losses come from 250 such steps, 131 million tokens, both runs from new weig
 | 250 | 5.971 | 6.084 | 6.014 |
 
 The order of the data moves the loss by 0.11 at step 250, more than anything that separates the two programs: on the same tokens Kapel's loss is the lower one, by 0.07, from initial weights drawn by another generator. The curves leave no sign of a difference in what is computed; the target of 3.28 itself is left to a machine that can give the run its 45 hours.
+
+## 15.13 The data
+
+The data of a run is prepared once, then read by every step without the step waiting for it, and the run knows exactly which tokens it read.
+
+**Preparing.** `kapel prepare INPUT... --tokenizer PATH --output DIR` (`prepare.rs`) reads Parquet files (a row each, the column `text`), JSONL files (a line each, the field `text`) and text files (one document each). One thread reads the documents in order and cuts them into jobs of 256; as many threads as cores tokenize them, each with a tokenizer of its own (the cache of encoded pieces has one lock); the main thread puts the jobs back in order and only then decides: a document whose text is that of an earlier one is left out (exact deduplication, by the first 128 bits of the SHA-256 of its text), an empty one too, and one kept document in `--val-every` goes to the validation split. The decisions depend on the order of the documents alone, so the same inputs give the same files whatever the number of threads; the test `the_same_inputs_give_the_same_files_whatever_the_threads` compares them byte for byte after one thread and five. Documents are encoded as plain text (section 9.2), each preceded by the separator, the tokenizer's `bos_token` or else its `eos_token` (`<|endoftext|>` for GPT-2, as llm.c's FineWeb shards have it).
+
+**The dataset** (`dataset.rs`) is a directory: shards in llm.c's format (`u16` for vocabularies up to 65,536 tokens, `u32` beyond), each document whole in one shard of at most `--shard-tokens` (100 million by default); for each shard an index, the first token of each of its documents; and `dataset.json`, the manifest, with the SHA-256 of the tokenizer, the separator, the counts of documents read, duplicates and empty ones, and for each split its shards with their sizes and SHA-256. llm.c's own files are read as they are, without an index: the separator, given as `data.separator`, marks the documents when they are needed.
+
+**Sources.** `data.train` names one source, `data.sources` several, each with a weight: a dataset's directory or `dataset.json`, local or at an `http(s)://` URL, or a pattern of llm.c files. Each row of a batch comes from one source, drawn with the probability of its weight by a generator that depends only on `data.seed` and the row's rank (SplitMix64). A source goes through its shards in order or, with `data.shuffle`, in an order drawn anew for each epoch, and through each shard's rows in order or in an order drawn for that shard and that epoch. The order of every row thus depends on the seed alone; the position in the data is the rows read and, for each source, its epoch, shard and row, and a checkpoint that saves it reads on exactly as before. `a_resumed_run_over_mixed_shuffled_documents_computes_the_same_bits` kills and resumes a run over two weighted sources, shuffled, packed by documents with their mask, and compares every parameter with those of a run that was not killed; a run with the same seed gives the same bits, one with another seed others.
+
+**Packing.** `data.pack = "stream"` cuts a shard's tokens every `length`, as llm.c does: a row may begin inside a document and end in the next. `"documents"` fills a row with whole documents, as many as fit, and pads the rest (ids of the separator, targets ignored); a document longer than a row is cut into rows of its own. With `data.mask`, each token attends to the earlier tokens of its own document only, and its position counts from the document's first token; the test `documents_of_one_row_see_only_themselves` checks that the logits of three documents in one row are those of the inference pass on each alone, for GPT-2, Llama and Qwen 3. The mask is not a tensor of `rows × length²` values: the attention receives where the document of each token starts (section 4), and the card skips the keys before each document (section 7.6).
+
+**Reading ahead.** `Prefetched` moves the loader to a thread of its own, `data.prefetch` batches ahead (4 by default); each batch comes with the position after it, which is what a checkpoint saves. A remote source downloads its manifest, then each shard with its index when it is reached, into `data.cache` (`~/.cache/kapel/data` by default), checking its SHA-256; while one shard is read the next is downloaded, and the shards read are removed. The test `a_remote_dataset_reads_as_the_local_one_and_keeps_little_on_disk` serves a dataset over HTTP: the batches are those of the local copy, at most two shards stay on disk, and a shard whose bytes were changed is refused. Requests carry no token but to the Hub, and nothing that names the user.
+
+**Measured**, on the Ryzen 7 7700 and the RTX 3090:
+
+| | |
+| --- | --- |
+| Preparing FineWeb-Edu's first file (726,000 documents, 2.2 GB of Parquet) with GPT-2's tokenizer | 26 s, 29 million tokens a second; 1,489 duplicates left out |
+| The same, one thread | 3.5 million tokens a second |
+| Tokens compared with `transformers` on 2,000 documents | identical |
+| One thread reading batches of 16 × 1024 (stream, in order) | 1.5 billion tokens a second |
+| The same, whole documents with their mask, shuffled | 730 million tokens a second; 80 % of the targets real, 20 % padding |
+| A step of GPT-2 124M waiting for its batch (16 × 1024, prefetched) | 0.003 ms of 316 |
+| The same step with documents and their mask | 317.6 ms, against 315.9 without |
+
+The plan asks that loading take less than 1 % of a step of a 1B model on 8 cards. Eight H100 at 40 % of their bf16 peak (989 Top/s each) train a 1B model, some 6 × 10⁹ operations a token, on about half a million tokens a second; one thread of the loader gives 730 million, and each card's process would have its own. On one card, a step waits 0.003 ms for its batch: a hundred-thousandth of its time.
+

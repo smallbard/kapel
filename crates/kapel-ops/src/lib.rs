@@ -28,7 +28,7 @@ mod update;
 
 use std::fmt;
 
-pub use attention::Attention;
+pub use attention::{Attention, documents_mask, is_documents};
 pub use copy::{Concat, Contiguous};
 pub use elementwise::{Affine, Binary, BinaryKind, Cast, Glu, Unary, UnaryKind};
 pub use index::{GatherRows, ScatterAddRows};

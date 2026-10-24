@@ -145,6 +145,7 @@ fn measure<B: Compute>(
         ids: &tokens[..n],
         targets: &tokens[1..=n],
         rows: a.rows,
+        segments: None,
     };
     let options = Options {
         dtype: a.dtype,
