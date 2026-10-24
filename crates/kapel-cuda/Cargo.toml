@@ -20,12 +20,12 @@ cuda = ["dep:cuda-core", "dep:cuda-bindings", "dep:cutile"]
 kapel-core.workspace = true
 kapel-ops.workspace = true
 kapel-cuda-abi.workspace = true
-cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "a73ec6ef7fe2922c93f5d1e1f2e3de67c891a760", optional = true }
+cuda-core = { version = "0.4.0", optional = true }
 # The driver's graph functions (capture, instantiation, launch), which cuda-core
 # does not wrap.
-cuda-bindings = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "a73ec6ef7fe2922c93f5d1e1f2e3de67c891a760", optional = true }
+cuda-bindings = { version = "0.4.0", optional = true }
 # Tile kernels, compiled at their first launch by `tileiras` (CUDA 13.2 or later).
-cutile = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "a73ec6ef7fe2922c93f5d1e1f2e3de67c891a760", optional = true }
+cutile = { version = "0.4.0", optional = true }
 
 [dev-dependencies]
 serde_json.workspace = true

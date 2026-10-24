@@ -80,6 +80,17 @@ jobs:
         env:
           KAPEL_REQUIRE_PARITY: "1"
 
+  # The book and the guide build, their links resolve.
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: mdbook@0.5.4
+      - run: mdbook build docs/book
+      - run: mdbook build docs/guide
+
   msrv:
     runs-on: ubuntu-latest
     steps:

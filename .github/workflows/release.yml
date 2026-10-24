@@ -1,0 +1,144 @@
+name: Release
+
+# A tag v* builds the `kapel` command and libkapel for Linux (x86 and ARM),
+# macOS and Windows, and the Python wheels, then attaches them to a GitHub
+# release. Publishing to PyPI and crates.io waits for an approval on the
+# environments `pypi` and `crates-io`.
+#
+# The prebuilt binaries compute on the processor; for NVIDIA cards, build with
+# the `cuda` feature or use the container image (see the guide).
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  binaries:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-x86_64
+          - os: ubuntu-24.04-arm
+            name: linux-aarch64
+          - os: macos-latest
+            name: macos-aarch64
+          - os: windows-latest
+            name: windows-x86_64
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --locked -p kapel-cli -p kapel-capi
+      - name: Package
+        run: |
+          dir="kapel-${GITHUB_REF_NAME}-${{ matrix.name }}"
+          mkdir -p "$dir/bin" "$dir/lib" "$dir/include"
+          cp LICENSE "$dir/"
+          cp crates/kapel-capi/include/kapel.h "$dir/include/"
+          case "${{ matrix.os }}" in
+            windows-*)
+              cp target/release/kapel.exe "$dir/bin/"
+              cp target/release/kapel.dll target/release/kapel.dll.lib target/release/kapel.lib "$dir/lib/"
+              7z a "$dir.zip" "$dir" > /dev/null
+              ;;
+            macos-*)
+              cp target/release/kapel "$dir/bin/"
+              cp target/release/libkapel.dylib target/release/libkapel.a "$dir/lib/"
+              tar czf "$dir.tar.gz" "$dir"
+              ;;
+            *)
+              cp target/release/kapel "$dir/bin/"
+              cp target/release/libkapel.so target/release/libkapel.a "$dir/lib/"
+              tar czf "$dir.tar.gz" "$dir"
+              ;;
+          esac
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.name }}
+          path: kapel-*.*
+
+  wheels:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release --locked -m crates/kapel-python/Cargo.toml -o dist
+          manylinux: auto
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}
+          path: dist
+
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: -m crates/kapel-python/Cargo.toml -o dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-sdist
+          path: dist
+
+  github:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [binaries, wheels, sdist]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
+
+  pypi:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [wheels, sdist]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  crates-io:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [binaries]
+    runs-on: ubuntu-latest
+    environment: crates-io
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # The crates in the order of their dependencies.
+      - run: cargo publish --workspace --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

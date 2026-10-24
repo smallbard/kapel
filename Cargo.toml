@@ -8,23 +8,23 @@ edition = "2024"
 rust-version = "1.89"
 license = "MIT"
 authors = ["Olivier Le Guyader"]
-publish = false
+publish = true
 
 [workspace.dependencies]
-kapel-core = { path = "crates/kapel-core" }
-kapel-ops = { path = "crates/kapel-ops" }
-kapel-ref = { path = "crates/kapel-ref" }
-kapel-cpu = { path = "crates/kapel-cpu" }
-kapel-cuda = { path = "crates/kapel-cuda" }
-kapel-cuda-abi = { path = "crates/kapel-cuda-abi" }
-kapel-hub = { path = "crates/kapel-hub" }
-kapel-tokenizers = { path = "crates/kapel-tokenizers" }
-kapel-models = { path = "crates/kapel-models" }
-kapel-infer = { path = "crates/kapel-infer" }
-kapel-train = { path = "crates/kapel-train" }
-kapel-serve = { path = "crates/kapel-serve" }
-kapel-quant = { path = "crates/kapel-quant" }
-kapel-runtime = { path = "crates/kapel-runtime" }
+kapel-core = { path = "crates/kapel-core", version = "0.1.0" }
+kapel-ops = { path = "crates/kapel-ops", version = "0.1.0" }
+kapel-ref = { path = "crates/kapel-ref", version = "0.1.0" }
+kapel-cpu = { path = "crates/kapel-cpu", version = "0.1.0" }
+kapel-cuda = { path = "crates/kapel-cuda", version = "0.1.0" }
+kapel-cuda-abi = { path = "crates/kapel-cuda-abi", version = "0.1.0" }
+kapel-hub = { path = "crates/kapel-hub", version = "0.1.0" }
+kapel-tokenizers = { path = "crates/kapel-tokenizers", version = "0.1.0" }
+kapel-models = { path = "crates/kapel-models", version = "0.1.0" }
+kapel-infer = { path = "crates/kapel-infer", version = "0.1.0" }
+kapel-train = { path = "crates/kapel-train", version = "0.1.0" }
+kapel-serve = { path = "crates/kapel-serve", version = "0.1.0" }
+kapel-quant = { path = "crates/kapel-quant", version = "0.1.0" }
+kapel-runtime = { path = "crates/kapel-runtime", version = "0.1.0" }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query"] }
 fancy-regex = "0.16"
 futures-util = { version = "0.3", default-features = false }

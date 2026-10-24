@@ -149,6 +149,22 @@ pub(crate) const KERNELS: &[(&str, &[Param])] = &[
         &[U32, U32, Slice, U32, Slice, U32, U32, Slice],
     ),
     (
+        "qgemv_q4_0",
+        &[U32, U32, Slice, U32, Slice, U32, U32, U32, Slice],
+    ),
+    (
+        "qgemv_q4_0_1",
+        &[U32, U32, Slice, U32, Slice, U32, U32, Slice],
+    ),
+    (
+        "qgemv_q4_1",
+        &[U32, U32, Slice, U32, Slice, U32, U32, U32, Slice],
+    ),
+    (
+        "qgemv_q4_1_1",
+        &[U32, U32, Slice, U32, Slice, U32, U32, Slice],
+    ),
+    (
         "qgemv_q4k",
         &[U32, U32, Slice, U32, Slice, U32, U32, U32, Slice],
     ),

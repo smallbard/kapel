@@ -1,0 +1,99 @@
+[
+  {
+    "name": "llama3.2-1b-cpu-q4_0",
+    "model": "unsloth/Llama-3.2-1B-Instruct",
+    "device": "cpu",
+    "dtype": "f32",
+    "quantize": "q4_0",
+    "quantize_output": true,
+    "processor": "AMD Ryzen 7 7700 8-Core Processor",
+    "threads": 8,
+    "kapel": "0.1.0",
+    "results": {
+      "prefill_tokens_per_s": 333.03374367945133,
+      "decode_tokens_per_s": 70.32281656829745,
+      "perplexity": 17.018332546977486
+    }
+  },
+  {
+    "name": "llama3.2-3b-cuda-bf16",
+    "model": "unsloth/Llama-3.2-3B-Instruct",
+    "device": "cuda",
+    "dtype": "bf16",
+    "quantize": null,
+    "quantize_output": false,
+    "processor": "AMD Ryzen 7 7700 8-Core Processor",
+    "threads": 8,
+    "kapel": "0.1.0",
+    "results": {
+      "prefill_tokens_per_s": 8645.719911028787,
+      "decode_tokens_per_s": 113.15694683286905,
+      "batch_tokens_per_s": 3491.9353898166796,
+      "perplexity": 10.92537499662295
+    }
+  },
+  {
+    "name": "llama3.2-3b-cuda-q4_0",
+    "model": "unsloth/Llama-3.2-3B-Instruct",
+    "device": "cuda",
+    "dtype": "bf16",
+    "quantize": "q4_0",
+    "quantize_output": true,
+    "processor": "AMD Ryzen 7 7700 8-Core Processor",
+    "threads": 8,
+    "kapel": "0.1.0",
+    "results": {
+      "prefill_tokens_per_s": 4411.416338807389,
+      "decode_tokens_per_s": 228.42786096704788,
+      "perplexity": 11.705159857571797
+    }
+  },
+  {
+    "name": "qwen2.5-0.5b-cpu-f32",
+    "model": "Qwen/Qwen2.5-0.5B-Instruct",
+    "device": "cpu",
+    "dtype": "f32",
+    "quantize": null,
+    "quantize_output": false,
+    "processor": "AMD Ryzen 7 7700 8-Core Processor",
+    "threads": 8,
+    "kapel": "0.1.0",
+    "results": {
+      "prefill_tokens_per_s": 811.9621383196724,
+      "decode_tokens_per_s": 26.096357660880557,
+      "perplexity": 15.2095512750094
+    }
+  },
+  {
+    "name": "qwen2.5-0.5b-cpu-q4_0",
+    "model": "Qwen/Qwen2.5-0.5B-Instruct",
+    "device": "cpu",
+    "dtype": "f32",
+    "quantize": "q4_0",
+    "quantize_output": true,
+    "processor": "AMD Ryzen 7 7700 8-Core Processor",
+    "threads": 8,
+    "kapel": "0.1.0",
+    "results": {
+      "prefill_tokens_per_s": 704.1761961510962,
+      "decode_tokens_per_s": 150.82872140274378,
+      "perplexity": 18.541514659939416
+    }
+  },
+  {
+    "name": "qwen2.5-0.5b-cuda-bf16",
+    "model": "Qwen/Qwen2.5-0.5B-Instruct",
+    "device": "cuda",
+    "dtype": "bf16",
+    "quantize": null,
+    "quantize_output": false,
+    "processor": "AMD Ryzen 7 7700 8-Core Processor",
+    "threads": 8,
+    "kapel": "0.1.0",
+    "results": {
+      "prefill_tokens_per_s": 40850.85631612882,
+      "decode_tokens_per_s": 437.11209743180467,
+      "perplexity": 15.20233774707245
+    }
+  }
+]

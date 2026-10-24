@@ -16,8 +16,10 @@ read, change or extend the code.
 - [10. Models: kapel-models](src/10-models.md)
 - [11. Generating text: kapel-infer and kapel-cli](src/11-generating-text.md)
 - [12. Serving: kapel-serve](src/12-serving.md)
-- [13. Safety and security](src/13-safety-and-security.md)
-- [14. Working on Kapel](src/14-working-on-kapel.md)
+- [13. Quantizing and evaluating: kapel-quant and kapel eval](src/13-quantizing-and-evaluating.md)
+- [14. Kapel from C and Python: kapel-runtime, kapel-capi and kapel-python](src/14-bindings.md)
+- [15. Safety and security](src/15-safety-and-security.md)
+- [16. Working on Kapel](src/16-working-on-kapel.md)
 - [Appendix](src/appendix.md)
 
 The chapters are plain Markdown and read well on GitHub. To build them as a

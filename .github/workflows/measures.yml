@@ -1,0 +1,36 @@
+name: Measures
+
+# The speeds and perplexities Kapel publishes, measured on the self-hosted
+# machine (Ryzen 7 7700, RTX 3090) that nothing else uses while it runs, and
+# compared with the baseline measured there (tools/bench/baselines). A speed
+# 10 % below the baseline, or a perplexity that moved, fails the job; the
+# report is in the job's summary and its artifact.
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 5 * * 1"   # every Monday at 05:00 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: measures
+  cancel-in-progress: false
+
+jobs:
+  measures:
+    if: vars.CUDA_RUNNER == 'true'
+    runs-on: [self-hosted, linux, cuda]
+    permissions:
+      contents: read
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: tools/bench/run.sh all measures.json
+      - run: python3 tools/bench/compare.py tools/bench/baselines/ryzen7-7700-rtx3090.json measures.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: measures
+          path: measures.json

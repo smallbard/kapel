@@ -14,7 +14,9 @@
 - [10. Models: kapel-models](10-models.md)
 - [11. Generating text: kapel-infer and kapel-cli](11-generating-text.md)
 - [12. Serving: kapel-serve](12-serving.md)
-- [13. Safety and security](13-safety-and-security.md)
-- [14. Working on Kapel](14-working-on-kapel.md)
+- [13. Quantizing and evaluating: kapel-quant and kapel eval](13-quantizing-and-evaluating.md)
+- [14. Kapel from C and Python: kapel-runtime, kapel-capi and kapel-python](14-bindings.md)
+- [15. Safety and security](15-safety-and-security.md)
+- [16. Working on Kapel](16-working-on-kapel.md)
 
 [Appendix](appendix.md)

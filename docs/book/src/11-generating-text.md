@@ -1,6 +1,6 @@
 # 11. Generating text: kapel-infer and kapel-cli
 
-`kapel-infer` is the first piece of the inference plan: it loads a model directory or a GGUF file onto a backend and generates text token by token, making the same choices as `transformers`. With greedy decoding, its tokens match the reference generations of `transformers` saved in `data/parity/generation`. `kapel-cli` wraps it in the `kapel run` command; the engine that serves many requests at once is the base of the server of chapter 12.
+`kapel-infer` is the first piece of the inference plan: it loads a model directory or a GGUF file onto a backend and generates text token by token, making the same choices as `transformers`. With greedy decoding, its tokens match the reference generations of `transformers` saved in `data/parity/generation`. `kapel-cli` wraps it in the `kapel run` command; the engine that serves many requests at once is the base of the server of chapter 12. `Scorer`, which gives the log-likelihood of continuations rather than generating, serves evaluation (chapter 13).
 
 ## 11.1 The pipeline
 
@@ -121,7 +121,7 @@ Spaces and multi-byte characters depend on their neighbours, so the text of the 
 
 ## 11.7 The kapel command
 
-`kapel serve`, the server, is the subject of chapter 12; this section is about `kapel run`.
+`kapel serve`, the server, is the subject of chapter 12, and `kapel quantize` and `kapel eval`, which make quantized models and measure them, of chapter 13; this section is about `kapel run`.
 
 ```
 cargo run --release -p kapel-cli -- run Qwen/Qwen3-0.6B --prompt "Why is the sky blue?"

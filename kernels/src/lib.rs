@@ -2613,6 +2613,20 @@ fn load_raw<const F: u32>(group: usize, row: &[u8], e: usize) -> [u32; 10] {
         r[2] = u16_at(row, at + 2);
         r[3] = u16_at(row, at + 4);
         r[4] = u16_at(row, at + 6);
+    } else if F == quant::Q4_0 || F == quant::Q4_1 {
+        // A block: the scale (and Q4_1's minimum), then 16 bytes whose low
+        // nibbles are elements 0 to 15 and high nibbles 16 to 31.
+        let size = if F == quant::Q4_1 { 20 } else { 18 };
+        let base = e / 32 * size;
+        let at = base + size - 16 + e % 16;
+        r[0] = u16_at(row, base);
+        r[1] = u16_at(row, at);
+        r[2] = u16_at(row, at + 2);
+        r[3] = u16_at(row, at + 4);
+        r[4] = u16_at(row, at + 6);
+        if F == quant::Q4_1 {
+            r[5] = u16_at(row, base + 2);
+        }
     } else if F == quant::Q4K {
         let base = e / 256 * 144;
         let off = e % 256;
@@ -2681,6 +2695,14 @@ fn decode_raw<const F: u32>(r: &[u32; 10], e: usize) -> (f32, f32, [f32; 8]) {
         let c = |w: u32, i: u32| small_float(((w >> (8 * i)) & 0xff) ^ 0x80) - 128.0;
         let q = [c(r[1], 0), c(r[1], 1), c(r[2], 0), c(r[2], 1), c(r[3], 0), c(r[3], 1), c(r[4], 0), c(r[4], 1)];
         (f16_hw(r[0]), 0.0, q)
+    } else if F == quant::Q4_0 || F == quant::Q4_1 {
+        // Elements 16 to 31 of a block are the high nibbles.
+        let t = (e % 32 / 16) as u32;
+        let offset = if F == quant::Q4_1 { 0.0 } else { 8.0 };
+        let c = |w: u32, i: u32| small_float((w >> (8 * i + 4 * t)) & 0x0f) - offset;
+        let q = [c(r[1], 0), c(r[1], 1), c(r[2], 0), c(r[2], 1), c(r[3], 0), c(r[3], 1), c(r[4], 0), c(r[4], 1)];
+        let min = if F == quant::Q4_1 { f16_hw(r[5]) } else { 0.0 };
+        (f16_hw(r[0]), min, q)
     } else if F == quant::Q4K {
         let off = e % 256;
         let (t, k) = ((off % 64 / 32) as u32, off / 32);
@@ -2880,6 +2902,8 @@ macro_rules! qgemv_kernels {
 qgemv_kernels!(qgemv_int8, qgemv_int8_1, quant::INT8);
 qgemv_kernels!(qgemv_int4, qgemv_int4_1, quant::INT4);
 qgemv_kernels!(qgemv_q8_0, qgemv_q8_0_1, quant::Q8_0);
+qgemv_kernels!(qgemv_q4_0, qgemv_q4_0_1, quant::Q4_0);
+qgemv_kernels!(qgemv_q4_1, qgemv_q4_1_1, quant::Q4_1);
 qgemv_kernels!(qgemv_q4k, qgemv_q4k_1, quant::Q4K);
 qgemv_kernels!(qgemv_q6k, qgemv_q6k_1, quant::Q6K);
 

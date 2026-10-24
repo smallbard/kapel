@@ -1,6 +1,6 @@
 # 8. Model files: kapel-hub
 
-`kapel-hub` turns files on disk, or on the Hugging Face Hub, into tensors. It reads safetensors and GGUF, opens sharded checkpoints, downloads repositories into a cache, and writes safetensors back. Every reader treats its file as untrusted: sizes are checked before anything is allocated, and arithmetic on offsets is checked for overflow. It depends only on `kapel-core`.
+`kapel-hub` turns files on disk, or on the Hugging Face Hub, into tensors. It reads safetensors and GGUF, opens sharded checkpoints, downloads repositories into a cache, and writes safetensors and GGUF back. Every reader treats its file as untrusted: sizes are checked before anything is allocated, and arithmetic on offsets is checked for overflow. It depends only on `kapel-core`.
 
 ## 8.1 Zero-copy reading
 
@@ -47,10 +47,14 @@ A checkpoint is a model directory: `config.json`, `tokenizer.json`, often `gener
 3. Download the top-level configuration and tokenizer files, then only the weights the checkpoint will read: the shards of the index, or `model.safetensors`. Duplicate formats such as `consolidated.safetensors` or `onnx/` are skipped.
 4. Stream each file to a `.part` file, compute its SHA-256 and compare it with the Hub's checksum for large files, then rename it into place.
 
+Once every file is there, `refs/<revision>` in the repository's directory records the commit, as the Hub's own cache does. When the Hub cannot be reached (a transport error: no network, a timeout), the commit recorded for the revision is used without asking, so a model downloaded once runs offline; `KAPEL_OFFLINE=1` or `HF_HUB_OFFLINE=1` skips the Hub altogether. A refusal of the Hub (404, 401) stays an error: the revision may have been deleted or its access withdrawn. A recorded commit must be hexadecimal, and a revision that cannot name a file (`refs/pr/1`) is not recorded.
+
 The cache root is `$KAPEL_CACHE`, or `~/.cache/kapel/hub`. A gated model needs `HF_TOKEN`. Connections time out after 30 s, and a transfer that stalls for 60 s fails rather than hanging.
 
 ## 8.5 Writing safely
 
 `safetensors::save` writes any host tensors, contiguous or not, padding the header so the data starts on an 8-byte boundary. Like every write in Kapel, it goes through `write_atomic`: the content is written to a temporary file in the same directory, flushed to disk, and renamed over the target. A process that has the old file mapped keeps reading the old content. This is what makes `Model::save` into the directory the model was loaded from safe; on Windows, where a mapped file cannot be replaced, it returns an error instead.
+
+`gguf::write(path, metadata, tensors)` writes a GGUF file of version 3: the metadata in the order given, each value an `Entry` that carries its GGUF type (llama.cpp reads each key as one type: `block_count` as `u32`, `rope.freq_base` as `f32`), then the tensor descriptions and their data, each aligned on 32 bytes. Views are written in row-major order, quantized tensors as their blocks (`ggml_type` gives the ggml number of a Kapel type), and the data is streamed tensor by tensor through `write_atomic`. A test writes metadata of every kind, a view and a quantized tensor, and reads them back; `kapel quantize` uses it to write models llama.cpp reads (chapter 13).
 
 Errors from this crate are `HubError`: `Io` and `Format` carry the path of the file, `Missing` the name of the tensor, and `Tensor` wraps a `kapel-core` error.

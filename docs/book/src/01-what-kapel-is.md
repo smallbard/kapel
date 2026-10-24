@@ -12,8 +12,8 @@ Five rules shape almost every design decision in the code. They are stated in `C
 
 1. **Every fast backend is checked against the reference.** The reference backend computes each operation in `f64`, as plainly as possible. A new operation comes with its reference definition, its gradient, and a conformity test with a written tolerance (chapter 5).
 2. **Results do not depend on the number of threads.** Work is split according to tensor shapes, never according to the hardware. Two runs give the same bits, and tests check it with 1, 2, 3 and 8 threads (chapter 6).
-3. **The library does not panic on user input.** Wrong shapes, unsupported types, corrupt files, hostile templates: each returns a typed error. `panic!` is reserved for broken internal invariants (chapters 3 and 13).
-4. **Every optimization comes with a measurement**, kept as a benchmark program next to the code it measures (chapter 14).
+3. **The library does not panic on user input.** Wrong shapes, unsupported types, corrupt files, hostile templates: each returns a typed error. `panic!` is reserved for broken internal invariants (chapters 3 and 15).
+4. **Every optimization comes with a measurement**, kept as a benchmark program next to the code it measures (chapter 16).
 5. **Code that can be audited**: few dependencies, short modules, documented kernels, and a `// SAFETY:` comment on every `unsafe` block.
 
 The development hardware is a Ryzen 7 7700 (Zen 4, with AVX-512 and its bf16 extension) and an RTX 3090 (Ampere, 24 GB). Several tuning constants in the code are named after it, such as the block sizes `Blocks::ZEN4`.
@@ -25,7 +25,7 @@ The work is organised in three plans, each a sequence of steps with a goal and a
 | Plan | File | Goal | Steps | State on 23 October 2026 |
 | --- | --- | --- | --- | --- |
 | Foundation | `PLAN-SOCLE.md` | Tensors, backends, model files, tooling | S0–S5 | All six steps done |
-| Inference | `PLAN-INFERENCE.md` | Load, quantize and serve small models on CPU and GPU | I0–I6 | I0 (correct generation), I1 (the CPU, but for ARM), I2 (the card), I3 (serving) and I4 (speculative decoding, without several GPUs nor off-card tables) done on 23 October 2026; I5–I6 to come |
+| Inference | `PLAN-INFERENCE.md` | Load, quantize and serve small models on CPU and GPU | I0–I6 | I0 (correct generation), I1 (the CPU, but for ARM), I2 (the card), I3 (serving) I4 (speculative decoding, without several GPUs nor off-card tables) and I5 (quantizing one's own models) done on 23 October 2026; I6 (being used) done but for its first releases |
 | Training | `PLAN-ENTRAINEMENT.md` | Bit-reproducible training up to a few billion parameters | T0–T6 | Not started; `kapel-train` is an empty crate |
 
 The inference plan targets one sequence at a time on a CPU first. Smallem showed that a small int4 model generates faster on a Ryzen than on an RTX 3090: token-by-token generation waits on memory, and a well-programmed CPU uses nearly all of its bandwidth. Batched generation on a GPU, with a paged cache, came after, then a server that computes the requests of many clients together.
@@ -40,4 +40,7 @@ The inference plan targets one sequence at a time on a CPU first. Smallem showed
 - A generation engine and the `kapel run` command (chapter 11), which on a Ryzen 7 7700 generates with a quantized Llama 3.2 1B at 90 % of llama.cpp's speed (chapter 6), and generation by batches over a cache by pages, which on an RTX 3090 reaches 90 % of vLLM's throughput (chapters 7, 10 and 11).
 - A server of OpenAI's API, `kapel serve` (chapter 12): requests that come and go computed together, streamed answers, answers held to a JSON schema or a grammar, Prometheus metrics. On an RTX 3090 it serves Llama 3.2 3B at about 20 requests per second, and at 80 % of that load 99 % of the requests get their first token within 63 ms.
 - Speculative decoding (chapter 11): a smaller model, the tokens of the sequence, or the model's own multi-token layer proposes, and the model checks several tokens per pass without changing its answers. On an RTX 3090, Qwen3 8B generates 1.72 times faster with Qwen3 0.6B proposing, and MiMo-7B 1.53 times faster with its own layer.
-- Fuzzing of every reader of untrusted files, and continuous integration on four platforms plus a GPU runner (chapters 13 and 14).
+- Quantization with data, by GPTQ and AWQ, and the `kapel quantize` command, which writes GGUF files that llama.cpp reads (chapter 13). Llama 3.2 1B in Q4\_0 by GPTQ loses 44 % less perplexity than llama.cpp's quantization with its importance matrix.
+- `kapel eval`, which replays tasks of lm-evaluation-harness (WikiText, HellaSwag, ARC, MMLU) and gives its perplexities within 0.001 % and its accuracies exactly (chapter 13).
+- A C library with a stable header, and a Python module (chapter 14).
+- Fuzzing of every reader of untrusted files, and continuous integration on four platforms plus a GPU runner (chapters 15 and 16).

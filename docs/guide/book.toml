@@ -1,0 +1,7 @@
+[book]
+title = "The Kapel Guide"
+authors = ["Olivier Le Guyader"]
+language = "en"
+src = "src"
+
+[output.html]

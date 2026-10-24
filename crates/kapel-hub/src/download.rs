@@ -9,6 +9,12 @@
 //! stored with Git LFS (the weights), its SHA-256 is checked against the one the
 //! Hub announces. A token in `HF_TOKEN` gives access to gated models.
 //!
+//! Once every file of a revision is there, `<cache>/<owner>--<name>/refs/<revision>`
+//! records its commit. When the Hub cannot be reached (no network, a timeout),
+//! or when `KAPEL_OFFLINE` or `HF_HUB_OFFLINE` is set to `1`, the commit recorded
+//! for the revision is used without asking: a model downloaded once runs
+//! offline. A revision the Hub refuses (not found, gated) is an error either way.
+//!
 //! Only files at the top of the repository are fetched (the configurations, the
 //! tokenizer, the chat template), with the weights [`Checkpoint`] reads:
 //! the shards listed by `model.safetensors.index.json` if there is one, else
@@ -104,12 +110,21 @@ fn agent() -> ureq::Agent {
 }
 
 fn request(agent: &ureq::Agent, url: &str) -> Result<ureq::Response> {
+    call(agent, url).map_err(|e| failure(url, &e))
+}
+
+fn call(agent: &ureq::Agent, url: &str) -> std::result::Result<ureq::Response, Box<ureq::Error>> {
     let mut request = agent.get(url);
     if let Ok(token) = std::env::var("HF_TOKEN") {
         request = request.set("Authorization", &format!("Bearer {token}"));
     }
-    request.call().map_err(|e| {
-        let message = match &e {
+    request.call().map_err(Box::new)
+}
+
+/// What a failed request says.
+fn failure(url: &str, e: &ureq::Error) -> HubError {
+    {
+        let message = match e {
             ureq::Error::Status(401 | 403, _) => {
                 format!("{url}: access denied (a gated model needs HF_TOKEN)")
             }
@@ -117,7 +132,31 @@ fn request(agent: &ureq::Agent, url: &str) -> Result<ureq::Response> {
             other => format!("{url}: {other}"),
         };
         HubError::io(url, std::io::Error::other(message))
-    })
+    }
+}
+
+/// Whether the environment asks not to contact the Hub.
+fn offline() -> bool {
+    ["KAPEL_OFFLINE", "HF_HUB_OFFLINE"]
+        .iter()
+        .any(|v| std::env::var(v).is_ok_and(|v| v == "1"))
+}
+
+/// The file that records the commit of `revision` of the repository whose
+/// cache is `repo_dir`, if the revision can name a file.
+fn reference(repo_dir: &Path, revision: &str) -> Option<PathBuf> {
+    is_plain_file_name(revision).then(|| repo_dir.join("refs").join(revision))
+}
+
+/// The directory of `revision` downloaded before, if its commit was recorded
+/// and its directory is there.
+fn recorded(repo_dir: &Path, revision: &str) -> Option<PathBuf> {
+    let commit = std::fs::read_to_string(reference(repo_dir, revision)?).ok()?;
+    let commit = commit.trim();
+    let valid =
+        !commit.is_empty() && commit.len() <= 64 && commit.bytes().all(|b| b.is_ascii_hexdigit());
+    let dir = repo_dir.join(commit);
+    (valid && dir.is_dir()).then_some(dir)
 }
 
 /// Downloads the files needed to run model `repo` at `revision` (`"main"` for the
@@ -137,11 +176,26 @@ pub fn snapshot(repo: &str, revision: &str, cache: &Path) -> Result<PathBuf> {
             "a repository is named <owner>/<name> or <name>",
         ));
     }
-    let agent = agent();
+    let repo_dir = cache.join(parts.join("--"));
     let url = format!("{ENDPOINT}/api/models/{repo}/revision/{revision}?blobs=true");
-    let body = request(&agent, &url)?
-        .into_string()
-        .map_err(|e| HubError::io(&url, e))?;
+    if offline() {
+        return recorded(&repo_dir, revision).ok_or_else(|| {
+            HubError::format(
+                repo,
+                format!("revision {revision:?} was never downloaded, and the Hub is not to be contacted (offline)"),
+            )
+        });
+    }
+    let agent = agent();
+    let answer = match call(&agent, &url) {
+        Ok(answer) => answer,
+        // The Hub out of reach: the revision as downloaded before, if it was.
+        Err(e) if matches!(*e, ureq::Error::Transport(_)) => {
+            return recorded(&repo_dir, revision).ok_or_else(|| failure(&url, &e));
+        }
+        Err(e) => return Err(failure(&url, &e)),
+    };
+    let body = answer.into_string().map_err(|e| HubError::io(&url, e))?;
     let info: Value = serde_json::from_str(&body)
         .map_err(|e| HubError::format(&url, format!("not valid JSON: {e}")))?;
     let commit = info
@@ -151,7 +205,7 @@ pub fn snapshot(repo: &str, revision: &str, cache: &Path) -> Result<PathBuf> {
             !sha.is_empty() && sha.len() <= 64 && sha.bytes().all(|b| b.is_ascii_hexdigit())
         })
         .ok_or_else(|| HubError::format(&url, "no commit sha in the answer"))?;
-    let dir = cache.join(parts.join("--")).join(commit);
+    let dir = repo_dir.join(commit);
     std::fs::create_dir_all(&dir).map_err(|e| HubError::io(&dir, e))?;
     // The top-level files, with the SHA-256 of those stored with Git LFS.
     let files: BTreeMap<&str, Option<&str>> = info
@@ -180,6 +234,14 @@ pub fn snapshot(repo: &str, revision: &str, cache: &Path) -> Result<PathBuf> {
     for name in weights(&available, index.as_ref())? {
         let sha256 = files.get(name).copied().flatten();
         fetch(&agent, repo, commit, name, sha256, &dir.join(name))?;
+    }
+    // Every file is there: the revision and its commit are recorded.
+    for name in [revision, commit] {
+        if let Some(path) = reference(&repo_dir, name) {
+            let refs = path.parent().expect("refs/<name>");
+            std::fs::create_dir_all(refs).map_err(|e| HubError::io(refs, e))?;
+            crate::write_atomic(&path, |w| w.write_all(commit.as_bytes()))?;
+        }
     }
     Ok(dir)
 }
@@ -303,6 +365,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_recorded_revision_is_found_offline() {
+        let cache = std::env::temp_dir().join(format!("kapel-refs-{}", std::process::id()));
+        let repo = cache.join("owner--name");
+        let commit = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(recorded(&repo, "main"), None);
+        std::fs::create_dir_all(repo.join("refs")).unwrap();
+        std::fs::write(repo.join("refs/main"), commit).unwrap();
+        // Recorded, but its directory is gone.
+        assert_eq!(recorded(&repo, "main"), None);
+        std::fs::create_dir_all(repo.join(commit)).unwrap();
+        assert_eq!(recorded(&repo, "main"), Some(repo.join(commit)));
+        // A revision that cannot name a file, or a record that is not a commit.
+        assert_eq!(recorded(&repo, "refs/pr/1"), None);
+        std::fs::write(repo.join("refs/v1"), "../../etc").unwrap();
+        assert_eq!(recorded(&repo, "v1"), None);
+        std::fs::remove_dir_all(&cache).unwrap();
+    }
+
     /// Downloads a tiny model from the Hub: `cargo test -p kapel-hub -- --ignored`.
     #[test]
     #[ignore = "needs the network"]
@@ -317,6 +398,9 @@ mod tests {
         let checkpoint = crate::Checkpoint::open(&dir).unwrap();
         assert!(checkpoint.names().count() > 0);
         assert!(dir.join("tokenizer.json").exists());
+        // Recorded: found again without the Hub.
+        let repo = cache.join("hf-internal-testing--tiny-random-LlamaForCausalLM");
+        assert_eq!(recorded(&repo, "main"), Some(dir.clone()));
         std::fs::remove_dir_all(&cache).unwrap();
     }
 }

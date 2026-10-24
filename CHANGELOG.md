@@ -186,20 +186,36 @@ changelog says how.
   `Model::replace` and `Site`, to compute and change a model one block at a time.
 - `kapel-infer`: `save_gguf`, a model and its tokenizer written to a GGUF file that
   llama.cpp reads; `Scorer`, the log-likelihood of continuations after contexts,
-  sharing the cache between sequences that begin alike.
+  sharing the cache between sequences that begin alike, its rows decoded and scored on
+  every core (WikiText on a card 2.4 times faster).
 - `kapel-cli`: `kapel quantize`, to GGUF or to a model directory; `kapel eval`, the
   tasks of lm-evaluation-harness (perplexity, HellaSwag, ARC, MMLU) replayed by Kapel,
   tokenized and scored as lm-evaluation-harness does.
 - `tools/eval/export_tasks.py`: the requests of lm-evaluation-harness's tasks,
   written once for `kapel eval`.
+- `kapel-hub`: a model downloaded once runs offline: the commit of each revision is
+  recorded (`refs/<revision>`) and used when the Hub cannot be reached, or when
+  `KAPEL_OFFLINE` or `HF_HUB_OFFLINE` is `1`.
 - `kapel-runtime`: a model loaded on whichever device, behind one type, for the
   bindings.
 - `kapel-capi`: the C API, `libkapel` and `include/kapel.h`, with an example in C.
+- `docs/guide`: *The Kapel Guide*, for users: installing, a first model, serving,
+  quantizing, evaluating, integrating from Python, C and Rust, a reference and
+  troubleshooting. The book gains chapters on quantization and evaluation (13) and
+  on the bindings (14).
+- `kapel-cli`: the example `bench`, the speeds and perplexity Kapel tracks;
+  `tools/bench/run.sh` measures a fixed list of setups and `tools/bench/compare.py`
+  compares them with a baseline. The workflow `measures` runs them on the
+  self-hosted machine at every push to `main`, the workflow `release` builds
+  binaries and wheels for a tag, and CI builds the book and the guide.
 - `kapel-python`: the Python module `kapel` (PyO3, stable ABI from Python 3.9): load,
   generate, chat, serve. CI builds both and tests them on Linux, macOS and Windows.
 
 ### Changed
 
+- `kapel-cuda`: cuda-oxide's crates (`cuda-core`, `cuda-bindings`, `cutile`) come from
+  crates.io (0.4.0) instead of a Git revision: every crate but the bindings can be
+  published.
 - `kapel-ops`: `Operation::infer_backward` checks the gradient's shape, type and
   device; every backward of every backend starts with it.
 - `kapel-ops`: `Error::BroadcastIncompatible` names its operation, and
@@ -245,6 +261,9 @@ changelog says how.
 
 ### Fixed
 
+- `kapel-cuda`: products by Q4_0 and Q4_1 weights have kernels of their own; they
+  went through the generic kernel, seven times slower (Llama 3.2 3B in Q4_0: 28 to
+  204 tokens per second).
 - `kapel-cuda`: a recorded pass keeps the tables its kernels read; once the
   table cache had let them go, a replay read freed memory. The table cache
   evicts the least recently used, and memory short at an allocation frees the

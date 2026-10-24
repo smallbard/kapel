@@ -30,5 +30,4 @@ allow-wildcard-paths = true
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-# cuda-oxide is not on crates.io yet; its revision is pinned in Cargo.toml.
-allow-git = ["https://github.com/NVlabs/cuda-oxide.git"]
+allow-git = []

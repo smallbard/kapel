@@ -1,6 +1,7 @@
 //! The log-likelihood of a continuation after a context: what evaluations
 //! by choice (HellaSwag, ARC, MMLU) and perplexities are made of.
 
+use kapel_core::Tensor;
 use kapel_models::Cache;
 use kapel_ops::{Backend, Transfer};
 
@@ -92,24 +93,66 @@ impl<'p, B: Backend + Transfer> Scorer<'p, B> {
             let logits = model.extend_last(backend, ids, &mut self.cache, wanted.max(1))?;
             self.held.extend_from_slice(ids);
             if wanted > 0 {
-                let values = backend.download(&logits)?.to_f64_vec()?;
-                let vocab = logits.shape().last().copied().unwrap_or(1);
-                for (j, row) in values.chunks_exact(vocab).enumerate() {
-                    let position = end - wanted + j;
-                    let target = continuation[position - first] as usize;
-                    let (max, best) = row.iter().enumerate().fold(
-                        (f64::NEG_INFINITY, 0),
-                        |(max, best), (i, &v)| {
-                            if v > max { (v, i) } else { (max, best) }
-                        },
-                    );
-                    let sum: f64 = row.iter().map(|v| (v - max).exp()).sum();
-                    score.log_likelihood += row[target] - max - sum.ln();
-                    score.greedy &= best == target;
+                let logits = backend.download(&logits)?;
+                let targets = &continuation[end - wanted - first..end - first];
+                for (log_probability, greedy) in row_scores(&logits, targets)? {
+                    score.log_likelihood += log_probability;
+                    score.greedy &= greedy;
                 }
             }
             start = end;
         }
         Ok(score)
     }
+}
+
+/// The log-probability of each target under its row of `logits` `[rows,
+/// vocab]` (in host memory), and whether it was the most likely (the first
+/// of equals). The rows are shared among the machine's threads, each
+/// decoding its own to `f64`: a row is a whole vocabulary, and a text scores
+/// thousands. Each row is computed alone, so the results do not depend on
+/// the number of threads.
+fn row_scores(logits: &Tensor, targets: &[u32]) -> Result<Vec<(f64, bool)>> {
+    let one = |row: &[f64], target: u32| {
+        let (max, best) =
+            row.iter()
+                .enumerate()
+                .fold((f64::NEG_INFINITY, 0), |(max, best), (i, &v)| {
+                    if v > max { (v, i) } else { (max, best) }
+                });
+        let sum: f64 = row.iter().map(|v| (v - max).exp()).sum();
+        (
+            row[target as usize] - max - sum.ln(),
+            best == target as usize,
+        )
+    };
+    let rows = targets.len();
+    let vocab = logits.shape().last().copied().unwrap_or(1);
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(rows)
+        .max(1);
+    let per = rows.div_ceil(threads);
+    let mut out = vec![(0.0, false); rows];
+    std::thread::scope(|scope| -> Result<()> {
+        let handles: Vec<_> = out
+            .chunks_mut(per)
+            .zip(targets.chunks(per))
+            .enumerate()
+            .map(|(i, (out, targets))| {
+                scope.spawn(move || -> Result<()> {
+                    let values = logits.narrow(0, i * per, targets.len())?.to_f64_vec()?;
+                    for ((row, &target), slot) in values.chunks_exact(vocab).zip(targets).zip(out) {
+                        *slot = one(row, target);
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("a scoring thread panicked")?;
+        }
+        Ok(())
+    })?;
+    Ok(out)
 }

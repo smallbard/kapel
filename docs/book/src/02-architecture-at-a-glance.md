@@ -1,6 +1,6 @@
 # 2. Architecture at a glance
 
-Kapel is a Cargo workspace of thirteen crates arranged in layers: a tensor type at the bottom, a catalogue of operations above it, interchangeable backends that implement the catalogue, and above them the crates that read files, turn text into tokens, run models and generate text. Each layer depends only on the layers below it.
+Kapel is a Cargo workspace of seventeen crates arranged in layers: a tensor type at the bottom, a catalogue of operations above it, interchangeable backends that implement the catalogue, and above them the crates that read files, turn text into tokens, run models and generate text. Each layer depends only on the layers below it.
 
 ## The layers
 
@@ -21,12 +21,16 @@ Models sit above the catalogue, never above a particular backend: swapping the r
 | Models | `kapel-models` | Configurations and the transformer forward pass | core, ops, hub |
 | Applications | `kapel-infer` | Generation: pipeline, engine of many requests, sampling, constraints, streaming text | core, ops, hub, models, tokenizers |
 |  | `kapel-serve` | The server of OpenAI's API: HTTP, streams, metrics | core, ops, models, infer, tokenizers |
-|  | `kapel-cli` | The `kapel` command | all of the above |
+|  | `kapel-quant` | Quantizing with calibration texts: GPTQ, AWQ | core, ops, models |
+|  | `kapel-cli` | The `kapel` command: `run`, `serve`, `quantize`, `eval` | all of the above |
+| Bindings | `kapel-runtime` | A model on whichever device, behind one type | core, ops, cpu, cuda, hub, models, tokenizers, infer, serve |
+|  | `kapel-capi` | The C library `libkapel` and its header `kapel.h` | runtime |
+|  | `kapel-python` | The Python module `kapel` (PyO3) | runtime |
 |  | `kapel-train` | A placeholder for training | none yet |
 
-Outside the workspace, `kernels/` holds the simple CUDA kernels written in Rust for the nightly compiler. They are compiled once to PTX and the result, `crates/kapel-cuda/kernels.ptx`, is checked in, so the published crates build on stable Rust. `fuzz/` holds the fuzzing targets and `tools/parity/` the Python scripts that produce reference outputs from `transformers`.
+Outside the workspace, `kernels/` holds the simple CUDA kernels written in Rust for the nightly compiler. They are compiled once to PTX and the result, `crates/kapel-cuda/kernels.ptx`, is checked in, so the published crates build on stable Rust. `fuzz/` holds the fuzzing targets, `tools/parity/` the Python scripts that produce reference outputs from `transformers`, and `tools/eval/` the script that exports the tasks of lm-evaluation-harness for `kapel eval`.
 
-Two dependency choices are deliberate. `kapel-tokenizers` depends on no other Kapel crate, so it can be used alone. And no crate above the backends names a backend: models and the generation engine are generic over `B: Backend`, so the same model code runs on the reference, the CPU or the GPU.
+Two dependency choices are deliberate. `kapel-tokenizers` depends on no other Kapel crate, so it can be used alone. And no crate above the backends names a backend: models and the generation engine are generic over `B: Backend`, so the same model code runs on the reference, the CPU or the GPU. Only the applications at the top choose one: `kapel-cli` from its `--device` option, and `kapel-runtime`, which holds a pipeline of either backend behind one type, for the bindings, whose callers choose at run time (chapter 14).
 
 ## One trait, three backends
 
