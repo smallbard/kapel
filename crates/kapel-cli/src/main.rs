@@ -2,6 +2,7 @@
 
 mod args;
 mod eval;
+mod merge;
 mod prepare;
 mod quantize;
 mod train;
@@ -25,6 +26,7 @@ usage: kapel run MODEL [options]
        kapel eval MODEL --tasks FILE [options]        (kapel eval --help)
        kapel prepare INPUT... --tokenizer PATH --output DIR   (kapel prepare --help)
        kapel train CONFIG.toml [options]              (kapel train --help)
+       kapel merge MODEL ADAPTER --output DIR         (kapel merge --help)
 
 Generates text with MODEL: a model directory, a GGUF file, or a repository of the
 Hugging Face Hub (owner/name, downloaded once into ~/.cache/kapel/hub, or
@@ -109,6 +111,11 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("train") => exit(train::execute(&args[1..])),
+        Some("merge") if args.get(1).is_some_and(|a| a == "--help" || a == "-h") => {
+            print!("{}", merge::USAGE);
+            ExitCode::SUCCESS
+        }
+        Some("merge") => exit(merge::execute(&args[1..])),
         Some("--version" | "-V") => {
             println!("kapel {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS

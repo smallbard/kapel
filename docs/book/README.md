@@ -19,8 +19,9 @@ read, change or extend the code.
 - [13. Quantizing and evaluating: kapel-quant and kapel eval](src/13-quantizing-and-evaluating.md)
 - [14. Kapel from C and Python: kapel-runtime, kapel-capi and kapel-python](src/14-bindings.md)
 - [15. Training: kapel-train](src/15-training.md)
-- [16. Safety and security](src/16-safety-and-security.md)
-- [17. Working on Kapel](src/17-working-on-kapel.md)
+- [16. Post-training: kapel-train](src/16-post-training.md)
+- [17. Safety and security](src/17-safety-and-security.md)
+- [18. Working on Kapel](src/18-working-on-kapel.md)
 - [Appendix](src/appendix.md)
 
 The chapters are plain Markdown and read well on GitHub. To build them as a

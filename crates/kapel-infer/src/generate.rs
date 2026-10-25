@@ -172,6 +172,21 @@ impl<B: Backend + Transfer> Pipeline<B> {
             return Self::load_gguf_with(dir, backend, options);
         }
         let model = prepare(Model::load(&Checkpoint::open(dir)?)?, &backend, options)?;
+        let mut pipeline = Self::with_model(dir, backend, model)?;
+        pipeline.cache_dtype = options.cache_dtype;
+        Ok(pipeline)
+    }
+
+    /// A pipeline of `model`, already on `backend` and in its types, with
+    /// the tokenizer, the chat template, the end tokens and the default
+    /// sampling of the model directory `dir`: a model trained in memory,
+    /// generating as it trains (GRPO), without loading its weights again.
+    ///
+    /// # Errors
+    ///
+    /// If the tokenizer or the configurations of `dir` cannot be read.
+    pub fn with_model(dir: impl AsRef<Path>, backend: B, model: Model) -> Result<Self> {
+        let dir = dir.as_ref();
         let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))?;
         let template = ChatTemplate::from_dir(dir)?;
         let generation = match dir.join("generation_config.json") {
@@ -198,9 +213,15 @@ impl<B: Backend + Transfer> Pipeline<B> {
             template,
             eos,
             sampling: Sampling::from_generation_config(&generation),
-            cache_dtype: options.cache_dtype,
+            cache_dtype: None,
             grammars: OnceLock::new(),
         })
+    }
+
+    /// The model, to be replaced: a model being trained, its new weights
+    /// for the next generations.
+    pub fn model_mut(&mut self) -> &mut Model {
+        &mut self.model
     }
 
     /// Loads a GGUF file onto `backend`: the model, its tokenizer, its chat

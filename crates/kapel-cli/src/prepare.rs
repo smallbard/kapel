@@ -16,10 +16,20 @@ document preceded by the separator, with the index of the documents of each
 shard and dataset.json, which kapel train reads (data.train = \"DIR\"). The same
 inputs give the same files, whatever the number of threads.
 
+With --chat, each row or line is an example of fine-tuning, as TRL reads them:
+{\"messages\": [{\"role\": …, \"content\": …}, …]}, every answer of the assistant
+learnt, or {\"prompt\": …, \"completion\": …}, the completion learnt (both
+messages, or both texts). The tokenizer's directory must hold the chat
+template. The shards then have a mask of the tokens the loss counts, and no
+separator: the template begins each conversation.
+
 options:
-  --tokenizer PATH         a tokenizer.json, or a model directory holding one
+  --tokenizer PATH         a tokenizer.json, a model directory holding one, or a
+                           repository of the Hub (owner/name)
   --output DIR             the directory written
-  --field NAME             the column or field of the text (default text)
+  --field NAME             the column or field of the text (default text; with
+                           --chat, of the messages, default messages)
+  --chat                   the inputs are examples of fine-tuning
   --separator TEXT         the token that starts each document (default the
                            tokenizer's bos_token, else its eos_token, else
                            <|endoftext|>)
@@ -39,13 +49,14 @@ fn number<T: std::str::FromStr>(name: &str, value: Option<&String>) -> Result<T,
 
 pub(crate) fn execute(args: &[String]) -> Result<(), String> {
     let mut options = PrepareOptions::default();
-    let (mut tokenizer, mut output, mut quiet) = (None, None, false);
+    let (mut tokenizer, mut output, mut quiet, mut field) = (None, None, false, None);
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
         match arg.as_str() {
             "--tokenizer" => tokenizer = rest.next().map(PathBuf::from),
             "--output" => output = rest.next().map(PathBuf::from),
-            "--field" => options.field = rest.next().ok_or("--field needs a name")?.clone(),
+            "--field" => field = Some(rest.next().ok_or("--field needs a name")?.clone()),
+            "--chat" => options.chat = true,
             "--separator" => {
                 options.separator = Some(rest.next().ok_or("--separator needs a token")?.clone())
             }
@@ -61,7 +72,15 @@ pub(crate) fn execute(args: &[String]) -> Result<(), String> {
             other => options.inputs.push(other.to_string()),
         }
     }
-    options.tokenizer = tokenizer.ok_or(format!("--tokenizer is needed\n\n{USAGE}"))?;
+    options.field =
+        field.unwrap_or_else(|| if options.chat { "messages" } else { "text" }.to_string());
+    let tokenizer = tokenizer.ok_or(format!("--tokenizer is needed\n\n{USAGE}"))?;
+    // A repository of the Hub, downloaded once, as for kapel run.
+    options.tokenizer = if tokenizer.exists() {
+        tokenizer
+    } else {
+        crate::directory(&tokenizer.to_string_lossy(), "main")?
+    };
     options.output = output.ok_or(format!("--output is needed\n\n{USAGE}"))?;
     if options.inputs.is_empty() {
         return Err(USAGE.to_string());
@@ -82,11 +101,16 @@ pub(crate) fn execute(args: &[String]) -> Result<(), String> {
         eprintln!();
         let val = manifest.val.as_ref();
         eprintln!(
-            "prepare: {} documents read, {} duplicates and {} empty left out; train {} tokens in {} shards{}",
+            "prepare: {} documents read, {} duplicates and {} empty left out; train {} tokens{} in {} shards{}",
             manifest.documents,
             manifest.duplicates,
             manifest.empty,
             manifest.train.tokens,
+            manifest
+                .train
+                .trained
+                .map(|t| format!(" ({t} learnt)"))
+                .unwrap_or_default(),
             manifest.train.shards.len(),
             val.map(|v| format!(", val {} tokens in {} shards", v.tokens, v.shards.len()))
                 .unwrap_or_default()

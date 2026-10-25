@@ -30,7 +30,7 @@ fancy-regex = "0.16"
 futures-util = { version = "0.3", default-features = false }
 llguidance = { version = "1.9", default-features = false, features = ["lark", "referencing", "ahash"] }
 memmap2 = "0.9"
-parquet = { version = "60", default-features = false, features = ["snap", "zstd", "lz4", "flate2-rust_backend"] }
+parquet = { version = "60", default-features = false, features = ["snap", "zstd", "lz4", "flate2-rust_backend", "json"] }
 minijinja = { version = "2", features = ["loop_controls", "json", "fuel"] }
 minijinja-contrib = { version = "2", features = ["pycompat"] }
 serde = { version = "1", features = ["derive"] }

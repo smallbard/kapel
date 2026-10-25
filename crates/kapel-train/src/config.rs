@@ -55,7 +55,8 @@ impl std::error::Error for ConfigError {}
 pub struct TrainConfig {
     /// The model.
     pub model: ModelConfig,
-    /// The tokens.
+    /// The tokens, for pre-training and supervised fine-tuning.
+    #[serde(default)]
     pub data: DataConfig,
     /// The size of a step.
     #[serde(default)]
@@ -77,13 +78,27 @@ pub struct TrainConfig {
     /// The log.
     #[serde(default)]
     pub log: LogConfig,
+    /// LoRA adapters: the model frozen, only they trained
+    /// ([`crate::lora`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lora: Option<crate::lora::LoraConfig>,
+    /// DPO: the run learns from pairs of answers instead of tokens
+    /// ([`crate::preference`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dpo: Option<crate::preference::DpoConfig>,
+    /// GRPO: the run learns from answers it writes and their rewards
+    /// ([`crate::grpo`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grpo: Option<crate::grpo::GrpoConfig>,
 }
 
 /// Where the model comes from.
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelConfig {
-    /// A `config.json`, or a model directory holding one.
+    /// A `config.json`, a model directory holding one, or a model of the
+    /// Hugging Face Hub (`owner/name`), downloaded once into Kapel's cache
+    /// as `kapel run` does.
     pub config: PathBuf,
     /// `"scratch"`: new weights ([`crate::model::init`]); `"weights"`: those
     /// of the model directory.
@@ -95,6 +110,10 @@ pub struct ModelConfig {
     /// The seed of the new weights.
     #[serde(default = "one")]
     pub seed: u64,
+    /// The name of the model on the Hub, when `config` was one: set by the
+    /// run, for the adapters' `base_model_name_or_path`.
+    #[serde(skip)]
+    pub hub: Option<String>,
 }
 
 fn scratch() -> String {
@@ -114,7 +133,7 @@ fn one() -> u64 {
 /// `train` names one source; `sources`, several, each with its weight. A
 /// source is a directory of `kapel prepare` or its `dataset.json`, either
 /// local or at an `http(s)://` URL, or a pattern of llm.c files.
-#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DataConfig {
     /// The training source: a path, a URL, or a pattern with `*` in its
@@ -136,7 +155,8 @@ pub struct DataConfig {
     #[serde(default)]
     pub shuffle: bool,
     /// `"stream"`: the tokens cut every `batch.length`; `"documents"`:
-    /// whole documents in each row, padded.
+    /// whole documents in each row, padded; `"padded"`: one document a row,
+    /// cut or padded (TRL's batches without packing).
     #[serde(default)]
     pub pack: crate::data::Pack,
     /// Each token attends to its own document only, and positions start
@@ -158,6 +178,23 @@ pub struct DataConfig {
 
 fn prefetch_default() -> usize {
     4
+}
+
+impl Default for DataConfig {
+    fn default() -> Self {
+        Self {
+            train: None,
+            sources: Vec::new(),
+            val: None,
+            seed: 0,
+            shuffle: false,
+            pack: crate::data::Pack::default(),
+            mask: false,
+            separator: None,
+            prefetch: prefetch_default(),
+            cache: None,
+        }
+    }
 }
 
 /// One of several training sources.
@@ -357,7 +394,8 @@ pub struct GroupConfig {
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ScheduleConfig {
-    /// `"constant"`, `"cosine"`, or `"wsd"` (warmup, stable, decay).
+    /// `"constant"`, `"cosine"`, `"wsd"` (warmup, stable, decay), or
+    /// `"linear"` (`transformers`' default).
     #[serde(default = "cosine")]
     pub kind: String,
     /// The steps of the linear warmup from zero.
@@ -401,6 +439,14 @@ pub struct TrainingConfig {
     /// The rows of logits the loss forms at once.
     #[serde(default = "chunk_default")]
     pub chunk: usize,
+    /// The memory of the cache of keys and values when the model writes
+    /// answers (GRPO, the tasks), in GiB.
+    #[serde(default = "cache_gib_default")]
+    pub cache_gib: f64,
+}
+
+fn cache_gib_default() -> f64 {
+    4.0
 }
 
 fn cuda() -> String {
@@ -423,6 +469,7 @@ impl Default for TrainingConfig {
             clip: 1.0,
             checkpoint_activations: false,
             chunk: chunk_default(),
+            cache_gib: cache_gib_default(),
         }
     }
 }
@@ -437,6 +484,14 @@ pub struct EvalConfig {
     /// The validation tokens read, from the start of the files.
     #[serde(default = "eval_tokens_default")]
     pub tokens: usize,
+    /// A text of control, its loss measured as the validation's: what a
+    /// fine-tuning makes the model forget (the `val` split of a dataset of
+    /// `kapel prepare`, or files).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control: Option<String>,
+    /// Tasks whose answers a program checks, their accuracy measured.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tasks: Vec<crate::grpo::TaskConfig>,
 }
 
 fn eval_every_default() -> usize {
@@ -452,6 +507,8 @@ impl Default for EvalConfig {
         Self {
             every: eval_every_default(),
             tokens: eval_tokens_default(),
+            control: None,
+            tasks: Vec::new(),
         }
     }
 }
@@ -551,7 +608,11 @@ impl TrainConfig {
                 p.to_path_buf()
             }
         };
-        self.model.config = join(&self.model.config);
+        // A name of the Hub stays as written, when no such file is there.
+        let joined = join(&self.model.config);
+        if joined.exists() || !is_hub_name(&self.model.config) {
+            self.model.config = joined;
+        }
         self.checkpoint.dir = join(&self.checkpoint.dir);
         // A URL stays as written.
         let place = |p: &str| {
@@ -563,6 +624,18 @@ impl TrainConfig {
         };
         self.data.train = self.data.train.as_deref().map(place);
         self.data.val = self.data.val.as_deref().map(place);
+        self.eval.control = self.eval.control.as_deref().map(place);
+        let local =
+            |p: &mut String| *p = join(Path::new(p.as_str())).to_string_lossy().into_owned();
+        for t in &mut self.eval.tasks {
+            local(&mut t.prompts);
+        }
+        if let Some(d) = &mut self.dpo {
+            local(&mut d.train);
+        }
+        if let Some(g) = &mut self.grpo {
+            local(&mut g.prompts);
+        }
         for source in &mut self.data.sources {
             source.path = place(&source.path);
         }
@@ -598,8 +671,36 @@ impl TrainConfig {
             ));
         }
         let d = &self.data;
-        if d.train.is_some() == !d.sources.is_empty() {
+        let tokens = self.dpo.is_none() && self.grpo.is_none();
+        if self.dpo.is_some() && self.grpo.is_some() {
+            return fail("dpo and grpo: one method a run".into());
+        }
+        if tokens && d.train.is_some() == !d.sources.is_empty() {
             return fail("data: either train or sources, not both".into());
+        }
+        if !tokens && (d.train.is_some() || !d.sources.is_empty()) {
+            return fail("data.train and data.sources: not with dpo or grpo".into());
+        }
+        if let Some(dpo) = &self.dpo {
+            dpo.validate().map_err(ConfigError)?;
+            if !b.rows.is_multiple_of(2) {
+                return fail(format!(
+                    "batch.rows: even for dpo, a pair a two rows, got {}",
+                    b.rows
+                ));
+            }
+        }
+        if let Some(g) = &self.grpo {
+            g.validate().map_err(ConfigError)?;
+            if g.max_tokens >= b.length {
+                return fail(format!(
+                    "grpo.max_tokens: below batch.length ({}), the prompt before",
+                    b.length
+                ));
+            }
+        }
+        for t in &self.eval.tasks {
+            t.validate().map_err(ConfigError)?;
         }
         if let Some(s) = d
             .sources
@@ -646,9 +747,9 @@ impl TrainConfig {
             }
         }
         let s = &self.schedule;
-        if !matches!(s.kind.as_str(), "constant" | "cosine" | "wsd") {
+        if !matches!(s.kind.as_str(), "constant" | "cosine" | "wsd" | "linear") {
             return fail(format!(
-                "schedule.kind: \"constant\", \"cosine\" or \"wsd\", got {:?}",
+                "schedule.kind: \"constant\", \"cosine\", \"wsd\" or \"linear\", got {:?}",
                 s.kind
             ));
         }
@@ -677,6 +778,9 @@ impl TrainConfig {
         if !(t.clip >= 0.0 && t.clip.is_finite()) || t.chunk == 0 {
             return fail("training.clip must not be negative, and training.chunk positive".into());
         }
+        if let Some(l) = &self.lora {
+            l.validate().map_err(ConfigError)?;
+        }
         if self.eval.tokens > 0 && self.eval.tokens < b.pass() {
             return fail(format!(
                 "eval.tokens: at least one pass ({}), got {}",
@@ -695,6 +799,17 @@ impl TrainConfig {
             _ => kapel_core::DType::BF16,
         }
     }
+}
+
+/// Whether `path` reads as a model of the Hub, `owner/name`.
+pub fn is_hub_name(path: &Path) -> bool {
+    let text = path.to_string_lossy();
+    let parts: Vec<&str> = text.split('/').collect();
+    path.is_relative()
+        && parts.len() == 2
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && !p.starts_with('.') && !p.ends_with(".json"))
 }
 
 /// Whether `name` matches `pattern`, where `*` stands for any text.
@@ -757,6 +872,21 @@ mod tests {
         assert!(refused("[optimizer]\nkind = \"sgd\"").contains("optimizer.kind"));
         assert!(refused("[optimizer]\nbeta2 = 1.0").contains("beta2"));
         assert!(refused("[training]\ndtype = \"f8\"").contains("training.dtype"));
+    }
+
+    #[test]
+    fn the_recipes_are_valid_configurations() {
+        let recipes = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../recipes");
+        let mut read = 0;
+        for entry in std::fs::read_dir(&recipes).unwrap() {
+            let path = entry.unwrap().path().join("train.toml");
+            if path.exists() {
+                let text = std::fs::read_to_string(&path).unwrap();
+                TrainConfig::parse(&text).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+                read += 1;
+            }
+        }
+        assert!(read >= 3, "{read} recipes");
     }
 
     #[test]

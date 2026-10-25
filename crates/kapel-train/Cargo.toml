@@ -27,6 +27,8 @@ memmap2.workspace = true
 parquet.workspace = true
 sha2.workspace = true
 kapel-tokenizers.workspace = true
+kapel-infer.workspace = true
+fancy-regex.workspace = true
 kapel-cpu.workspace = true
 kapel-cuda = { workspace = true, optional = true }
 

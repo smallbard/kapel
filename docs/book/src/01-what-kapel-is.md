@@ -13,7 +13,7 @@ Five rules shape almost every design decision in the code. They are stated in `C
 1. **Every fast backend is checked against the reference.** The reference backend computes each operation in `f64`, as plainly as possible. A new operation comes with its reference definition, its gradient, and a conformity test with a written tolerance (chapter 5).
 2. **Results do not depend on the number of threads.** Work is split according to tensor shapes, never according to the hardware. Two runs give the same bits, and tests check it with 1, 2, 3 and 8 threads (chapter 6).
 3. **The library does not panic on user input.** Wrong shapes, unsupported types, corrupt files, hostile templates: each returns a typed error. `panic!` is reserved for broken internal invariants (chapters 3 and 15).
-4. **Every optimization comes with a measurement**, kept as a benchmark program next to the code it measures (chapter 17).
+4. **Every optimization comes with a measurement**, kept as a benchmark program next to the code it measures (chapter 18).
 5. **Code that can be audited**: few dependencies, short modules, documented kernels, and a `// SAFETY:` comment on every `unsafe` block.
 
 The development hardware is a Ryzen 7 7700 (Zen 4, with AVX-512 and its bf16 extension) and an RTX 3090 (Ampere, 24 GB). Several tuning constants in the code are named after it, such as the block sizes `Blocks::ZEN4`.

@@ -16,9 +16,13 @@
 //!   documents running from one row into the next;
 //! - [`Pack::Documents`]: whole documents, as many as fit, the rest of the row
 //!   padded (ids of the separator, targets [`crate::IGNORE`]); a document
-//!   longer than a row is cut into rows of its own.
+//!   longer than a row is cut into rows of its own;
+//! - [`Pack::Padded`]: one document a row, the rest of a longer one left
+//!   out, as TRL's batches without packing.
 //!
-//! Each row also reads the token after it, its last target. With `mask`, a
+//! Each row also reads the token after it, its last target. A shard of
+//! conversations has a mask of the tokens the loss counts: the targets
+//! outside it are [`crate::IGNORE`]. With `mask`, a
 //! batch carries the document of each token ([`Tokens::segments`]): each
 //! token attends to the earlier tokens of its own document only, and
 //! positions start again at each document.
@@ -43,7 +47,7 @@ use std::time::{Duration, Instant};
 use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
 
-use crate::dataset::{MANIFEST, Manifest, read_index, sha256_hex};
+use crate::dataset::{MANIFEST, Manifest, Mask, read_index, read_mask, sha256_hex};
 
 /// A file that cannot be read as tokens.
 #[derive(Debug)]
@@ -247,6 +251,9 @@ pub enum Pack {
     Stream,
     /// Whole documents, as many as fit, then padding.
     Documents,
+    /// One document a row, cut to the row (its rest left out) or padded:
+    /// the batches of `transformers` without packing.
+    Padded,
 }
 
 /// How a [`Loader`] reads.
@@ -306,6 +313,8 @@ struct ShardMeta {
     file: String,
     /// Its index: a path or a URL, if any.
     index: Option<String>,
+    /// The mask of its targets: a path or a URL, if any.
+    mask: Option<String>,
     tokens: usize,
     sha256: Option<String>,
 }
@@ -382,6 +391,7 @@ impl Source {
                 Ok(ShardMeta {
                     file: p.to_string_lossy().into_owned(),
                     index: index.exists().then(|| index.to_string_lossy().into_owned()),
+                    mask: None,
                     tokens: file.len(),
                     sha256: None,
                 })
@@ -417,6 +427,7 @@ impl Source {
                 .map(|sh| ShardMeta {
                     file: locate(&sh.file),
                     index: Some(locate(&sh.index)),
+                    mask: sh.mask.as_deref().map(&locate),
                     tokens: sh.tokens as usize,
                     sha256: Some(sh.sha256.clone()),
                 })
@@ -483,7 +494,11 @@ impl Source {
             })?;
             Some(file.positions_of(separator))
         };
-        Ok(OpenShard { file, starts })
+        let mask = match &meta.mask {
+            Some(m) => Some(read_mask(&self.local(m, None)?, file.len())?),
+            None => None,
+        };
+        Ok(OpenShard { file, starts, mask })
     }
 
     /// Starts downloading shard `i` on a thread, for a remote source.
@@ -495,6 +510,7 @@ impl Source {
                 for (location, sha) in [
                     (Some(&meta.file), meta.sha256.as_deref()),
                     (meta.index.as_ref(), None),
+                    (meta.mask.as_ref(), None),
                 ] {
                     if let Some(location) = location {
                         let name = location.rsplit('/').next().unwrap_or(location);
@@ -509,7 +525,10 @@ impl Source {
     /// Removes shard `i`'s downloaded files, for a remote source.
     fn evict(&self, i: usize) {
         if let (Some(dir), Some(meta)) = (&self.cache, self.shards.get(i)) {
-            for location in std::iter::once(&meta.file).chain(meta.index.as_ref()) {
+            for location in std::iter::once(&meta.file)
+                .chain(meta.index.as_ref())
+                .chain(meta.mask.as_ref())
+            {
                 if is_url(location) {
                     let name = location.rsplit('/').next().unwrap_or(location);
                     let _ = std::fs::remove_file(dir.join(name));
@@ -522,6 +541,8 @@ impl Source {
 struct OpenShard {
     file: TokenFile,
     starts: Option<Vec<u64>>,
+    /// The tokens the loss counts as targets, if not all.
+    mask: Option<Mask>,
 }
 
 /// A row of a shard: `len` tokens from `start`.
@@ -535,6 +556,22 @@ struct Row {
 fn rows_of(shard: &OpenShard, length: usize, pack: Pack) -> Vec<Row> {
     let n = shard.file.len();
     match pack {
+        Pack::Padded => {
+            let starts = shard.starts.as_deref().unwrap_or(&[]);
+            let ends = starts
+                .iter()
+                .skip(1)
+                .copied()
+                .chain(std::iter::once(n as u64));
+            starts
+                .iter()
+                .zip(ends)
+                .map(|(&s, e)| Row {
+                    start: s,
+                    len: (e - s).min(length as u64) as u32,
+                })
+                .collect()
+        }
         Pack::Stream => (0..n.saturating_sub(1) / length)
             .map(|k| Row {
                 start: (k * length) as u64,
@@ -586,7 +623,7 @@ fn rows_of(shard: &OpenShard, length: usize, pack: Pack) -> Vec<Row> {
 }
 
 /// A 64-bit mix of `values` (SplitMix64's finalizer, chained).
-fn mix(values: &[u64]) -> u64 {
+pub(crate) fn mix(values: &[u64]) -> u64 {
     let mut h = 0x9e37_79b9_7f4a_7c15u64;
     for &v in values {
         h = splitmix(h ^ v);
@@ -602,7 +639,7 @@ fn splitmix(mut z: u64) -> u64 {
 }
 
 /// A permutation of `0..n` drawn from `seed` (Fisher–Yates).
-fn permutation(n: usize, seed: u64) -> Vec<u32> {
+pub(crate) fn permutation(n: usize, seed: u64) -> Vec<u32> {
     let mut v: Vec<u32> = (0..n as u32).collect();
     let mut state = seed;
     for i in (1..n).rev() {
@@ -672,7 +709,7 @@ impl Reader {
 
     fn next_row(&mut self, reading: &Reading) -> Result<(Row, usize)> {
         let n = self.source.shards.len();
-        let needs_starts = reading.mask || reading.pack == Pack::Documents;
+        let needs_starts = reading.mask || reading.pack != Pack::Stream;
         // Every shard may be visited once without a row before giving up.
         for _ in 0..=n {
             if self.current.is_none() {
@@ -743,11 +780,22 @@ impl Reader {
         let (_, open, _, _) = self.current.as_ref().expect("a shard open");
         let file = &open.file;
         let (start, len) = (row.start as usize, row.len as usize);
-        let available = (file.len() - start).min(len + 1);
+        // A padded row is its document: nothing after it is a target.
+        let after = usize::from(reading.pack != Pack::Padded);
+        let available = (file.len() - start).min(len + after);
         let mut tokens = Vec::with_capacity(len + 1);
         file.extend(start, available, &mut tokens);
         out.ids.extend_from_slice(&tokens[..len]);
-        out.targets.extend_from_slice(&tokens[1..available]);
+        match &open.mask {
+            Some(mask) => out.targets.extend((1..available).map(|j| {
+                if mask.get(start + j) {
+                    tokens[j]
+                } else {
+                    crate::IGNORE
+                }
+            })),
+            None => out.targets.extend_from_slice(&tokens[1..available]),
+        }
         if available < len + 1 {
             out.targets.push(crate::IGNORE);
         }
@@ -1078,6 +1126,32 @@ pub(crate) mod tests {
         let s = c.segments.unwrap();
         assert_ne!(s[0], s[1]);
         assert_eq!(s[1], s[2]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn padded_rows_hold_one_document_each() {
+        let dir = temp("padded");
+        let path = documents(&dir);
+        let mut reading = Reading::new(4, 6);
+        reading.pack = Pack::Padded;
+        reading.separator = Some(9);
+        let mut l = loader(&path, reading);
+        let i = crate::IGNORE;
+        let a = l.next_batch().unwrap();
+        // [9 1 2], [9 3], [9 4 5 6 7 8] (its 10 left out), [9 11].
+        assert_eq!(
+            a.ids,
+            vec![
+                9, 1, 2, 9, 9, 9, 9, 3, 9, 9, 9, 9, 9, 4, 5, 6, 7, 8, 9, 11, 9, 9, 9, 9
+            ]
+        );
+        assert_eq!(
+            a.targets,
+            vec![
+                1, 2, i, i, i, i, 3, i, i, i, i, i, 4, 5, 6, 7, 8, i, 11, i, i, i, i, i
+            ]
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

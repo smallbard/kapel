@@ -8,13 +8,23 @@
 //! counted. The attention counts its whole score matrix, as Smallem and
 //! llm.c count it, though a causal kernel computes half of it. The backward
 //! pass computes two products for each product of the forward pass: a step
-//! costs three forward passes.
+//! costs three forward passes. With the weights frozen (LoRA), the products
+//! by a weight compute the gradient of their input only: two forward passes
+//! for them, three for the attention's; the adapters' small products are not
+//! counted.
 
 use kapel_models::{Block, Config};
 
 /// The multiply-adds of a forward pass over `rows` sequences of `length`
 /// tokens.
 pub fn forward_macs(config: &Config, rows: usize, length: usize) -> u64 {
+    let (weights, attention) = parts(config, rows, length);
+    weights + attention
+}
+
+/// The multiply-adds of a forward pass: those of the products by a weight,
+/// and those of the attention.
+fn parts(config: &Config, rows: usize, length: usize) -> (u64, u64) {
     let c = config;
     let tokens = (rows * length) as u64;
     let t = length as u64;
@@ -30,13 +40,24 @@ pub fn forward_macs(config: &Config, rows: usize, length: usize) -> u64 {
     };
     // Scores `q · kᵀ` and the mix of the values: `T² · H · D` each.
     let attention = 2 * rows as u64 * t * t * q;
-    c.layers as u64 * (projections + mlp + attention) + tokens * h * v
+    let layers = c.layers as u64;
+    (
+        layers * (projections + mlp) + tokens * h * v,
+        layers * attention,
+    )
 }
 
 /// The operations of a training step over `tokens` tokens in sequences of
 /// `length`: three forward passes, two operations per multiply-add.
 pub fn step_flops(config: &Config, tokens: usize, length: usize) -> u64 {
     6 * forward_macs(config, tokens / length.max(1), length)
+}
+
+/// [`step_flops`] with the weights frozen: the products by a weight cost
+/// two forward passes, the attention three.
+pub fn frozen_step_flops(config: &Config, tokens: usize, length: usize) -> u64 {
+    let (weights, attention) = parts(config, tokens / length.max(1), length);
+    4 * weights + 6 * attention
 }
 
 /// The peak of a card in the given type, in Top/s, when Kapel knows it: the

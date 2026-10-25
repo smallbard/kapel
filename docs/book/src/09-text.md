@@ -54,6 +54,7 @@ A chat model expects its conversations in a precise format, written by its autho
 - `strftime_now(format)`, the current local date and time; Llama 3 templates print today's date.
 - A `tojson` filter that writes JSON exactly as Python's `json.dumps` does, separators and all.
 - The `{% generation %}` tags of training templates, rendered as plain blocks.
+- Variables of one's own, as the keyword arguments of `apply_chat_template` (`render_with`): `enable_thinking = false` turns Qwen 3's thinking off.
 
 A template comes from the model's files, so it is untrusted code. Rendering is bounded by fuel (10 million steps) and by a cap of 1 MiB on the output; minijinja also refuses a single repeated string above 100 MB. `SECURITY.md` states what remains unbounded: a string built by repeated concatenation is limited by fuel, not by size.
 

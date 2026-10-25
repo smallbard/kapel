@@ -186,6 +186,11 @@ impl Operation for Affine {
 /// floats round to nearest, ties to even; integers round and saturate. Between
 /// float types, the gradient passes through unchanged; an integer input or
 /// output receives none.
+///
+/// A quantized input converts to a float type: its values decoded, then
+/// rounded to the type (the weights of a model quantized for QLoRA, merged
+/// with their adapters). It receives no gradient; nothing converts to a
+/// quantized type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Cast {
     /// The target type.
@@ -197,13 +202,19 @@ impl Operation for Cast {
 
     fn infer(&self, inputs: &[&Tensor]) -> Result<Signature> {
         arity(Self::NAME, inputs, &[1], "1")?;
-        for dtype in [inputs[0].dtype(), self.dtype] {
-            if dtype.is_quantized() {
-                return Err(kapel_core::Error::UnsupportedDType {
-                    op: Self::NAME,
-                    dtype,
-                });
-            }
+        let from = inputs[0].dtype();
+        let refused = if self.dtype.is_quantized() {
+            Some(self.dtype)
+        } else if from.is_quantized() && !self.dtype.is_float() {
+            Some(from)
+        } else {
+            None
+        };
+        if let Some(dtype) = refused {
+            return Err(kapel_core::Error::UnsupportedDType {
+                op: Self::NAME,
+                dtype,
+            });
         }
         Ok(Signature {
             shape: inputs[0].shape().to_vec(),

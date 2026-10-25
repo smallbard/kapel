@@ -220,6 +220,97 @@ impl Cuda {
         Ok(Some(out.reshape(shape)?))
     }
 
+    /// The gradient of `x` in `x [..., K] · wᵢᵀ`, the weights stacked, on the
+    /// device when every weight's format has kernels; `None` otherwise: the
+    /// weights dequantized at once into the gradient's type, then one
+    /// product `g · W`.
+    pub(crate) fn quantized_product_grad(
+        &self,
+        x: &Tensor,
+        weights: &[&Tensor],
+        grad: &Tensor,
+    ) -> Result<Option<Tensor>> {
+        let op = <QuantizedMatmul as kapel_ops::Operation>::NAME;
+        let mut codes = Vec::with_capacity(weights.len());
+        for w in weights {
+            match self.codes(op, w)? {
+                Some(c) => codes.push(c),
+                None => return Ok(None),
+            }
+        }
+        let dtype = grad.dtype();
+        if !matches!(dtype, DType::F32 | DType::BF16 | DType::F16) || dtype != x.dtype() {
+            return Ok(None);
+        }
+        let k = weights[0].shape()[1];
+        let width: usize = weights.iter().map(|w| w.shape()[0]).sum();
+        let rows: usize = grad.shape()[..grad.rank() - 1].iter().product();
+        if k == 0 || rows == 0 || width == 0 {
+            return Ok(Some(self.output_as(x.shape(), dtype, true, |_, _| Ok(()))?));
+        }
+        let size = dtype.storage_bytes(1)?;
+        let stacked = self.output_as(&[width, k], dtype, false, |p, _| {
+            let mut c0 = 0;
+            for (w, c) in weights.iter().zip(&codes) {
+                let columns = w.shape()[0];
+                let n = columns * k;
+                self.launch(
+                    "dequantize",
+                    n / 8,
+                    Args::new()
+                        .u32(c.code)
+                        .u32(c.group)
+                        .u32(small(op, k)?)
+                        .slice(c.pointer, c.bytes)
+                        .u32(0)
+                        .u32(float_code(op, dtype)?)
+                        .slice(p + (c0 * k * size) as u64, n * size),
+                )?;
+                c0 += columns;
+            }
+            Ok(())
+        })?;
+        let g = self.contiguous_x(op, grad)?.reshape(&[rows, width])?;
+        let dx = self.matmul(&g, &stacked, None, &[rows, k])?;
+        Ok(Some(dx.reshape(x.shape())?))
+    }
+
+    /// The quantized `x` decoded into the float `dtype` on the device, when
+    /// its format has kernels and its rows are whole; `None` otherwise.
+    pub(crate) fn decoded_on_device(&self, x: &Tensor, dtype: DType) -> Result<Option<Tensor>> {
+        let op = "cast";
+        if !matches!(dtype, DType::F32 | DType::BF16 | DType::F16) || x.rank() == 0 {
+            return Ok(None);
+        }
+        let Some(c) = self.codes(op, x)? else {
+            return Ok(None);
+        };
+        let k = *x.shape().last().expect("a dimension");
+        let whole =
+            x.is_contiguous() && k.is_multiple_of(x.dtype().block_len()) && k.is_multiple_of(8);
+        if !whole {
+            return Ok(None);
+        }
+        if x.numel() == 0 {
+            return Ok(Some(self.output_as(x.shape(), dtype, true, |_, _| Ok(()))?));
+        }
+        let y = self.output_as(x.shape(), dtype, false, |p, n| {
+            self.launch(
+                "dequantize",
+                n / 8,
+                Args::new()
+                    .u32(c.code)
+                    .u32(c.group)
+                    .u32(small(op, k)?)
+                    .slice(c.pointer, c.bytes)
+                    .u32(0)
+                    .u32(float_code(op, dtype)?)
+                    .slice(p, dtype.storage_bytes(n)?),
+            )
+        })?;
+        Ok(Some(y))
+    }
+
     /// `x` row-major from the start of its storage, in its own type.
     fn contiguous_x(&self, op: &'static str, x: &Tensor) -> Result<Tensor> {
         if x.is_contiguous() && x.layout().offset() == 0 {

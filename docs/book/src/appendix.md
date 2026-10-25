@@ -106,10 +106,14 @@
 | The tape, losses, optimizers | `crates/kapel-train/src/{tape,loss,optim}.rs`, `crates/kapel-train/tests/{tape,optim}.rs` |
 | Decoders on a tape | `crates/kapel-train/src/model.rs`, `crates/kapel-train/tests/{model,cuda}.rs` |
 | The fused cross-entropy | `crates/kapel-ops/src/loss.rs`, `crates/kapel-{ref,cpu}/src/loss.rs`, `crates/kapel-cuda/src/ops.rs`, `kernels/src/lib.rs` (`cross_entropy_rows`) |
-| The training loop, its configuration and checkpoints | `crates/kapel-train/src/{trainer,config,schedule,checkpoint,flops}.rs`, `crates/kapel-cli/src/train.rs`, `crates/kapel-train/tests/trainer.rs`, `recipes/gpt2-124m/` |
+| The training loop, its configuration and checkpoints | `crates/kapel-train/src/{trainer/mod,config,schedule,checkpoint,flops}.rs`, `crates/kapel-cli/src/train.rs`, `crates/kapel-train/tests/trainer.rs`, `recipes/gpt2-124m/` |
 | Preparing and reading the data | `crates/kapel-train/src/{prepare,dataset,data}.rs`, `crates/kapel-cli/src/prepare.rs`, `crates/kapel-train/tests/prepare.rs`, `crates/kapel-train/examples/loader.rs` |
 | Optimizers' steps in place | `crates/kapel-ops/src/update.rs`, `crates/kapel-{ref,cpu}/src/update.rs`, `crates/kapel-cuda/src/ops.rs` (`adamw`) |
 | Training measured against PyTorch, the time of each operation | `crates/kapel-train/examples/{gradients,steps}.rs`, `tools/train/gradients.py`, `crates/kapel-train/src/profile.rs` |
+| Conversations and their masks | `crates/kapel-train/src/chat.rs`, `crates/kapel-train/tests/prepare.rs` |
+| LoRA and QLoRA, PEFT's files, merging | `crates/kapel-train/src/lora.rs`, `crates/kapel-cli/src/merge.rs`, `crates/kapel-train/tests/lora.rs`, `crates/kapel-train/examples/lora.rs`, `tools/train/peft_parity.py` |
+| DPO, GRPO, rewards, tasks | `crates/kapel-train/src/{preference,grpo,rewards}.rs`, `crates/kapel-train/src/trainer/post.rs`, `crates/kapel-train/tests/post.rs`, `crates/kapel-train/examples/tasks.rs` |
+| Post-training measured against TRL | `tools/train/{trl_sft,gsm8k}.py`, `recipes/{sft-lora-gsm8k,grpo-gsm8k}/` |
 | One model type for the bindings | `crates/kapel-runtime/src/lib.rs` |
 | The C API | `crates/kapel-capi/include/kapel.h`, `crates/kapel-capi/src/lib.rs`, `crates/kapel-capi/examples/c/` |
 | The Python module | `crates/kapel-python/src/lib.rs`, `crates/kapel-python/kapel.pyi`, `crates/kapel-python/tests/` |

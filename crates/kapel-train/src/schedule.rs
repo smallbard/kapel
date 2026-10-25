@@ -17,6 +17,7 @@ enum Kind {
     Constant,
     Cosine,
     Wsd,
+    Linear,
 }
 
 impl Schedule {
@@ -26,6 +27,7 @@ impl Schedule {
             kind: match config.kind.as_str() {
                 "constant" => Kind::Constant,
                 "wsd" => Kind::Wsd,
+                "linear" => Kind::Linear,
                 _ => Kind::Cosine,
             },
             warmup: config.warmup,
@@ -40,7 +42,11 @@ impl Schedule {
     /// - during the `warmup` first steps, `(step + 1) / warmup`, as llm.c;
     /// - then, for `"cosine"`, from 1 to `final` along half a cosine, as
     ///   llm.c and nanoGPT; for `"wsd"`, 1, then a straight line from 1 to
-    ///   `final` over the last `decay` of the run; for `"constant"`, 1.
+    ///   `final` over the last `decay` of the run; for `"linear"`, from 1 at
+    ///   the end of the warmup to `final` one step past the last, as
+    ///   `transformers`' `get_linear_schedule_with_warmup` (TRL's default):
+    ///   the last step has `1 / (steps − warmup)` of the way left; for
+    ///   `"constant"`, 1.
     pub fn factor(&self, step: usize) -> f64 {
         if step < self.warmup {
             return (step + 1) as f64 / self.warmup as f64;
@@ -48,6 +54,11 @@ impl Schedule {
         let last = self.last;
         match self.kind {
             Kind::Constant => 1.0,
+            Kind::Linear => {
+                let span = (self.steps - self.warmup).max(1) as f64;
+                let left = ((self.steps - step.min(self.steps)) as f64 / span).max(0.0);
+                last + left * (1.0 - last)
+            }
             Kind::Cosine => {
                 let span = (self.steps - self.warmup).max(1) as f64;
                 let ratio = ((step - self.warmup) as f64 / span).min(1.0);
@@ -96,5 +107,9 @@ mod tests {
         assert!((w.factor(110) - 0.1).abs() < 1e-12);
         assert!(w.factor(80) < 1.0 && w.factor(80) > 0.1);
         assert_eq!(schedule("constant").factor(100), 1.0);
+        let l = schedule("linear");
+        assert_eq!(l.factor(10), 1.0);
+        assert!((l.factor(60) - 0.55).abs() < 1e-12);
+        assert!((l.factor(109) - (0.1 + 0.9 / 100.0)).abs() < 1e-12);
     }
 }

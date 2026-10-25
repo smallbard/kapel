@@ -9,11 +9,18 @@
 //! - `train_000000.bin`, … : the tokens, in llm.c's format (see
 //!   [`crate::data::TokenFile`]), each document whole and preceded by the
 //!   separator, as llm.c's FineWeb shards are;
-//! - `train_000000.idx`, … : where each document starts in its shard.
+//! - `train_000000.idx`, … : where each document starts in its shard;
+//! - for conversations, `train_000000.mask`, … : which tokens the loss
+//!   counts, those the assistant wrote ([`crate::chat`]).
 //!
 //! An index file is the 8 bytes `KAPELIDX`, a little-endian `u32` version
 //! (1), four bytes of zeros, a `u64` count, then that many `u64`: the first
 //! token of each document (its separator), in increasing order.
+//!
+//! A mask file is the 8 bytes `KAPELMSK`, a `u32` version (1), four bytes
+//! of zeros, a `u64` count of tokens, then one bit per token, the first in
+//! the lowest bit of the first byte: 1 for a token the loss counts as a
+//! target.
 
 use std::path::Path;
 
@@ -28,6 +35,8 @@ pub const MANIFEST: &str = "dataset.json";
 
 const INDEX_MAGIC: &[u8; 8] = b"KAPELIDX";
 
+const MASK_MAGIC: &[u8; 8] = b"KAPELMSK";
+
 /// What `dataset.json` holds.
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct Manifest {
@@ -35,8 +44,15 @@ pub struct Manifest {
     pub kapel_dataset: u32,
     /// The tokenizer the tokens come from.
     pub tokenizer: TokenizerInfo,
-    /// The token that starts each document.
+    /// The token that starts each document, and pads the rows.
     pub separator: u32,
+    /// Whether the separator is written before each document: not for
+    /// conversations, whose template begins them, where it only pads.
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub separated: bool,
+    /// For conversations, how they were made into tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat: Option<ChatInfo>,
     /// The documents read, duplicates and empty ones included.
     pub documents: u64,
     /// The documents left out as exact duplicates of an earlier one.
@@ -52,6 +68,21 @@ pub struct Manifest {
     /// The validation split, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub val: Option<Split>,
+}
+
+fn yes() -> bool {
+    true
+}
+
+fn is_true(b: &bool) -> bool {
+    *b
+}
+
+/// How conversations were made into tokens.
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+pub struct ChatInfo {
+    /// The SHA-256 of the chat template.
+    pub template_sha256: String,
 }
 
 /// The tokenizer of a dataset.
@@ -79,6 +110,9 @@ pub struct Split {
     pub tokens: u64,
     /// Its documents.
     pub documents: u64,
+    /// Its tokens the loss counts, for conversations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trained: Option<u64>,
     /// Its shards, in order.
     pub shards: Vec<ShardInfo>,
 }
@@ -96,6 +130,10 @@ pub struct ShardInfo {
     pub documents: u64,
     /// The SHA-256 of the file of tokens.
     pub sha256: String,
+    /// The mask of its tokens the loss counts, relative to the manifest,
+    /// for conversations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mask: Option<String>,
 }
 
 impl Manifest {
@@ -130,7 +168,7 @@ impl Manifest {
             .iter()
             .chain(manifest.val.iter().flat_map(|s| &s.shards))
         {
-            for name in [&shard.file, &shard.index] {
+            for name in [&shard.file, &shard.index].into_iter().chain(&shard.mask) {
                 if !is_relative_name(name) {
                     return Err(DataError(format!(
                         "a shard named {name:?}: names stay inside the dataset"
@@ -209,6 +247,75 @@ pub fn read_index(path: &Path, tokens: usize) -> Result<Vec<u64>> {
     Ok(starts)
 }
 
+/// Writes the mask `bits` (one per token) into `path`.
+///
+/// # Errors
+///
+/// If the file cannot be written.
+pub fn write_mask(path: &Path, bits: &[bool]) -> Result<()> {
+    let mut bytes = Vec::with_capacity(24 + bits.len().div_ceil(8));
+    bytes.extend_from_slice(MASK_MAGIC);
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.extend_from_slice(&[0; 4]);
+    bytes.extend_from_slice(&(bits.len() as u64).to_le_bytes());
+    for chunk in bits.chunks(8) {
+        let mut byte = 0u8;
+        for (i, &b) in chunk.iter().enumerate() {
+            byte |= u8::from(b) << i;
+        }
+        bytes.push(byte);
+    }
+    std::fs::write(path, bytes).map_err(|e| DataError(format!("{}: {e}", path.display())))
+}
+
+/// A mask read back: one bit per token.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Mask {
+    bits: Vec<u8>,
+    len: usize,
+}
+
+impl Mask {
+    /// Whether the loss counts token `i`; `false` beyond the end.
+    pub fn get(&self, i: usize) -> bool {
+        i < self.len && self.bits[i / 8] >> (i % 8) & 1 == 1
+    }
+
+    /// Its tokens.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether it has no token.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+/// Reads the mask in `path`, checked to have `tokens` bits.
+///
+/// # Errors
+///
+/// If the file cannot be read or is not the mask of such a shard.
+pub fn read_mask(path: &Path, tokens: usize) -> Result<Mask> {
+    let fail = |m: &str| DataError(format!("{}: {m}", path.display()));
+    let bytes = std::fs::read(path).map_err(|e| fail(&e.to_string()))?;
+    if bytes.len() < 24 || &bytes[..8] != MASK_MAGIC {
+        return Err(fail("not a mask of tokens"));
+    }
+    if u32::from_le_bytes(bytes[8..12].try_into().expect("4 bytes")) != 1 {
+        return Err(fail("a mask of another version"));
+    }
+    let count = u64::from_le_bytes(bytes[16..24].try_into().expect("8 bytes"));
+    if count != tokens as u64 || (bytes.len() - 24) != tokens.div_ceil(8) {
+        return Err(fail("its count is not the shard's tokens"));
+    }
+    Ok(Mask {
+        bits: bytes[24..].to_vec(),
+        len: tokens,
+    })
+}
+
 /// The SHA-256 of `bytes`, in hexadecimal.
 pub fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::Digest;
@@ -232,6 +339,20 @@ mod tests {
         assert!(read_index(&path, 9).is_err());
         write_index(&path, &[0, 5, 5]).unwrap();
         assert!(read_index(&path, 10).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_mask_reads_back_and_a_bad_one_is_refused() {
+        let dir = std::env::temp_dir().join(format!("kapel-mask-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.mask");
+        let bits: Vec<bool> = (0..19).map(|i| i % 3 == 1).collect();
+        write_mask(&path, &bits).unwrap();
+        let mask = read_mask(&path, 19).unwrap();
+        assert_eq!((0..19).map(|i| mask.get(i)).collect::<Vec<_>>(), bits);
+        assert!(!mask.get(19));
+        assert!(read_mask(&path, 18).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

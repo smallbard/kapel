@@ -246,3 +246,162 @@ pub fn linear_cross_entropy<B: Compute>(
         }
     }))
 }
+
+/// The cross-entropy of each position, `−ln p(target)` (0 for [`IGNORE`]),
+/// for hidden states `h [N, C]` and an output table `w [V, C]`: `[N]`, in
+/// `f32` (`f64` for inputs in `f64`). The log-probabilities of sequences
+/// for DPO, of tokens for GRPO, whose losses weigh each position apart.
+///
+/// The logits are formed `chunk` rows at a time, as in
+/// [`linear_cross_entropy`], but their gradients cannot be: they depend on
+/// the gradient of each position, known in the backward pass only. The
+/// backward pass forms each piece of logits again: one product more.
+///
+/// # Errors
+///
+/// As [`cross_entropy`].
+pub fn linear_token_losses<B: Compute>(
+    h: &Var<B>,
+    w: &Var<B>,
+    targets: &[u32],
+    chunk: usize,
+) -> Result<Var<B>> {
+    let tape = h.tape();
+    let backend = tape.backend().clone();
+    let (hv, wv) = (h.value(), w.value());
+    let invalid = |message: String| kapel_core::Error::InvalidArgument {
+        op: "linear_token_losses",
+        message,
+    };
+    let ([n, c], [vocab, c2]) = (hv.shape(), wv.shape()) else {
+        return Err(invalid(format!(
+            "h [N, C] and w [V, C], got {:?} and {:?}",
+            hv.shape(),
+            wv.shape()
+        )));
+    };
+    let (n, c, vocab) = (*n, *c, *vocab);
+    if c != *c2 {
+        return Err(invalid(format!("h [N, {c}] and w [V, {c2}]")));
+    }
+    check_len(n, targets)?;
+    counted(targets, vocab)?;
+    let dtype = hv.dtype();
+    let wide = CrossEntropy::output_dtype(dtype);
+    let padded = vocab.next_multiple_of(ALIGN);
+    let wp = padded_table(&backend, &wv, padded)?;
+    let wt = wp.transpose(0, 1)?;
+    let chunk = chunk.max(1);
+    let mut parts = Vec::new();
+    for start in (0..n).step_by(chunk) {
+        let len = chunk.min(n - start);
+        let rows = &targets[start..start + len];
+        if rows.iter().all(|&t| t == IGNORE) {
+            parts.push(backend.zeros(&[len], wide)?);
+            continue;
+        }
+        let x = hv.narrow(0, start, len)?;
+        let logits = backend.forward(&Matmul, &[&x, &wt])?.narrow(1, 0, vocab)?;
+        let t = backend.upload(&Tensor::from_slice(rows, &[len])?)?;
+        parts.push(backend.forward(&CrossEntropy, &[&logits, &t])?);
+    }
+    let losses = match parts.len() {
+        0 => backend.zeros(&[0], wide)?,
+        1 => parts.pop().expect("one part"),
+        _ => {
+            let refs: Vec<&Tensor> = parts.iter().collect();
+            backend.forward(&Concat { dim: 0 }, &refs)?
+        }
+    };
+    drop((wp, wt));
+    let targets = targets.to_vec();
+    Ok(tape.custom(&[h, w], losses, move || {
+        move |backend: &B, g: Tensor, needed: &[bool]| -> Result<Vec<Option<Grad>>> {
+            let add = Binary {
+                kind: BinaryKind::Add,
+            };
+            let wp = padded_table(backend, &wv, padded)?;
+            let wt = wp.transpose(0, 1)?;
+            let g = backend.forward(&Cast { dtype: wide }, &[&g])?;
+            let mut gh_parts = Vec::new();
+            let mut gw: Option<Tensor> = None;
+            for start in (0..n).step_by(chunk) {
+                let len = chunk.min(n - start);
+                let rows = &targets[start..start + len];
+                if rows.iter().all(|&t| t == IGNORE) {
+                    if needed[0] {
+                        gh_parts.push(backend.zeros(&[len, c], dtype)?);
+                    }
+                    continue;
+                }
+                let x = hv.narrow(0, start, len)?;
+                let logits = backend.forward(&Matmul, &[&x, &wt])?.narrow(1, 0, vocab)?;
+                let t = backend.upload(&Tensor::from_slice(rows, &[len])?)?;
+                let gl = backend
+                    .backward(&CrossEntropy, &[&logits, &t], &g.narrow(0, start, len)?)?
+                    .swap_remove(0)
+                    .expect("the logits receive a gradient");
+                drop(logits);
+                let gl = if padded == vocab {
+                    gl
+                } else if let Some(full) = padded_rows(&gl, padded)? {
+                    full
+                } else {
+                    let zeros = backend.zeros(&[len, padded - vocab], gl.dtype())?;
+                    backend.forward(&Concat { dim: 1 }, &[&gl, &zeros])?
+                };
+                if needed[0] {
+                    gh_parts.push(backend.forward(&Matmul, &[&gl, &wp])?);
+                }
+                if needed[1] {
+                    let part = backend.forward(&Matmul, &[&gl.transpose(0, 1)?, &x])?;
+                    let part = backend.forward(&Cast { dtype: wide }, &[&part])?;
+                    gw = Some(match gw {
+                        None => part,
+                        Some(acc) => backend.forward(&add, &[&acc, &part])?,
+                    });
+                }
+            }
+            let gh = match gh_parts.len() {
+                0 => None,
+                1 => gh_parts.pop(),
+                _ => {
+                    let refs: Vec<&Tensor> = gh_parts.iter().collect();
+                    Some(backend.forward(&Concat { dim: 0 }, &refs)?)
+                }
+            };
+            let gh = gh
+                .map(|g| -> Result<Grad> {
+                    let g = if g.dtype() == dtype {
+                        g
+                    } else {
+                        backend.forward(&Cast { dtype }, &[&g])?
+                    };
+                    Ok(Grad::Dense(g))
+                })
+                .transpose()?;
+            let gw = gw
+                .map(|g| -> Result<Grad> {
+                    let g = g.narrow(0, 0, vocab)?;
+                    Ok(Grad::Dense(
+                        backend.forward(&Cast { dtype: wv.dtype() }, &[&g])?,
+                    ))
+                })
+                .transpose()?;
+            Ok(vec![gh, gw])
+        }
+    }))
+}
+
+/// The table `w [V, C]` with rows of zeros up to `padded`.
+fn padded_table<B: Compute>(backend: &B, w: &Tensor, padded: usize) -> Result<Tensor> {
+    let [vocab, c] = w.shape()[..] else {
+        unreachable!("checked [V, C]")
+    };
+    if padded == vocab {
+        Ok(w.clone())
+    } else {
+        let zeros = backend.zeros(&[padded - vocab, c], w.dtype())?;
+        backend.forward(&Concat { dim: 0 }, &[w, &zeros])
+    }
+}

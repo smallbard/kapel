@@ -53,7 +53,7 @@ The shared checks are small private functions: `arity`, `float`, `indices` (the 
 | `Binary` | a, b → broadcast shape | Add, Sub, Mul, Div, Max, Min; a broadcast input's gradient is summed over the repeated dimensions | a, b |
 | `Affine` | x → same | scale · x + bias | x |
 | `Glu` | x \[…, 2n\] → \[…, n\] | f(x\[…, :n\]) · x\[…, n:\], the gate first: SwiGLU with SiLU, GeGLU with GELU | x |
-| `Cast` | x → `dtype` | as `DType::encode`; the gradient passes between float types only | x if floats |
+| `Cast` | x → `dtype` | as `DType::encode`; a quantized `x` is decoded to a float type (merging LoRA adapters into quantized weights, section 16.2); the gradient passes between float types only | x if floats |
 | `Contiguous` | x → same | a row-major copy, bit for bit | x |
 | `Concat` | inputs → joined along `dim` | same type and shape except `dim` | each input |
 | `Matmul` | \[…, M, K\] · \[…, K, N\], optional bias \[N\] | batch dimensions broadcast; strided inputs allowed; a bias of the type of `a` added to every row before rounding (the bias of a linear layer, in the product) | a, b, bias |

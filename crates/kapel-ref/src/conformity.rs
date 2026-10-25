@@ -460,6 +460,21 @@ fn cases<V: Visitor>(v: &mut V, dtype: DType) {
             format!("[4, 16] to {target}"),
             vec![x(rng, &[4, 16])],
         );
+        // Quantized weights decoded, as for merging an adapter into them.
+        use kapel_core::QuantFormat as Q;
+        for format in [
+            DType::int8(64).expect("valid"),
+            DType::int4(32).expect("valid"),
+            DType::Quantized(Q::Q8_0),
+            DType::Quantized(Q::Q4_0),
+            DType::Quantized(Q::Q4K),
+        ] {
+            v.visit(
+                &Cast { dtype: target },
+                format!("{format} [3, 256] to {target}"),
+                vec![plain(random_quantized(rng, &[3, 256], format))],
+            );
+        }
     }
     let mut r = |shape: &[usize]| random(rng, shape, dtype, -1.0, 1.0);
     for (case, arg) in [

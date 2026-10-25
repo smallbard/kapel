@@ -13,6 +13,14 @@
 //! A run resumed from a checkpoint goes on with the parameters, the
 //! optimizer's moments and steps, and the position in the data it had: on
 //! the same machine, it computes the bits an uninterrupted run computes.
+//!
+//! What a step learns from is the run's objective: tokens (pre-training,
+//! supervised fine-tuning), pairs of answers (DPO), or answers the model
+//! writes and their rewards (GRPO), in [`post`]. Every `eval.every` steps,
+//! the losses of validation and of the text of control, and the accuracy of
+//! the tasks, are measured.
+
+mod post;
 
 use std::collections::BTreeMap;
 use std::io::Write as _;
@@ -28,6 +36,7 @@ use crate::checkpoint::{self, Checkpoint, State, Writer};
 use crate::config::{TrainConfig, matches};
 use crate::data::{self, Loader, Prefetched, Source};
 use crate::flops;
+use crate::lora::{self, Projection};
 use crate::model::{Batch, Decoder, Options, Parameter, Parameters, init};
 use crate::optim::{Optimizer, OptimizerState, global_norm};
 use crate::schedule::Schedule;
@@ -59,6 +68,8 @@ from!(
     kapel_core::Error,
     crate::config::ConfigError,
     crate::data::DataError,
+    crate::rewards::RewardError,
+    kapel_infer::InferError,
     kapel_models::ModelError,
     kapel_hub::HubError,
     std::io::Error,
@@ -108,13 +119,19 @@ fn model_json(path: &Path) -> Result<Value> {
     serde_json::from_slice(&text).map_err(|e| TrainError(format!("{}: {e}", file.display())))
 }
 
-/// The parameters the configuration starts from, with its groups applied.
-fn start(config: &TrainConfig, model_config: &Config) -> Result<Parameters> {
+/// The parameters the configuration starts from: its adapters added, its
+/// groups applied, then the frozen projections quantized for QLoRA. With
+/// adapters, also the projections adapted.
+fn start(config: &TrainConfig, model_config: &Config) -> Result<(Parameters, Vec<Projection>)> {
     let mut params = if config.model.init == "weights" {
         let checkpoint = kapel_hub::Checkpoint::open(&config.model.config)?;
         Parameters::from_model(&kapel_models::Model::load(&checkpoint)?)
     } else {
         init(model_config, config.model.std, config.model.seed)?
+    };
+    let adapted = match &config.lora {
+        Some(l) => lora::add_adapters(&mut params, model_config, l, config.model.seed)?,
+        None => Vec::new(),
     };
     for (name, p) in params.iter_mut() {
         if let Some(g) = config
@@ -136,7 +153,16 @@ fn start(config: &TrainConfig, model_config: &Config) -> Result<Parameters> {
             *sparse = g.sparse.unwrap_or(*sparse);
         }
     }
-    Ok(params)
+    if let Some(dtype) = config
+        .lora
+        .as_ref()
+        .map(lora::LoraConfig::quantized_dtype)
+        .transpose()?
+        .flatten()
+    {
+        lora::quantize_frozen(&mut params, model_config, dtype)?;
+    }
+    Ok((params, adapted))
 }
 
 /// Runs the configuration's training on the device it names.
@@ -146,6 +172,22 @@ fn start(config: &TrainConfig, model_config: &Config) -> Result<Parameters> {
 /// For a configuration, a file or a device that fails.
 #[allow(clippy::needless_return)]
 pub fn run(config: &TrainConfig, options: &RunOptions) -> Result<Summary> {
+    // A model of the Hub, downloaded once.
+    let resolved;
+    let config = if !config.model.config.exists()
+        && crate::config::is_hub_name(&config.model.config)
+    {
+        let name = config.model.config.to_string_lossy().into_owned();
+        let dir =
+            kapel_hub::download::snapshot(&name, "main", &kapel_hub::download::default_cache())?;
+        let mut c = config.clone();
+        c.model.config = dir;
+        c.model.hub = Some(name);
+        resolved = c;
+        &resolved
+    } else {
+        config
+    };
     let device = config.training.device.as_str();
     if device == "cpu" {
         if options.profile {
@@ -212,6 +254,46 @@ pub fn run(config: &TrainConfig, options: &RunOptions) -> Result<Summary> {
     )))
 }
 
+/// What the steps of a run learn from.
+enum Objective {
+    /// Tokens, read ahead.
+    Tokens(Prefetched),
+    /// Pairs of answers, for DPO.
+    Pairs(Box<post::Pairs>),
+    /// Answers written by the model, for GRPO.
+    Answers(Box<post::Answers>),
+}
+
+impl Objective {
+    fn position(&self) -> data::Position {
+        match self {
+            Self::Tokens(t) => t.position().clone(),
+            Self::Pairs(p) => p.pairs.position(),
+            Self::Answers(a) => a.prompts.position(),
+        }
+    }
+}
+
+/// The gradients of the passes of a step, added up.
+#[derive(Default)]
+struct Summed(BTreeMap<String, Grad>);
+
+/// What a step computed, before the optimizer moves.
+struct StepOutput {
+    /// The gradients, summed over the passes.
+    grads: Vec<(String, Grad)>,
+    /// The factor of the sum: `1 / passes` for a mean.
+    scale: f64,
+    /// The loss of the step.
+    loss: f64,
+    /// The tokens it learnt from (their rows, padding included).
+    tokens: u64,
+    /// Its operations, for the MFU.
+    flops: u64,
+    /// What else it shows, for the log.
+    metrics: serde_json::Map<String, Value>,
+}
+
 /// A run in progress, on one backend.
 struct Run<'a, B: Compute> {
     config: &'a TrainConfig,
@@ -221,10 +303,20 @@ struct Run<'a, B: Compute> {
     model_json: Value,
     decoder: Decoder,
     params: Parameters,
+    /// The projections with adapters, for a run with LoRA.
+    adapted: Vec<Projection>,
     optimizer: Optimizer,
     schedule: Schedule,
-    train: Prefetched,
+    objective: Objective,
+    /// The model the run starts from, frozen, when the objective needs it
+    /// and the adapters are not the difference.
+    reference: Option<Parameters>,
+    /// What writes answers, for GRPO and the tasks.
+    generator: Option<kapel_infer::Pipeline<B>>,
+    /// The tasks evaluated, their prompts read.
+    tasks: Vec<post::Task>,
     val: Option<Vec<data::Tokens>>,
+    control: Option<Vec<data::Tokens>>,
     step: usize,
     tokens: u64,
     dir: PathBuf,
@@ -249,8 +341,11 @@ impl<'a, B: Compute> Run<'a, B> {
     ) -> Result<Self> {
         let model_json = model_json(&config.model.config)?;
         let model_config = Config::from_json(&model_json)?;
-        let decoder = Decoder::new(model_config.clone())?;
-        let mut params = start(config, &model_config)?;
+        let mut decoder = Decoder::new(model_config.clone())?;
+        if let Some(l) = &config.lora {
+            decoder = decoder.with_lora(l.scale());
+        }
+        let (mut params, adapted) = start(config, &model_config)?;
         let mut optimizer = Optimizer::new(&config.optimizer);
         let b = &config.batch;
         let reading = config.data.reading(b.rows, b.length);
@@ -266,28 +361,66 @@ impl<'a, B: Compute> Run<'a, B> {
             }
             Ok(source)
         };
-        let sources = config
-            .data
-            .training_sources()
-            .iter()
-            .map(|(path, weight)| Ok((open(path, "train")?, *weight)))
-            .collect::<Result<Vec<_>>>()?;
-        let mut train = Loader::new(sources, reading.clone())?;
-        let val = match &config.data.val {
-            Some(path) if config.eval.tokens > 0 => {
-                // In order, whatever the training's order: the same rows at
-                // every evaluation.
-                let mut r = reading.clone();
-                r.shuffle = false;
-                let mut loader = Loader::new(vec![(open(path, "val")?, 1.0)], r)?;
-                let passes = config.eval.tokens / b.pass();
-                Some(
-                    (0..passes)
-                        .map(|_| loader.next_batch())
-                        .collect::<std::result::Result<_, _>>()?,
-                )
+        let encoder = || -> Result<crate::chat::Encoder> {
+            Ok(crate::chat::Encoder::from_dir(&config.model.config)?)
+        };
+        let mut loader = None;
+        let mut objective = if let Some(dpo) = &config.dpo {
+            Some(Objective::Pairs(Box::new(post::Pairs::new(
+                dpo,
+                &encoder()?,
+                b.length,
+                config.data.seed,
+                options.quiet,
+            )?)))
+        } else if let Some(grpo) = &config.grpo {
+            Some(Objective::Answers(Box::new(post::Answers::new(
+                grpo,
+                &encoder()?,
+                b.length,
+                config.data.seed,
+                options.quiet,
+            )?)))
+        } else {
+            let sources = config
+                .data
+                .training_sources()
+                .iter()
+                .map(|(path, weight)| Ok((open(path, "train")?, *weight)))
+                .collect::<Result<Vec<_>>>()?;
+            loader = Some(Loader::new(sources, reading.clone())?);
+            None
+        };
+        // In order, whatever the training's order: the same rows at every
+        // evaluation.
+        let held_out = |path: &Option<String>| -> Result<Option<Vec<data::Tokens>>> {
+            match path {
+                Some(path) if config.eval.tokens > 0 => {
+                    let mut r = reading.clone();
+                    r.shuffle = false;
+                    let mut loader = Loader::new(vec![(open(path, "val")?, 1.0)], r)?;
+                    let passes = config.eval.tokens / b.pass();
+                    Ok(Some(
+                        (0..passes)
+                            .map(|_| loader.next_batch())
+                            .collect::<std::result::Result<_, _>>()?,
+                    ))
+                }
+                _ => Ok(None),
             }
-            _ => None,
+        };
+        let val = held_out(&config.data.val)?;
+        let control = held_out(&config.eval.control)?;
+        let tasks = if config.eval.tasks.is_empty() {
+            Vec::new()
+        } else {
+            let e = encoder()?;
+            config
+                .eval
+                .tasks
+                .iter()
+                .map(|t| post::Task::new(t, &e))
+                .collect::<Result<_>>()?
         };
         let dir = config.checkpoint.dir.clone();
         std::fs::create_dir_all(&dir)?;
@@ -324,14 +457,45 @@ impl<'a, B: Compute> Run<'a, B> {
                 steps: saved.state.optimizer_steps,
                 tensors,
             })?;
-            train.seek(&saved.state.position)?;
+            let position = &saved.state.position;
+            match (&mut objective, &mut loader) {
+                (Some(Objective::Pairs(p)), _) => p.pairs.seek(position)?,
+                (Some(Objective::Answers(a)), _) => a.prompts.seek(position)?,
+                (_, Some(l)) => l.seek(position)?,
+                _ => {}
+            }
             step = saved.state.step;
             tokens = saved.state.tokens;
             if !options.quiet {
                 eprintln!("train: resumed from {} at step {step}", path.display());
             }
         }
-        let params = params.to(&backend, DType::F32)?;
+        let objective = match (objective, loader) {
+            (Some(o), _) => o,
+            (None, Some(l)) => Objective::Tokens(l.prefetch(config.data.prefetch)),
+            (None, None) => unreachable!("an objective or tokens"),
+        };
+        // The model the objective compares with: the starting weights,
+        // frozen, in the computation's type; when only adapters train, the
+        // model without them, which needs no copy.
+        let needs_reference =
+            config.dpo.is_some() || config.grpo.as_ref().is_some_and(|g| g.beta > 0.0);
+        let adapters_only = config.lora.is_some()
+            && params
+                .iter()
+                .all(|(n, p)| !p.trainable || lora::is_factor(n));
+        let reference = if needs_reference && !adapters_only {
+            let (mut start, _) = start(config, &model_config)?;
+            for (_, p) in start.iter_mut() {
+                p.trainable = false;
+            }
+            Some(start.to(&backend, config.dtype())?)
+        } else {
+            None
+        };
+        // The frozen parameters in the computation's type: half the memory
+        // of a frozen model in `f32`.
+        let params = params.to_mixed(&backend, DType::F32, config.dtype())?;
         let log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -342,7 +506,12 @@ impl<'a, B: Compute> Run<'a, B> {
                 .as_deref()
                 .and_then(|n| flops::peak_tflops(n, dtype))
         });
-        let step_flops = flops::step_flops(&model_config, b.pass() * b.accumulate(), b.length);
+        let step_tokens = b.pass() * b.accumulate();
+        let step_flops = if config.lora.is_some() {
+            flops::frozen_step_flops(&model_config, step_tokens, b.length)
+        } else {
+            flops::step_flops(&model_config, step_tokens, b.length)
+        };
         Ok(Self {
             config,
             options,
@@ -351,10 +520,15 @@ impl<'a, B: Compute> Run<'a, B> {
             model_json,
             decoder,
             params,
+            adapted,
             optimizer,
             schedule: Schedule::new(&config.schedule),
-            train: train.prefetch(config.data.prefetch),
+            objective,
+            reference,
+            generator: None,
+            tasks,
             val,
+            control,
             step,
             tokens,
             dir,
@@ -373,6 +547,56 @@ impl<'a, B: Compute> Run<'a, B> {
             checkpoint: self.config.training.checkpoint_activations,
             chunk: self.config.training.chunk,
         }
+    }
+
+    /// A step of tokens: `accumulate` passes, their gradients summed, their
+    /// losses averaged.
+    fn token_step(&mut self) -> Result<StepOutput> {
+        let accumulate = self.config.batch.accumulate();
+        let mut losses = Vec::with_capacity(accumulate);
+        let mut sum = Summed::default();
+        for _ in 0..accumulate {
+            let Objective::Tokens(train) = &mut self.objective else {
+                unreachable!("a step of tokens");
+            };
+            let tokens = train.next_batch()?;
+            let (l, grads) = self.pass(&tokens)?;
+            losses.push(l);
+            self.accumulate(&mut sum, grads)?;
+        }
+        let mut values = Vec::with_capacity(losses.len());
+        for l in &losses {
+            values.push(self.backend.download(l)?.to_f64_vec()?[0]);
+        }
+        Ok(StepOutput {
+            grads: sum.0.into_iter().collect(),
+            scale: 1.0 / accumulate as f64,
+            loss: values.iter().sum::<f64>() / values.len() as f64,
+            tokens: (self.config.batch.pass() * accumulate) as u64,
+            flops: self.step_flops,
+            metrics: serde_json::Map::new(),
+        })
+    }
+
+    /// Adds the gradients of a pass to those of the step.
+    fn accumulate(&self, sum: &mut Summed, grads: Vec<(String, Grad)>) -> Result<()> {
+        for (name, g) in grads {
+            let merged = match sum.0.remove(&name) {
+                Some(t) => {
+                    let shape = self
+                        .params
+                        .get(&name)
+                        .expect("a parameter")
+                        .value
+                        .shape()
+                        .to_vec();
+                    self.add(t, g, &shape)?
+                }
+                None => g,
+            };
+            sum.0.insert(name, merged);
+        }
+        Ok(())
     }
 
     /// One pass: its loss, left on the device, and its gradients.
@@ -439,9 +663,9 @@ impl<'a, B: Compute> Run<'a, B> {
         })
     }
 
-    /// The mean loss of the validation batches, without gradients.
-    fn evaluate(&self) -> Result<Option<f64>> {
-        let Some(val) = &self.val else {
+    /// The mean loss of held-out batches, without gradients.
+    fn evaluate(&self, batches: Option<&[data::Tokens]>) -> Result<Option<f64>> {
+        let Some(val) = batches else {
             return Ok(None);
         };
         let mut total = 0.0;
@@ -476,11 +700,26 @@ impl<'a, B: Compute> Run<'a, B> {
         })
     }
 
-    /// The checkpoint of the current step, in host memory.
+    /// The checkpoint of the current step, in host memory: with adapters,
+    /// the parameters trained only.
     fn checkpoint(&self) -> Result<Checkpoint> {
+        let adapter = self.config.lora.as_ref().map(|l| {
+            lora::peft_config(
+                l,
+                self.decoder.config(),
+                &self.adapted,
+                &self
+                    .config
+                    .model
+                    .hub
+                    .clone()
+                    .unwrap_or_else(|| self.config.model.config.to_string_lossy().into_owned()),
+            )
+        });
         let params = self
             .params
             .iter()
+            .filter(|(_, p)| adapter.is_none() || p.trainable)
             .map(|(n, p)| Ok((n.to_string(), self.host_copy(&p.value)?)))
             .collect::<Result<_>>()?;
         let state = self.optimizer.state();
@@ -497,13 +736,14 @@ impl<'a, B: Compute> Run<'a, B> {
                 step: self.step,
                 optimizer_steps: steps,
                 optimizer: self.config.optimizer.kind.clone(),
-                position: self.train.position().clone(),
+                position: self.objective.position(),
                 tokens: self.tokens,
             },
             params,
             optimizer,
             model_config: self.model_json.clone(),
             run_config: self.config.to_toml(),
+            adapter,
         })
     }
 
@@ -534,35 +774,12 @@ impl<'a, B: Compute> Run<'a, B> {
             let start = Instant::now();
             let lr = c.optimizer.lr * self.schedule.factor(self.step);
             self.optimizer.set_lr(lr);
-            let mut sum: Option<BTreeMap<String, Grad>> = None;
-            let mut losses = Vec::with_capacity(accumulate);
-            for _ in 0..accumulate {
-                let tokens = self.train.next_batch()?;
-                let (l, grads) = self.pass(&tokens)?;
-                losses.push(l);
-                sum = Some(match sum {
-                    None => grads.into_iter().collect(),
-                    Some(mut total) => {
-                        for (name, g) in grads {
-                            let shape = self
-                                .params
-                                .get(&name)
-                                .expect("a parameter")
-                                .value
-                                .shape()
-                                .to_vec();
-                            let merged = match total.remove(&name) {
-                                Some(t) => self.add(t, g, &shape)?,
-                                None => g,
-                            };
-                            total.insert(name, merged);
-                        }
-                        total
-                    }
-                });
-            }
-            let grads: Vec<(String, Grad)> = sum.unwrap_or_default().into_iter().collect();
-            let scale = 1.0 / accumulate as f64;
+            let out = match &self.objective {
+                Objective::Tokens(_) => self.token_step()?,
+                Objective::Pairs(_) => self.pair_step()?,
+                Objective::Answers(_) => self.answer_step()?,
+            };
+            let (grads, scale) = (out.grads, out.scale);
             let norm = global_norm(&self.backend, &self.params, &grads)? * scale;
             let clip = c.training.clip;
             let factor = if clip > 0.0 && norm > clip {
@@ -570,22 +787,21 @@ impl<'a, B: Compute> Run<'a, B> {
             } else {
                 1.0
             };
-            self.optimizer
-                .step(&self.backend, &mut self.params, grads, scale * factor)?;
-            let mut values = Vec::with_capacity(losses.len());
-            for l in &losses {
-                values.push(self.backend.download(l)?.to_f64_vec()?[0]);
+            if !grads.is_empty() {
+                self.optimizer
+                    .step(&self.backend, &mut self.params, grads, scale * factor)?;
             }
-            loss = values.iter().sum::<f64>() / values.len() as f64;
+            loss = out.loss;
             (self.synchronize)();
             let seconds = start.elapsed().as_secs_f64();
-            let data_ms = self.train.take_waited().as_secs_f64() * 1e3;
+            let data_ms = match &mut self.objective {
+                Objective::Tokens(t) => t.take_waited().as_secs_f64() * 1e3,
+                _ => 0.0,
+            };
             self.step += 1;
-            self.tokens += step_tokens;
-            let mfu = self
-                .peak
-                .map(|p| self.step_flops as f64 / seconds / (p * 1e12));
-            let line = json!({
+            self.tokens += out.tokens;
+            let mfu = self.peak.map(|p| out.flops as f64 / seconds / (p * 1e12));
+            let mut line = json!({
                 "step": self.step,
                 "loss": loss,
                 "lr": lr,
@@ -593,14 +809,23 @@ impl<'a, B: Compute> Run<'a, B> {
                 "tokens": self.tokens,
                 "ms": seconds * 1e3,
                 "data_ms": data_ms,
-                "tokens_per_s": step_tokens as f64 / seconds,
+                "tokens_per_s": out.tokens as f64 / seconds,
                 "mfu": mfu,
                 "peak_gib": self.peak_memory.as_ref().map(|p| p() as f64 / (1u64 << 30) as f64),
             });
+            let shown: Vec<String> = out
+                .metrics
+                .iter()
+                .filter_map(|(k, v)| Some(format!(" | {k} {:.4}", v.as_f64()?)))
+                .collect();
+            if let Some(o) = line.as_object_mut() {
+                o.extend(out.metrics);
+            }
             self.record(line)?;
+            let step_tokens = out.tokens;
             if !self.options.quiet && (self.step.is_multiple_of(every) || self.step == 1) {
                 eprintln!(
-                    "step {:>6}/{steps} | loss {loss:.6} | norm {norm:.4} | lr {lr:.2e} | {:.1} ms | {:.0} tok/s{}",
+                    "step {:>6}/{steps} | loss {loss:.6} | norm {norm:.4} | lr {lr:.2e} | {:.1} ms | {:.0} tok/s{}{}",
                     self.step,
                     seconds * 1e3,
                     step_tokens as f64 / seconds,
@@ -610,19 +835,29 @@ impl<'a, B: Compute> Run<'a, B> {
                             .peak_memory
                             .as_ref()
                             .map(|p| format!(" | {:.2} GiB", p() as f64 / (1u64 << 30) as f64))
-                            .unwrap_or_default()
+                            .unwrap_or_default(),
+                    shown.concat()
                 );
             }
             let last = self.step == steps;
             let stopping = self.options.stop_after == Some(self.step);
             if (c.eval.every > 0 && self.step.is_multiple_of(c.eval.every)) || (last && !stopping) {
-                val_loss = self.evaluate()?;
+                val_loss = self.evaluate(self.val.as_deref())?;
                 if let Some(v) = val_loss {
                     self.record(json!({"step": self.step, "val_loss": v, "tokens": self.tokens}))?;
                     if !self.options.quiet {
                         eprintln!("step {:>6}/{steps} | val loss {v:.6}", self.step);
                     }
                 }
+                if let Some(v) = self.evaluate(self.control.as_deref())? {
+                    self.record(
+                        json!({"step": self.step, "control_loss": v, "tokens": self.tokens}),
+                    )?;
+                    if !self.options.quiet {
+                        eprintln!("step {:>6}/{steps} | control loss {v:.6}", self.step);
+                    }
+                }
+                self.evaluate_tasks()?;
             }
             if (c.checkpoint.every > 0 && self.step.is_multiple_of(c.checkpoint.every)) || last {
                 let checkpoint = self.checkpoint()?;

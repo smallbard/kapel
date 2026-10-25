@@ -51,7 +51,7 @@ pub use config::{
     Norm,
 };
 pub use gguf::GgufModel;
-pub use model::{Cache, Model, Observer, ROOM, Recorded, RecordedStep, Site};
+pub use model::{Cache, Model, Observer, ROOM, Recorded, RecordedStep, Site, quantize_matrix};
 
 /// What can go wrong with a model.
 #[derive(Debug)]

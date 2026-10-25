@@ -6,11 +6,19 @@ use kapel_train::trainer::{RunOptions, run};
 pub(crate) const USAGE: &str = "\
 usage: kapel train CONFIG.toml [options]
 
-Trains a model as CONFIG.toml describes it (see The Kapel Guide, Training): the
-model, the token files, the batch, the optimizer, the schedule of learning
-rates, the evaluations and the checkpoints. Each step goes to log.jsonl in the
-run's directory, with its loss, learning rate, gradient norm, speed and model
-FLOP utilization; each checkpoint is a model directory that transformers loads.
+Trains a model as CONFIG.toml describes it (see The Kapel Book, chapters 15 and
+16): the model (a directory, or a repository of the Hub), what it learns from,
+the batch, the optimizer, the schedule of learning rates, the evaluations and the
+checkpoints. A run learns from tokens ([data]: pre-training, and supervised
+fine-tuning on conversations prepared with kapel prepare --chat), from pairs of
+answers ([dpo]), or from answers it writes and their rewards ([grpo]); with
+[lora], the model is frozen and adapters beside it train (QLoRA with
+lora.quantize). Each step goes to log.jsonl in the run's directory, with its loss,
+learning rate, gradient norm, speed and model FLOP utilization, and what the
+method shows (rewards, accuracy of preferences...); every eval.every steps, the
+validation and control losses and the accuracy of [[eval.tasks]]. Each checkpoint
+is a model directory that transformers loads, or with adapters an adapter that
+PEFT loads (kapel merge makes it a model).
 
 options:
   --resume                 go on from the last checkpoint of the run's directory

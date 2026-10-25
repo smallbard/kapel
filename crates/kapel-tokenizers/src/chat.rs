@@ -160,6 +160,11 @@ impl ChatTemplate {
         Ok(source.map(|s| Self::new(s, tokens)))
     }
 
+    /// The template's source.
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
     /// The text of `messages`, with the start of the assistant's answer if
     /// `add_generation_prompt`.
     ///
@@ -172,6 +177,23 @@ impl ChatTemplate {
         &self,
         messages: &[Message],
         add_generation_prompt: bool,
+    ) -> Result<String, TokenizerError> {
+        self.render_with(messages, add_generation_prompt, &BTreeMap::new())
+    }
+
+    /// [`ChatTemplate::render`], with more variables for the template, as
+    /// the keyword arguments of `apply_chat_template` (`enable_thinking` of
+    /// Qwen 3); they do not replace `messages`, `add_generation_prompt` or
+    /// the special tokens.
+    ///
+    /// # Errors
+    ///
+    /// As [`ChatTemplate::render`].
+    pub fn render_with(
+        &self,
+        messages: &[Message],
+        add_generation_prompt: bool,
+        variables: &BTreeMap<String, Value>,
     ) -> Result<String, TokenizerError> {
         let mut env = Environment::new();
         env.set_trim_blocks(true);
@@ -203,11 +225,13 @@ impl ChatTemplate {
                 ]))
             })
             .collect();
-        let mut context: BTreeMap<String, JinjaValue> = self
-            .tokens
+        let mut context: BTreeMap<String, JinjaValue> = variables
             .iter()
-            .map(|(k, v)| (k.clone(), JinjaValue::from(v.as_str())))
+            .map(|(k, v)| (k.clone(), JinjaValue::from_serialize(v)))
             .collect();
+        for (k, v) in &self.tokens {
+            context.insert(k.clone(), JinjaValue::from(v.as_str()));
+        }
         context.insert("messages".into(), JinjaValue::from(messages));
         context.insert(
             "add_generation_prompt".into(),

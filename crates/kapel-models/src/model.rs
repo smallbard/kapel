@@ -520,7 +520,7 @@ impl Model {
         self.map_named(|name, w| {
             let fits = w.rank() == 2 && w.shape()[1].is_multiple_of(dtype.block_len());
             if chosen(name) && fits && w.dtype().is_float() {
-                Ok(quantized(w, dtype)?)
+                Ok(quantize_matrix(w, dtype)?)
             } else {
                 Ok(w.clone())
             }
@@ -1576,9 +1576,14 @@ fn gpt2_names(weights: BTreeMap<String, Tensor>) -> BTreeMap<String, Tensor> {
         .collect()
 }
 
-/// `value` rounded to `dtype`, as a float of that type holds it.
-/// A weight `[N, K]` quantized to `dtype`, by pieces of rows on every core.
-fn quantized(w: &Tensor, dtype: DType) -> kapel_core::Result<Tensor> {
+/// A weight `[N, K]` in host memory quantized to `dtype` by rounding to the
+/// nearest code, by pieces of rows on every core.
+///
+/// # Errors
+///
+/// If `dtype` is not a quantized type, or `K` is not a multiple of its
+/// blocks.
+pub fn quantize_matrix(w: &Tensor, dtype: DType) -> kapel_core::Result<Tensor> {
     let (n, k) = (w.shape()[0], w.shape()[1]);
     let threads = std::thread::available_parallelism().map_or(1, |t| t.get());
     // Pieces of about a million values: a few megabytes at a time.

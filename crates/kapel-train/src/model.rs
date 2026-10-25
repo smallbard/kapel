@@ -6,6 +6,10 @@
 //! inference or to be saved for the Hub. [`Decoder`] computes the forward
 //! pass of a batch of sequences on a [`Tape`], with the same operations as
 //! the inference pass, batched: the same logits.
+//!
+//! A projection with a LoRA adapter beside it ([`crate::lora`]) adds its
+//! product, and a frozen projection may be quantized (QLoRA): its product
+//! reads the codes.
 
 use std::collections::BTreeMap;
 use std::rc::Rc;
@@ -101,6 +105,11 @@ impl Parameters {
             .sum()
     }
 
+    /// The number of values, frozen ones included.
+    pub fn count_all(&self) -> usize {
+        self.map.values().map(|p| p.value.numel()).sum()
+    }
+
     /// Each value in `dtype` and on `backend`'s device: `f32` on the card
     /// for training.
     ///
@@ -108,10 +117,23 @@ impl Parameters {
     ///
     /// Those of the backend.
     pub fn to<B: Compute>(&self, backend: &B, dtype: DType) -> Result<Self> {
+        self.to_mixed(backend, dtype, dtype)
+    }
+
+    /// Each value on `backend`'s device, the float values of the trainable
+    /// parameters in `dtype` (the master weights), of the frozen ones in
+    /// `frozen`: a frozen model in the computation's type takes half the
+    /// memory of `f32`. Quantized values stay as they are.
+    ///
+    /// # Errors
+    ///
+    /// Those of the backend.
+    pub fn to_mixed<B: Compute>(&self, backend: &B, dtype: DType, frozen: DType) -> Result<Self> {
         let map = self
             .map
             .iter()
             .map(|(n, p)| {
+                let dtype = if p.trainable { dtype } else { frozen };
                 let mut value = backend.upload(&p.value)?;
                 if value.dtype().is_float() && value.dtype() != dtype {
                     value = backend.forward(&kapel_ops::Cast { dtype }, &[&value])?;
@@ -279,6 +301,8 @@ fn positions(n: usize, length: usize, segments: Option<&[u32]>) -> Vec<u32> {
 #[derive(Clone, Debug)]
 pub struct Decoder {
     config: Rc<Config>,
+    /// The scale of the LoRA adapters' products, if any.
+    lora: Option<f64>,
 }
 
 /// What the blocks share in one pass.
@@ -291,6 +315,10 @@ struct Pass {
     /// `[rows, length]` in `i32`: attention stays within documents
     /// ([`Attention`]'s documents).
     mask: Option<Tensor>,
+    /// The scale of the adapters' products.
+    lora: Option<f64>,
+    /// The type of the computation.
+    dtype: DType,
 }
 
 impl Decoder {
@@ -319,7 +347,15 @@ impl Decoder {
         }
         Ok(Self {
             config: Rc::new(config),
+            lora: None,
         })
+    }
+
+    /// The decoder that adds the products of the LoRA adapters it finds
+    /// among the parameters, scaled by `scale` ([`crate::lora`]).
+    pub fn with_lora(mut self, scale: f64) -> Self {
+        self.lora = Some(scale);
+        self
     }
 
     /// The configuration.
@@ -341,6 +377,24 @@ impl Decoder {
     ) -> Result<Var<B>> {
         let (h, head) = self.hidden(leaves, batch, options)?;
         linear_cross_entropy(&h, &head, batch.targets, options.chunk)
+    }
+
+    /// The cross-entropy of each position of `batch`, `−ln p(target)`, 0
+    /// where the target is [`crate::IGNORE`] (`f32`, `[rows · length]`):
+    /// the log-probabilities of sequences and tokens for DPO and GRPO
+    /// ([`crate::loss::linear_token_losses`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`Decoder::loss`].
+    pub fn token_losses<B: Compute>(
+        &self,
+        leaves: &Leaves<B>,
+        batch: &Batch<'_>,
+        options: &Options,
+    ) -> Result<Var<B>> {
+        let (h, head) = self.hidden(leaves, batch, options)?;
+        crate::loss::linear_token_losses(&h, &head, batch.targets, options.chunk)
     }
 
     /// The logits `[rows · length, vocab]` of `batch` (its targets unread),
@@ -402,6 +456,17 @@ impl Decoder {
         // The rows of the table, gathered from the parameter itself: its
         // gradient stays rows.
         let mut x = embed.gather_rows(&ids)?.cast(dtype)?;
+        if let Some(scale) = self.lora {
+            let (a, b) = crate::lora::embedding_factor_names(c);
+            if let (Some(a), Some(b)) = (leaves.optional(&a), leaves.optional(&b)) {
+                let delta = a
+                    .gather_rows(&ids)?
+                    .cast(dtype)?
+                    .scale(rounded(dtype, scale))?
+                    .linear(&b.cast(dtype)?, None)?;
+                x = x.add(&delta)?;
+            }
+        }
         if let Some(scale) = c.embed_scale {
             x = x.scale(rounded(dtype, scale))?;
         }
@@ -424,6 +489,8 @@ impl Decoder {
                     backend.upload(&Tensor::from_slice(&starts, &[batch.rows, length])?)
                 })
                 .transpose()?,
+            lora: self.lora,
+            dtype,
         });
         let prefix = match c.block {
             Block::Gpt2 => "transformer.h",
@@ -439,7 +506,7 @@ impl Decoder {
                 .collect();
             let weights: Vec<Var<B>> = names
                 .iter()
-                .map(|k| leaves.get(&format!("{p}{k}"))?.cast(dtype))
+                .map(|k| computed(leaves.get(&format!("{p}{k}"))?, dtype))
                 .collect::<Result<_>>()?;
             let config = Rc::clone(&self.config);
             let pass = Rc::clone(&pass);
@@ -481,6 +548,15 @@ impl Decoder {
             Block::Gpt2 => "transformer.wte.weight",
             _ => "model.embed_tokens.weight",
         }
+    }
+}
+
+/// A parameter in the computation's type; a quantized one as it is.
+fn computed<B: Compute>(v: &Var<B>, dtype: DType) -> Result<Var<B>> {
+    if v.dtype().is_float() {
+        v.cast(dtype)
+    } else {
+        Ok(v.clone())
     }
 }
 
@@ -537,11 +613,86 @@ fn block<'a, B: Compute + 'a>(
     // [B, H, T, D] → [N, H·D].
     let merged =
         |y: Var<B>| -> Result<Var<B>> { y.transpose(1, 2)?.contiguous()?.reshape(&[n, hq * d]) };
+    // The products of the adapters of `modules` with `x`, side by side as
+    // the projections' outputs are (`widths`), zeros for those without;
+    // `None` if none has one.
+    let adapters = |x: &Var<B>, modules: &[&str], widths: &[usize]| -> Result<Option<Var<B>>> {
+        let Some(scale) = pass.lora else {
+            return Ok(None);
+        };
+        let mut parts = Vec::with_capacity(modules.len());
+        for m in modules {
+            let (a, b) = crate::lora::factor_names(m);
+            parts.push(match (w(&a), w(&b)) {
+                // The scale on `x · Aᵀ`, `r` wide, not on the output.
+                (Some(a), Some(b)) => Some(
+                    x.linear(a, None)?
+                        .scale(rounded(pass.dtype, scale))?
+                        .linear(b, None)?,
+                ),
+                _ => None,
+            });
+        }
+        if parts.iter().all(Option::is_none) {
+            return Ok(None);
+        }
+        if parts.len() == 1 {
+            return Ok(parts.pop().flatten());
+        }
+        let tape = x.tape();
+        let parts: Vec<Var<B>> = parts
+            .into_iter()
+            .zip(widths)
+            .map(|(p, &width)| match p {
+                Some(p) => Ok(p),
+                None => Ok(tape.constant(tape.backend().zeros(&[n, width], pass.dtype)?)),
+            })
+            .collect::<Result<_>>()?;
+        let refs: Vec<&Var<B>> = parts.iter().collect();
+        Ok(Some(tape.concat(&refs, 1)?))
+    };
+    // `x · Wᵀ (+ bias)` for the weights of `modules` side by side (`[out,
+    // in]` each), quantized or not, plus their adapters.
+    let project = |x: &Var<B>, modules: &[&str], bias: Option<&Var<B>>| -> Result<Var<B>> {
+        let weights: Vec<&Var<B>> = modules
+            .iter()
+            .map(|m| need(&format!("{m}.weight")))
+            .collect::<Result<_>>()?;
+        let widths: Vec<usize> = weights.iter().map(|w| w.shape()[0]).collect();
+        let quantized = weights.iter().filter(|w| w.dtype().is_quantized()).count();
+        let base = if quantized == weights.len() {
+            let values: Vec<Tensor> = weights.iter().map(|w| w.value()).collect();
+            let refs: Vec<&Tensor> = values.iter().collect();
+            let y = x.quantized_matmul(&refs)?;
+            match bias {
+                Some(b) => y.add(b)?,
+                None => y,
+            }
+        } else if quantized > 0 {
+            return Err(Error::InvalidArgument {
+                op: "Decoder",
+                message: format!("block {layer}: {modules:?} are quantized in part only"),
+            });
+        } else if weights.len() == 1 {
+            x.linear(weights[0], bias)?
+        } else {
+            x.linear(&x.tape().concat(&weights, 0)?, bias)?
+        };
+        match adapters(x, modules, &widths)? {
+            Some(delta) => base.add(&delta),
+            None => Ok(base),
+        }
+    };
     match c.block {
         Block::Gpt2 => {
             let h = norm(c, x, w("ln_1.weight"), w("ln_1.bias"))?;
             // `Conv1D` stores `[in, out]`: `y = x · w + b`.
             let qkv = h.matmul_bias(need("attn.c_attn.weight")?, w("attn.c_attn.bias"))?;
+            let width = qkv.shape()[1];
+            let qkv = match adapters(&h, &["attn.c_attn"], &[width])? {
+                Some(delta) => qkv.add(&delta)?,
+                None => qkv,
+            };
             // `[N, 3C]` seen as `[B, T, 3, H, D]`: each of q, k, v a view of
             // it, whose gradients come back as slices along the third
             // dimension, joined by one copy.
@@ -552,35 +703,43 @@ fn block<'a, B: Compute + 'a>(
                     .transpose(1, 2)
             };
             let y = part(0)?.attention(&part(1)?, &part(2)?, pass.mask.as_ref(), attention)?;
-            let a = merged(y)?.matmul_bias(need("attn.c_proj.weight")?, w("attn.c_proj.bias"))?;
+            let y = merged(y)?;
+            let a = y.matmul_bias(need("attn.c_proj.weight")?, w("attn.c_proj.bias"))?;
+            let a = match adapters(&y, &["attn.c_proj"], &[c.hidden])? {
+                Some(delta) => a.add(&delta)?,
+                None => a,
+            };
             let x = x.add(&a)?;
             let h = norm(c, &x, w("ln_2.weight"), w("ln_2.bias"))?;
             let fc = h.matmul_bias(need("mlp.c_fc.weight")?, w("mlp.c_fc.bias"))?;
-            let out = fc
-                .unary(c.activation)?
-                .matmul_bias(need("mlp.c_proj.weight")?, w("mlp.c_proj.bias"))?;
+            let fc = match adapters(&h, &["mlp.c_fc"], &[c.intermediate])? {
+                Some(delta) => fc.add(&delta)?,
+                None => fc,
+            };
+            let act = fc.unary(c.activation)?;
+            let out = act.matmul_bias(need("mlp.c_proj.weight")?, w("mlp.c_proj.bias"))?;
+            let out = match adapters(&act, &["mlp.c_proj"], &[c.hidden])? {
+                Some(delta) => out.add(&delta)?,
+                None => out,
+            };
             x.add(&out)
         }
         Block::Sequential | Block::Sandwich => {
             let sandwich = c.block == Block::Sandwich;
             let h = norm(c, x, w("input_layernorm.weight"), None)?;
             // The query, key and value projections as one product.
-            let names = ["q_proj", "k_proj", "v_proj"];
-            let weights: Vec<&Var<B>> = names
-                .iter()
-                .map(|m| need(&format!("self_attn.{m}.weight")))
-                .collect::<Result<_>>()?;
+            let names = ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"];
             let tape = x.tape();
             let bias = if c.qkv_bias {
                 let biases: Vec<&Var<B>> = names
                     .iter()
-                    .map(|m| need(&format!("self_attn.{m}.bias")))
+                    .map(|m| need(&format!("{m}.bias")))
                     .collect::<Result<_>>()?;
                 Some(tape.concat(&biases, 0)?)
             } else {
                 None
             };
-            let qkv = h.linear(&tape.concat(&weights, 0)?, bias.as_ref())?;
+            let qkv = project(&h, &names, bias.as_ref())?;
             let (wq, wk) = (hq * d, hkv * d);
             let split = |start: usize, h: usize, norm_name: Option<&str>| -> Result<Var<B>> {
                 let mut p = qkv.narrow(1, start, h * d)?.reshape(&[n, h, d])?;
@@ -615,7 +774,7 @@ fn block<'a, B: Compute + 'a>(
             } else {
                 None
             };
-            let mut a = merged(y)?.linear(need("self_attn.o_proj.weight")?, bias)?;
+            let mut a = project(&merged(y)?, &["self_attn.o_proj"], bias)?;
             if sandwich {
                 a = norm(c, &a, w("post_attention_layernorm.weight"), None)?;
             }
@@ -628,12 +787,8 @@ fn block<'a, B: Compute + 'a>(
             let h = norm(c, &x, w(before), None)?;
             // The gate and up projections as one product, then the gated
             // unit: its derivative keeps one tensor instead of three.
-            let gate_up = tape.concat(
-                &[need("mlp.gate_proj.weight")?, need("mlp.up_proj.weight")?],
-                0,
-            )?;
-            let inner = h.linear(&gate_up, None)?.glu(c.activation)?;
-            let mut m = inner.linear(need("mlp.down_proj.weight")?, None)?;
+            let inner = project(&h, &["mlp.gate_proj", "mlp.up_proj"], None)?.glu(c.activation)?;
+            let mut m = project(&inner, &["mlp.down_proj"], None)?;
             if sandwich {
                 m = norm(c, &m, w("post_feedforward_layernorm.weight"), None)?;
             }
@@ -676,7 +831,7 @@ impl Rng {
 
 /// A seed of its own for each parameter, from the run's seed and the
 /// parameter's name: the initialization does not depend on their order.
-fn seed_of(seed: u64, name: &str) -> u64 {
+pub(crate) fn seed_of(seed: u64, name: &str) -> u64 {
     // FNV-1a.
     let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ seed;
     for b in name.bytes() {

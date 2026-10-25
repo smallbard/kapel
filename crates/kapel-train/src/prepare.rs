@@ -16,6 +16,13 @@
 //! token. Each document is written whole, preceded by the separator, in the
 //! shard being filled; a shard is closed before the document that would
 //! take it beyond its size.
+//!
+//! With `chat`, each row or line is an example of fine-tuning instead, a
+//! conversation or a prompt and its completion ([`crate::chat`]), made into
+//! tokens by the model's chat template; the shards then have a mask of the
+//! tokens the loss counts, those of the assistant, and no separator: the
+//! template begins each conversation. An example with nothing to learn is
+//! left out as empty.
 
 use std::collections::{BTreeMap, HashSet};
 use std::io::BufRead as _;
@@ -27,9 +34,11 @@ use std::time::Instant;
 use kapel_tokenizers::Tokenizer;
 use sha2::Digest as _;
 
+use crate::chat::{Encoder, Example};
 use crate::data::DataError;
 use crate::dataset::{
-    InputInfo, MANIFEST, Manifest, ShardInfo, Split, TokenizerInfo, sha256_hex, write_index,
+    ChatInfo, InputInfo, MANIFEST, Manifest, ShardInfo, Split, TokenizerInfo, sha256_hex,
+    write_index, write_mask,
 };
 
 type Result<T> = std::result::Result<T, DataError>;
@@ -50,8 +59,10 @@ pub struct PrepareOptions {
     pub tokenizer: PathBuf,
     /// The directory written.
     pub output: PathBuf,
-    /// The column or field of the text.
+    /// The column or field of the text; for `chat`, that of the messages.
     pub field: String,
+    /// Each row or line is an example of fine-tuning (see the module).
+    pub chat: bool,
     /// The token that starts each document, by its text; `None` for the
     /// `bos_token` of the tokenizer's configuration, else its `eos_token`,
     /// else `<|endoftext|>`.
@@ -76,6 +87,7 @@ impl Default for PrepareOptions {
             tokenizer: PathBuf::new(),
             output: PathBuf::new(),
             field: "text".into(),
+            chat: false,
             separator: None,
             val_every: 0,
             shard_tokens: 100_000_000,
@@ -99,15 +111,29 @@ pub struct Progress {
     pub seconds: f64,
 }
 
-/// A document read: its input, and its text (`None` for a null value).
-type Job = (u64, Vec<(usize, Option<String>)>);
+/// A document read: a text (`None` for a null value), or an example.
+enum Doc {
+    Text(Option<String>),
+    Json(serde_json::Value),
+}
 
-/// A document tokenized: its input, its text's hash, its tokens.
+/// Documents read, each with its input.
+type Job = (u64, Vec<(usize, Doc)>);
+
+/// A document tokenized: its input, its text's hash, its tokens, and for an
+/// example the tokens the loss counts.
 struct Done {
     input: usize,
     bytes: usize,
     hash: [u8; 16],
     tokens: Vec<u32>,
+    mask: Option<Vec<bool>>,
+}
+
+/// What makes documents into tokens, on one thread.
+enum Coder {
+    Text(Tokenizer),
+    Chat(Encoder, String),
 }
 
 /// The documents of one job per message, so many go through a channel at
@@ -136,6 +162,21 @@ pub fn prepare(options: &PrepareOptions, mut progress: impl FnMut(&Progress)) ->
     };
     let tokenizer = load()?;
     let separator = separator(&tokenizer, &tokenizer_file, options.separator.as_deref())?;
+    let tokenizer_dir = tokenizer_file
+        .parent()
+        .unwrap_or(Path::new("."))
+        .to_path_buf();
+    let chat = if options.chat {
+        let encoder = Encoder::from_dir(&tokenizer_dir)?;
+        let template = encoder
+            .template()
+            .ok_or_else(|| fail(format!("{}: no chat template", tokenizer_dir.display())))?;
+        Some(ChatInfo {
+            template_sha256: sha256_hex(template.source().as_bytes()),
+        })
+    } else {
+        None
+    };
     let vocab = tokenizer.vocab_size();
     let mut paths = Vec::new();
     for pattern in &options.inputs {
@@ -162,13 +203,26 @@ pub fn prepare(options: &PrepareOptions, mut progress: impl FnMut(&Progress)) ->
         options.threads
     };
     // One tokenizer per thread: their caches would contend for one lock.
-    let mut tokenizers = vec![tokenizer];
-    for _ in 1..threads {
-        tokenizers.push(load()?);
+    let mut coders = Vec::with_capacity(threads);
+    let mut first = Some(tokenizer);
+    for _ in 0..threads {
+        coders.push(if options.chat {
+            Coder::Chat(Encoder::from_dir(&tokenizer_dir)?, options.field.clone())
+        } else {
+            Coder::Text(match first.take() {
+                Some(t) => t,
+                None => load()?,
+            })
+        });
     }
     let wide = vocab > 1 << 16;
+    let separated = !options.chat;
     let mut train = SplitWriter::new(&options.output, "train", options.shard_tokens, wide);
     let mut val = SplitWriter::new(&options.output, "val", options.shard_tokens, wide);
+    for split in [&mut train, &mut val] {
+        split.separated = separated;
+        split.masked = options.chat;
+    }
     let mut seen: HashSet<[u8; 16]> = HashSet::new();
     let mut counts = vec![0u64; paths.len()];
     let (mut documents, mut duplicates, mut empty, mut kept, mut bytes) = (0u64, 0, 0, 0u64, 0u64);
@@ -179,15 +233,16 @@ pub fn prepare(options: &PrepareOptions, mut progress: impl FnMut(&Progress)) ->
     let job_rx = Arc::new(Mutex::new(job_rx));
     let field = options.field.as_str();
     let limit = options.limit;
+    let as_json = options.chat;
     let outcome: Result<()> = std::thread::scope(|scope| {
         let paths = &paths;
         // The channels' ends move in here: dropped on an error, they stop
         // the threads instead of letting them read the whole corpus.
         let (job_rx, done_rx) = (job_rx, done_rx);
-        scope.spawn(move || read_all(paths, field, limit, &job_tx));
-        for tokenizer in tokenizers {
+        scope.spawn(move || read_all(paths, field, as_json, limit, &job_tx));
+        for coder in coders {
             let (rx, tx) = (Arc::clone(&job_rx), done_tx.clone());
-            scope.spawn(move || tokenize(&tokenizer, &rx, &tx));
+            scope.spawn(move || tokenize(&coder, &rx, &tx));
         }
         drop((done_tx, job_rx));
         let mut pending: BTreeMap<u64, Result<Vec<Done>>> = BTreeMap::new();
@@ -214,7 +269,8 @@ pub fn prepare(options: &PrepareOptions, mut progress: impl FnMut(&Progress)) ->
                     documents += 1;
                     counts[d.input] += 1;
                     bytes += d.bytes as u64;
-                    if d.tokens.is_empty() {
+                    let nothing_learnt = d.mask.as_ref().is_some_and(|m| !m.contains(&true));
+                    if d.tokens.is_empty() || nothing_learnt {
                         empty += 1;
                         continue;
                     }
@@ -225,7 +281,7 @@ pub fn prepare(options: &PrepareOptions, mut progress: impl FnMut(&Progress)) ->
                     let to_val = options.val_every > 0 && kept.is_multiple_of(options.val_every);
                     kept += 1;
                     let split = if to_val { &mut val } else { &mut train };
-                    if let Err(e) = split.add(separator, &d.tokens) {
+                    if let Err(e) = split.add(separator, &d.tokens, d.mask.as_deref()) {
                         result = Err(e);
                     }
                 }
@@ -264,6 +320,8 @@ pub fn prepare(options: &PrepareOptions, mut progress: impl FnMut(&Progress)) ->
             vocab,
         },
         separator,
+        separated,
+        chat,
         documents,
         duplicates,
         empty,
@@ -344,35 +402,52 @@ fn kind(path: &Path) -> Result<Kind> {
     }
 }
 
-/// Reads every input in order, sending jobs of documents.
-fn read_all(paths: &[PathBuf], field: &str, limit: Option<u64>, tx: &SyncSender<Result<Job>>) {
+/// Reads every input in order, sending jobs of documents: texts, or with
+/// `as_json` the rows and lines as they are, examples.
+fn read_all(
+    paths: &[PathBuf],
+    field: &str,
+    as_json: bool,
+    limit: Option<u64>,
+    tx: &SyncSender<Result<Job>>,
+) {
     let mut seq = 0u64;
-    let mut job: Vec<(usize, Option<String>)> = Vec::with_capacity(JOB_DOCUMENTS);
+    let mut job: Vec<(usize, Doc)> = Vec::with_capacity(JOB_DOCUMENTS);
     let mut read = 0u64;
-    let mut send = |job: &mut Vec<(usize, Option<String>)>| -> bool {
+    let mut send = |job: &mut Vec<(usize, Doc)>| -> bool {
         let full = std::mem::replace(job, Vec::with_capacity(JOB_DOCUMENTS));
         let ok = tx.send(Ok((seq, full))).is_ok();
         seq += 1;
         ok
     };
     for (input, path) in paths.iter().enumerate() {
-        let mut push = |text: Option<String>| -> bool {
+        let mut push = |doc: Doc| -> bool {
             if limit.is_some_and(|l| read >= l) {
                 return false;
             }
             read += 1;
-            job.push((input, text));
+            job.push((input, doc));
             job.len() < JOB_DOCUMENTS || send(&mut job)
         };
-        let outcome = match kind(path) {
-            Ok(Kind::Parquet) => read_parquet(path, field, &mut push),
-            Ok(Kind::Jsonl) => read_jsonl(path, field, &mut push),
-            Ok(Kind::Text) => std::fs::read(path)
+        let outcome = match (kind(path), as_json) {
+            (Ok(Kind::Parquet), false) => {
+                read_parquet(path, field, &mut |t: Option<String>| push(Doc::Text(t)))
+            }
+            (Ok(Kind::Jsonl), false) => {
+                read_jsonl(path, field, &mut |t: Option<String>| push(Doc::Text(t)))
+            }
+            (Ok(Kind::Parquet), true) => read_parquet_rows(path, &mut |v| push(Doc::Json(v))),
+            (Ok(Kind::Jsonl), true) => read_jsonl_values(path, &mut |v| push(Doc::Json(v))),
+            (Ok(Kind::Text), false) => std::fs::read(path)
                 .map(|b| {
-                    push(Some(String::from_utf8_lossy(&b).into_owned()));
+                    push(Doc::Text(Some(String::from_utf8_lossy(&b).into_owned())));
                 })
                 .map_err(|e| fail(format!("{}: {e}", path.display()))),
-            Err(e) => Err(e),
+            (Ok(Kind::Text), true) => Err(fail(format!(
+                "{}: examples come from .parquet or .jsonl files",
+                path.display()
+            ))),
+            (Err(e), _) => Err(e),
         };
         if let Err(e) = outcome {
             let _ = tx.send(Err(e));
@@ -443,6 +518,69 @@ fn read_parquet(
     Ok(())
 }
 
+/// The records of the files `pattern` names (`*` in the file name), in
+/// order: the rows of `.parquet` files and the lines of `.jsonl` files as
+/// JSON values, `limit` at most. For the prompts and pairs that fine-tuning
+/// reads whole.
+///
+/// # Errors
+///
+/// If a file cannot be read, or is neither Parquet nor JSONL.
+pub fn read_records(pattern: &str, limit: Option<usize>) -> Result<Vec<serde_json::Value>> {
+    let mut out = Vec::new();
+    for path in crate::data::matching(pattern)? {
+        let mut push = |v: serde_json::Value| {
+            if limit.is_some_and(|l| out.len() >= l) {
+                return false;
+            }
+            out.push(v);
+            true
+        };
+        match kind(&path)? {
+            Kind::Parquet => read_parquet_rows(&path, &mut push)?,
+            Kind::Jsonl => read_jsonl_values(&path, &mut push)?,
+            Kind::Text => {
+                return Err(fail(format!(
+                    "{}: records come from .parquet or .jsonl files",
+                    path.display()
+                )));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Each row of a Parquet file as a JSON object; stops when `push` says so.
+fn read_parquet_rows(path: &Path, push: &mut dyn FnMut(serde_json::Value) -> bool) -> Result<()> {
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+    let at = |e: &dyn std::fmt::Display| fail(format!("{}: {e}", path.display()));
+    let file = std::fs::File::open(path).map_err(|e| at(&e))?;
+    let reader = SerializedFileReader::new(file).map_err(|e| at(&e))?;
+    for row in reader.get_row_iter(None).map_err(|e| at(&e))? {
+        if !push(row.map_err(|e| at(&e))?.to_json_value()) {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Each line of a JSONL file as a JSON value; stops when `push` says so.
+fn read_jsonl_values(path: &Path, push: &mut dyn FnMut(serde_json::Value) -> bool) -> Result<()> {
+    let file = std::fs::File::open(path).map_err(|e| fail(format!("{}: {e}", path.display())))?;
+    for (n, line) in std::io::BufReader::new(file).lines().enumerate() {
+        let line = line.map_err(|e| fail(format!("{}: {e}", path.display())))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value = serde_json::from_str(&line)
+            .map_err(|e| fail(format!("{}:{}: {e}", path.display(), n + 1)))?;
+        if !push(value) {
+            break;
+        }
+    }
+    Ok(())
+}
+
 /// The field `field` of each line of a JSONL file; stops when `push` says so.
 fn read_jsonl(
     path: &Path,
@@ -471,9 +609,43 @@ fn read_jsonl(
     Ok(())
 }
 
+/// A document made into tokens.
+fn encode(coder: &Coder, input: usize, doc: Doc) -> Result<Done> {
+    let at = |e: &dyn std::fmt::Display| fail(format!("a document of input {input}: {e}"));
+    let digest = |bytes: &[u8]| -> [u8; 16] {
+        let hash: [u8; 32] = sha2::Sha256::digest(bytes).into();
+        hash[..16].try_into().expect("16 bytes")
+    };
+    match (coder, doc) {
+        (Coder::Text(tokenizer), Doc::Text(text)) => {
+            let text = text.unwrap_or_default();
+            let tokens = tokenizer.encode_ordinary(&text).map_err(|e| at(&e))?;
+            Ok(Done {
+                input,
+                bytes: text.len(),
+                hash: digest(text.as_bytes()),
+                tokens,
+                mask: None,
+            })
+        }
+        (Coder::Chat(encoder, field), Doc::Json(value)) => {
+            let example = Example::from_json(&value, field).map_err(|e| at(&e))?;
+            let (tokens, mask) = encoder.encode(&example).map_err(|e| at(&e))?;
+            Ok(Done {
+                input,
+                bytes: example.bytes(),
+                hash: digest(value.to_string().as_bytes()),
+                tokens,
+                mask: Some(mask),
+            })
+        }
+        _ => Err(at(&"a document of the other kind")),
+    }
+}
+
 /// Tokenizes jobs until there are none.
 fn tokenize(
-    tokenizer: &Tokenizer,
+    coder: &Coder,
     jobs: &Mutex<Receiver<Result<Job>>>,
     done: &SyncSender<(u64, Result<Vec<Done>>)>,
 ) {
@@ -490,19 +662,7 @@ fn tokenize(
             Ok(Ok((seq, docs))) => {
                 let result = docs
                     .into_iter()
-                    .map(|(input, text)| {
-                        let text = text.unwrap_or_default();
-                        let hash: [u8; 32] = sha2::Sha256::digest(text.as_bytes()).into();
-                        let tokens = tokenizer
-                            .encode_ordinary(&text)
-                            .map_err(|e| fail(format!("a document of input {input}: {e}")))?;
-                        Ok(Done {
-                            input,
-                            bytes: text.len(),
-                            hash: hash[..16].try_into().expect("16 bytes"),
-                            tokens,
-                        })
-                    })
+                    .map(|(input, doc)| encode(coder, input, doc))
                     .collect();
                 (seq, result)
             }
@@ -519,7 +679,12 @@ struct SplitWriter {
     name: &'static str,
     shard_tokens: usize,
     wide: bool,
+    /// Whether the separator goes before each document.
+    separated: bool,
+    /// Whether the shards have a mask.
+    masked: bool,
     tokens: Vec<u32>,
+    mask: Vec<bool>,
     starts: Vec<u64>,
     split: Split,
 }
@@ -531,7 +696,10 @@ impl SplitWriter {
             name,
             shard_tokens,
             wide,
+            separated: true,
+            masked: false,
             tokens: Vec::new(),
+            mask: Vec::new(),
             starts: Vec::new(),
             split: Split::default(),
         }
@@ -541,8 +709,8 @@ impl SplitWriter {
         self.tokens.len() as u64
     }
 
-    fn add(&mut self, separator: u32, document: &[u32]) -> Result<()> {
-        let size = document.len() + 1;
+    fn add(&mut self, separator: u32, document: &[u32], mask: Option<&[bool]>) -> Result<()> {
+        let size = document.len() + usize::from(self.separated);
         if !self.tokens.is_empty() && self.tokens.len() + size > self.shard_tokens {
             self.flush()?;
         }
@@ -550,8 +718,19 @@ impl SplitWriter {
             return Err(fail("a document of more than 2³¹ tokens"));
         }
         self.starts.push(self.tokens.len() as u64);
-        self.tokens.push(separator);
+        if self.separated {
+            self.tokens.push(separator);
+        }
         self.tokens.extend_from_slice(document);
+        if self.masked {
+            if self.separated {
+                self.mask.push(false);
+            }
+            match mask {
+                Some(m) => self.mask.extend_from_slice(m),
+                None => self.mask.extend(std::iter::repeat_n(true, document.len())),
+            }
+        }
         Ok(())
     }
 
@@ -566,6 +745,15 @@ impl SplitWriter {
         let path = self.dir.join(&file);
         std::fs::write(&path, &bytes).map_err(|e| fail(format!("{}: {e}", path.display())))?;
         write_index(&self.dir.join(&index), &self.starts)?;
+        let mask = if self.masked {
+            let name = format!("{}_{rank:06}.mask", self.name);
+            write_mask(&self.dir.join(&name), &self.mask)?;
+            let trained = self.mask.iter().filter(|&&b| b).count() as u64;
+            *self.split.trained.get_or_insert(0) += trained;
+            Some(name)
+        } else {
+            None
+        };
         let (tokens, documents) = (self.tokens.len() as u64, self.starts.len() as u64);
         self.split.tokens += tokens;
         self.split.documents += documents;
@@ -575,8 +763,10 @@ impl SplitWriter {
             tokens,
             documents,
             sha256: sha256_hex(&bytes),
+            mask,
         });
         self.tokens.clear();
+        self.mask.clear();
         self.starts.clear();
         Ok(())
     }

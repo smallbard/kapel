@@ -18,6 +18,8 @@ for piece in pipeline.generate(&prompt, &Request::default())? {
 
 A file is read as GGUF (`Pipeline::load_gguf`). The model comes from `Model::from_gguf` (chapter 10), and everything else from the metadata. The tokenizer is written back as the `tokenizer.json` it was converted from: the tokens and merges of a byte-level BPE, the splitting pattern that `tokenizer.ggml.pre` names (Llama 3's, or Qwen's with its NFC normalization), the control and user-defined tokens as added tokens, and a beginning of sequence when the file asks for one, or by llama.cpp's default for its pre-tokenizer. `kapel-tokenizers` then reads it as any other. The end tokens are those the file names (end of sequence, of turn, of message) and the control tokens that llama.cpp recognizes as ends (`<|eot_id|>`, `<|im_end|>`, …): the same set as `generation_config.json` gives for the models measured. A GGUF file has no sampling settings, so the default is greedy.
 
+`Pipeline::with_model(dir, backend, model)` takes a model already on the backend, and the rest from the directory: a model being trained writes answers from its current weights without loading them again (GRPO, section 16.5), `model_mut` replacing them for the next answers.
+
 `prompt(text)` encodes raw text; `chat_prompt(messages)` renders a conversation through the template first. A `Request` says how to choose tokens, how many to generate at most (256 by default), which stop sequences end the answer, and the form the answer must take, if any (`constraint`, section 11.4); `ignore_eos` takes the end tokens as any other, so that answers have known lengths, to measure speed.
 
 ## 11.2 Prefill, then one token at a time

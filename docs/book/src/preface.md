@@ -25,6 +25,6 @@ Kapel is a Rust library for running and training transformer models. Its distinc
 - To quantize or evaluate models, read chapters 10 and 13.
 - To call Kapel from another language, read chapters 11 and 14.
 - To train models, read chapters 4, 10 and 15.
-- To review a change, read chapter 16 and the testing part of chapter 17.
+- To review a change, read chapter 17 and the testing part of chapter 18.
 
 **Conventions.** Shapes are written in brackets, outermost first: `[B, H, T, D]` is batch, heads, positions, head width. File references are relative to the repository root, such as `crates/kapel-ops/src/lib.rs`. Code identifiers are in `monospace`. The book describes the repository as of 23 October 2026; where code and book disagree, the code wins, and the book should be fixed.

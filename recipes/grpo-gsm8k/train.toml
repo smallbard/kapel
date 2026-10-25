@@ -1,0 +1,76 @@
+# Qwen 3 0.6B trained by GRPO on GSM8K's problems, without thinking, the
+# reward 1 for the right final number: The Kapel Book, section 16.7.
+#
+#   python tools/train/gsm8k.py recipes/grpo-gsm8k/gsm8k
+#   kapel train recipes/grpo-gsm8k/train.toml
+#
+# Each step: 16 problems, 8 answers each of at most 512 tokens, written by
+# Kapel's engine from the weights being trained; the accuracy of GSM8K's test,
+# answered greedily, every 50 steps.
+#
+# Expected: the test's accuracy from 61.2 % to about 69 % (64.9, 67.1, 68.4,
+# 69.3 at steps 50 to 200), the reward from 0.64 to 0.70 (means of 50
+# steps); 1 hour 33 minutes and 11.5 GiB on an RTX 3090.
+
+[model]
+config = "Qwen/Qwen3-0.6B"
+init = "weights"
+
+[batch]
+rows = 8
+length = 768
+
+[optimizer]
+kind = "adamw"
+lr = 2e-5
+beta1 = 0.9
+beta2 = 0.99
+weight_decay = 0.0
+
+[schedule]
+kind = "constant"
+steps = 200
+
+[training]
+device = "cuda"
+dtype = "bf16"
+clip = 1.0
+chunk = 1024
+cache_gib = 6.0
+
+[eval]
+every = 50
+tokens = 0
+
+[[eval.tasks]]
+name = "gsm8k"
+prompts = "gsm8k/test.jsonl"
+max_tokens = 512
+template = { enable_thinking = false }
+[[eval.tasks.rewards]]
+kind = "math"
+
+[checkpoint]
+dir = "run"
+every = 50
+keep = 0
+
+[log]
+every = 10
+
+[lora]
+r = 16
+alpha = 32
+
+[grpo]
+prompts = "gsm8k/prompts.jsonl"
+prompts_per_step = 16
+group = 8
+max_tokens = 512
+temperature = 1.0
+beta = 0.04
+epsilon = 0.2
+loss = "grpo"
+template = { enable_thinking = false }
+[[grpo.rewards]]
+kind = "math"

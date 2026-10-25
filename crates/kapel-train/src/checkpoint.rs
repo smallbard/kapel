@@ -9,6 +9,11 @@
 //!   training files, the tokens seen;
 //! - `config.toml`, the configuration of the run.
 //!
+//! A run with LoRA adapters saves those only, as PEFT does
+//! (`adapter_model.safetensors`, `adapter_config.json`): the directory is an
+//! adapter of the model the run starts from. The other parameters it trains,
+//! if any, go to `trainable.safetensors`.
+//!
 //! The tensors are copied to the host when the checkpoint is taken; the
 //! files are then written by a thread of their own, under a temporary name,
 //! and the directory renamed into place once complete, so a run killed
@@ -52,6 +57,9 @@ pub struct Checkpoint {
     pub model_config: serde_json::Value,
     /// The configuration of the run, as TOML.
     pub run_config: String,
+    /// For a run with LoRA adapters, their `adapter_config.json`: the
+    /// parameters are then the trained ones only.
+    pub adapter: Option<serde_json::Value>,
 }
 
 fn io(path: &Path, e: impl std::fmt::Display) -> String {
@@ -83,7 +91,20 @@ impl Checkpoint {
             kapel_hub::safetensors::save(temporary.join(file), &refs, &metadata)
                 .map_err(|e| e.to_string())
         };
-        save("model.safetensors", &self.params)?;
+        match &self.adapter {
+            Some(config) => {
+                let (factors, others): (BTreeMap<_, _>, BTreeMap<_, _>) = self
+                    .params
+                    .iter()
+                    .map(|(n, t)| (n.clone(), t.clone()))
+                    .partition(|(n, _)| crate::lora::is_factor(n));
+                crate::lora::save(&temporary, &factors, config)?;
+                if !others.is_empty() {
+                    save("trainable.safetensors", &others)?;
+                }
+            }
+            None => save("model.safetensors", &self.params)?,
+        }
         save("optimizer.safetensors", &self.optimizer)?;
         let json = serde_json::to_vec_pretty(&self.model_config).expect("JSON serializes");
         std::fs::write(temporary.join("config.json"), json).map_err(|e| io(&temporary, e))?;
@@ -129,12 +150,26 @@ impl Checkpoint {
         .map_err(|e| io(path, e))?;
         let run_config =
             std::fs::read_to_string(path.join("config.toml")).map_err(|e| io(path, e))?;
+        let (params, adapter) = if path.join("adapter_config.json").exists() {
+            let mut params = crate::lora::load(path)?.factors;
+            if path.join("trainable.safetensors").exists() {
+                params.extend(load("trainable.safetensors")?);
+            }
+            let config = serde_json::from_slice(
+                &std::fs::read(path.join("adapter_config.json")).map_err(|e| io(path, e))?,
+            )
+            .map_err(|e| io(path, e))?;
+            (params, Some(config))
+        } else {
+            (load("model.safetensors")?, None)
+        };
         Ok(Self {
             state,
-            params: load("model.safetensors")?,
+            params,
             optimizer: load("optimizer.safetensors")?,
             model_config,
             run_config,
+            adapter,
         })
     }
 }

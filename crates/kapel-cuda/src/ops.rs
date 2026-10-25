@@ -1093,6 +1093,9 @@ impl Cuda {
         if x.dtype() == dtype && dtype.element_size().is_some() {
             return self.materialize(op, x, x.layout());
         }
+        if let Some(y) = self.decoded_on_device(x, dtype)? {
+            return Ok(y);
+        }
         if on_device(x.dtype(), dtype) {
             let wide = self.widened(op, x)?;
             return match dtype {
@@ -1321,6 +1324,24 @@ impl InF32<QuantizedMatmul> for Cuda {
         let shape = [x.shape()[0], n];
         self.matmul(&x, &wt, None, &shape)?
             .reshape(&signature.shape)
+    }
+
+    /// On the device for the formats with kernels.
+    fn backward_native(
+        &self,
+        _op: &QuantizedMatmul,
+        inputs: &[&Tensor],
+        grad: &Tensor,
+    ) -> Option<Result<Vec<Option<Tensor>>>> {
+        match self.quantized_product_grad(inputs[0], &inputs[1..], grad) {
+            Ok(Some(dx)) => {
+                let mut grads = vec![Some(dx)];
+                grads.resize(inputs.len(), None);
+                Some(Ok(grads))
+            }
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        }
     }
 
     fn backward_f32(

@@ -264,6 +264,31 @@ changelog says how.
   reading its added tokens.
 - `kapel-hub`: `download::fetch_url`, a file downloaded and checked.
 - The example `loader` of `kapel-train`.
+- `kapel prepare --chat`: conversations and prompt-completion examples (TRL's
+  forms, from JSONL or Parquet) made into tokens by the model's chat template,
+  with a mask of the assistant's tokens beside each shard; the loss counts
+  them only (`kapel_train::chat`). `data.pack = "padded"`: one document a row.
+- `kapel-train`: LoRA adapters on every projection and on the embeddings, drawn
+  as PEFT draws them, merged into the model, saved and read in PEFT's format;
+  QLoRA, the frozen projections quantized; runs with adapters save only what
+  they train (`kapel_train::lora`).
+- `kapel-train`: DPO, with the likelihood term of RPO (`[dpo]`,
+  `kapel_train::preference`); GRPO and Dr. GRPO, the answers written by the
+  inference engine from the weights being trained, scored by rewards of four
+  kinds or of one's own (`[grpo]`, `kapel_train::grpo`,
+  `kapel_train::rewards`); the losses of tokens without forming the logits
+  whole (`linear_token_losses`).
+- `kapel-train`: the loss of a text of control and the accuracy of tasks whose
+  answers a program checks, measured along a run (`eval.control`,
+  `[[eval.tasks]]`); `schedule.kind = "linear"`, as `transformers`; a model of
+  the Hub as `model.config`.
+- `kapel merge`: a LoRA adapter merged into its model.
+- `kapel-infer`: `Pipeline::with_model`, a pipeline of a model already in
+  memory; `kapel-tokenizers`: `ChatTemplate::render_with`, more variables for
+  the template (`enable_thinking`).
+- `kapel-ops`: `Cast` decodes quantized types to float ones.
+- `tools/train`: `peft_parity.py`, `trl_sft.py` and `gsm8k.py`; the examples
+  `lora` and `tasks` of `kapel-train`.
 
 ### Changed
 
@@ -329,6 +354,8 @@ changelog says how.
 
 ### Fixed
 
+- `kapel-cuda`: the backward pass of a product by quantized weights runs on
+  the card, the weights dequantized there; it went through the host.
 - `kapel-tokenizers`: a `tokenizer.json` whose model has no type but merges is
   read as a BPE, as `tokenizers` does; GPT-2's file on the Hub is so.
 - `kapel-hub`: `HF_TOKEN` is sent to the Hub only.
