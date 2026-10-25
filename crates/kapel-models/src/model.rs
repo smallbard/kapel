@@ -454,8 +454,16 @@ impl Model {
                 .iter()
                 .map(|m| format!("{p}.mlp.{m}.weight"))
                 .collect();
-            if stackable(w, &mlp) {
+            let mlp_biases: Vec<String> = ["gate_proj", "up_proj"]
+                .iter()
+                .map(|m| format!("{p}.mlp.{m}.bias"))
+                .collect();
+            let mlp_bias = self.config.mlp_bias;
+            if stackable(w, &mlp) && (!mlp_bias || stackable(w, &mlp_biases)) {
                 stack(w, &mlp, format!("{p}.mlp.gate_up_proj.weight"))?;
+                if mlp_bias {
+                    stack(w, &mlp_biases, format!("{p}.mlp.gate_up_proj.bias"))?;
+                }
             }
         }
         Ok(self)
@@ -1378,18 +1386,32 @@ impl Model {
         };
         let h = self.norm(ops, &x, &format!("{p}.{before}"))?;
         ops.see(Site::Mlp, &h)?;
+        let bias = |name: &str| {
+            if c.mlp_bias {
+                self.optional(&format!("{p}.mlp.{name}.bias"))
+            } else {
+                None
+            }
+        };
         let inner = match self.optional(&format!("{p}.mlp.gate_up_proj.weight")) {
             // Stacked by `Model::fused`: one product, one gated unit.
             Some(w) => backend.forward(
                 &Glu {
                     activation: c.activation,
                 },
-                &[&ops.linear(&h, w, None)?],
+                &[&ops.linear(&h, w, bias("gate_up_proj"))?],
             )?,
             None => {
-                let gate =
-                    ops.linear(&h, self.weight(&format!("{p}.mlp.gate_proj.weight"))?, None)?;
-                let up = ops.linear(&h, self.weight(&format!("{p}.mlp.up_proj.weight"))?, None)?;
+                let gate = ops.linear(
+                    &h,
+                    self.weight(&format!("{p}.mlp.gate_proj.weight"))?,
+                    bias("gate_proj"),
+                )?;
+                let up = ops.linear(
+                    &h,
+                    self.weight(&format!("{p}.mlp.up_proj.weight"))?,
+                    bias("up_proj"),
+                )?;
                 ops.binary(BinaryKind::Mul, &ops.unary(c.activation, &gate)?, &up)?
             }
         };
@@ -1397,7 +1419,7 @@ impl Model {
         let mut m = ops.linear(
             &inner,
             self.weight(&format!("{p}.mlp.down_proj.weight"))?,
-            None,
+            bias("down_proj"),
         )?;
         if c.block == Block::Sandwich {
             m = self.norm(ops, &m, &format!("{p}.post_feedforward_layernorm"))?;

@@ -42,3 +42,18 @@ cargo run --release -p kapel-train --features cuda --example tasks -- \
 `$QWEN` is a directory of Qwen 3 0.6B, a snapshot of the Hugging Face cache.
 The example `tasks` answers the test's prompts greedily, with the adapter
 merged, and prints the accuracy: it measures Kapel's adapters and TRL's alike.
+
+# Experiments
+
+Step T5 of the training plan (*The Kapel Book*, chapter 17).
+
+- `smallem_tokens.py SMALLEM_DATA OUT`: Smallem's tokens (its `data/bpe`)
+  given llm.c's header, for `recipes/scaling-smallem`.
+- `wandb_log.py RUN_DIR`: a run's `log.jsonl` in Weights & Biases, offline
+  unless `--online`. It needs `wandb`.
+
+```sh
+python tools/train/smallem_tokens.py ~/Smallem/data/bpe data/smallem
+kapel sweep recipes/scaling-smallem/sweep.toml
+kapel fit recipes/scaling-smallem/runs/results.tsv
+```

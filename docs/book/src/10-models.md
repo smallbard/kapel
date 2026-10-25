@@ -8,7 +8,7 @@
 
 | `model_type` | Block layout | Normalization | Notable features |
 | --- | --- | --- | --- |
-| `llama`, `mistral` | sequential | RMSNorm | Mistral slides a window on every layer |
+| `llama`, `mistral` | sequential | RMSNorm | Mistral slides a window on every layer; biases on q, k, v and the output with `attention_bias`, on the MLP with `mlp_bias` |
 | `qwen2` | sequential | RMSNorm | biases on q, k, v |
 | `qwen3` | sequential | RMSNorm | an RMSNorm per head on q and k |
 | `mimo` | sequential | RMSNorm | Qwen 2 with a multi-token prediction layer |

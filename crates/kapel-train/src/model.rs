@@ -787,8 +787,18 @@ fn block<'a, B: Compute + 'a>(
             let h = norm(c, &x, w(before), None)?;
             // The gate and up projections as one product, then the gated
             // unit: its derivative keeps one tensor instead of three.
-            let inner = project(&h, &["mlp.gate_proj", "mlp.up_proj"], None)?.glu(c.activation)?;
-            let mut m = project(&inner, &["mlp.down_proj"], None)?;
+            let (gate_up, down) = if c.mlp_bias {
+                let biases = [need("mlp.gate_proj.bias")?, need("mlp.up_proj.bias")?];
+                (
+                    Some(tape.concat(&biases, 0)?),
+                    Some(need("mlp.down_proj.bias")?),
+                )
+            } else {
+                (None, None)
+            };
+            let inner = project(&h, &["mlp.gate_proj", "mlp.up_proj"], gate_up.as_ref())?
+                .glu(c.activation)?;
+            let mut m = project(&inner, &["mlp.down_proj"], down)?;
             if sandwich {
                 m = norm(c, &m, w("post_feedforward_layernorm.weight"), None)?;
             }
@@ -849,6 +859,15 @@ enum Init {
     Ones,
 }
 
+/// Whether `name` is a table of tokens or positions (embeddings, output):
+/// what "non-embedding" parameters leave out (Kaplan et al.), and what Muon
+/// leaves to AdamW.
+pub fn is_table(name: &str) -> bool {
+    ["wte", "wpe", "embed_tokens", "lm_head"]
+        .iter()
+        .any(|t| name.contains(t))
+}
+
 /// The parameters of a new model of configuration `config`, in `f32`:
 /// GPT-2's initialization (nanoGPT's) for every architecture: normal of
 /// standard deviation `std` (0.02 in GPT-2) for the matrices and tables,
@@ -860,6 +879,39 @@ enum Init {
 ///
 /// [`Error::InvalidArgument`] for an architecture [`Decoder::new`] refuses.
 pub fn init(config: &Config, std: f64, seed: u64) -> Result<Parameters> {
+    let mut params = Parameters::default();
+    for (name, shape, init) in layout(config, std)? {
+        let n: usize = shape.iter().product();
+        let data: Vec<f32> = match init {
+            Init::Zeros => vec![0.0; n],
+            Init::Ones => vec![1.0; n],
+            Init::Normal(s) => {
+                let mut rng = Rng::new(seed_of(seed, &name));
+                (0..n).map(|_| (rng.normal() * s) as f32).collect()
+            }
+        };
+        let value = Tensor::from_slice(&data, &shape)?;
+        params.insert(name, Parameter::new(value));
+    }
+    Ok(params)
+}
+
+/// The names and shapes of the parameters [`init`] gives a model of
+/// configuration `config`, without drawing them: the size of a model before
+/// it is made.
+///
+/// # Errors
+///
+/// As [`init`].
+pub fn shapes(config: &Config) -> Result<Vec<(String, Vec<usize>)>> {
+    Ok(layout(config, 1.0)?
+        .into_iter()
+        .map(|(name, shape, _)| (name, shape))
+        .collect())
+}
+
+/// The parameters of a new model, their shapes and how each starts.
+fn layout(config: &Config, std: f64) -> Result<Vec<(String, Vec<usize>, Init)>> {
     Decoder::new(config.clone())?;
     let c = config;
     let (h, v, i) = (c.hidden, c.vocab, c.intermediate);
@@ -943,6 +995,11 @@ pub fn init(config: &Config, std: f64, seed: u64) -> Result<Parameters> {
                     vec![h, i],
                     Init::Normal(residual),
                 );
+                if c.mlp_bias {
+                    add(p("mlp.gate_proj.bias"), vec![i], Init::Zeros);
+                    add(p("mlp.up_proj.bias"), vec![i], Init::Zeros);
+                    add(p("mlp.down_proj.bias"), vec![h], Init::Zeros);
+                }
             }
             add("model.norm.weight".into(), vec![h], one);
             if !c.tie_embeddings {
@@ -950,19 +1007,5 @@ pub fn init(config: &Config, std: f64, seed: u64) -> Result<Parameters> {
             }
         }
     }
-    let mut params = Parameters::default();
-    for (name, shape, init) in shapes {
-        let n: usize = shape.iter().product();
-        let data: Vec<f32> = match init {
-            Init::Zeros => vec![0.0; n],
-            Init::Ones => vec![1.0; n],
-            Init::Normal(s) => {
-                let mut rng = Rng::new(seed_of(seed, &name));
-                (0..n).map(|_| (rng.normal() * s) as f32).collect()
-            }
-        };
-        let value = Tensor::from_slice(&data, &shape)?;
-        params.insert(name, Parameter::new(value));
-    }
-    Ok(params)
+    Ok(shapes)
 }

@@ -11,11 +11,14 @@
 //! - [`preference`]: pairs of answers, and the loss of DPO;
 //! - [`grpo`]: answers written by the model, scored by [`rewards`], and the
 //!   loss of GRPO;
-//! - [`profile`]: the time of each operation;
+//! - [`profile`]: the time and the operations of each kind of call;
 //! - [`trainer`]: the training loop, driven by a [`config`] file: batches of
 //!   [`data`] in order, accumulation, clipping, a [`schedule`] of learning
-//!   rates, evaluation, [`checkpoint`]s that resume exactly, and the
-//!   model's FLOP utilization ([`flops`]).
+//!   rates, evaluation, [`checkpoint`]s that resume exactly, the model's
+//!   FLOP utilization and budgets of operations ([`flops`]), a log in JSONL
+//!   and for [`tensorboard`];
+//! - [`sweep`]: grids of runs, queued on one card, resumed, tabulated; and
+//!   [`scaling`]: the laws fitted to them.
 
 pub mod chat;
 pub mod checkpoint;
@@ -32,8 +35,11 @@ pub mod preference;
 pub mod prepare;
 pub mod profile;
 pub mod rewards;
+pub mod scaling;
 pub mod schedule;
+pub mod sweep;
 pub mod tape;
+pub mod tensorboard;
 pub mod trainer;
 
 pub use loss::{IGNORE, cross_entropy, linear_cross_entropy};

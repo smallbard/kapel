@@ -5,6 +5,7 @@ mod eval;
 mod merge;
 mod prepare;
 mod quantize;
+mod sweep;
 mod train;
 
 use std::io::{BufRead, Write};
@@ -27,6 +28,8 @@ usage: kapel run MODEL [options]
        kapel prepare INPUT... --tokenizer PATH --output DIR   (kapel prepare --help)
        kapel train CONFIG.toml [options]              (kapel train --help)
        kapel merge MODEL ADAPTER --output DIR         (kapel merge --help)
+       kapel sweep SWEEP.toml [options]               (kapel sweep --help)
+       kapel fit RESULTS.tsv... [options]             (kapel fit --help)
 
 Generates text with MODEL: a model directory, a GGUF file, or a repository of the
 Hugging Face Hub (owner/name, downloaded once into ~/.cache/kapel/hub, or
@@ -116,6 +119,16 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("merge") => exit(merge::execute(&args[1..])),
+        Some("sweep") if args.get(1).is_some_and(|a| a == "--help" || a == "-h") => {
+            print!("{}", sweep::USAGE);
+            ExitCode::SUCCESS
+        }
+        Some("sweep") => exit(sweep::execute(&args[1..])),
+        Some("fit") if args.get(1).is_some_and(|a| a == "--help" || a == "-h") => {
+            print!("{}", sweep::FIT_USAGE);
+            ExitCode::SUCCESS
+        }
+        Some("fit") => exit(sweep::fit(&args[1..])),
         Some("--version" | "-V") => {
             println!("kapel {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS

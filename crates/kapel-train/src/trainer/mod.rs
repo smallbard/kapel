@@ -16,7 +16,7 @@
 //!
 //! What a step learns from is the run's objective: tokens (pre-training,
 //! supervised fine-tuning), pairs of answers (DPO), or answers the model
-//! writes and their rewards (GRPO), in [`post`]. Every `eval.every` steps,
+//! writes and their rewards (GRPO), in `trainer/post.rs`. Every `eval.every` steps,
 //! the losses of validation and of the text of control, and the accuracy of
 //! the tasks, are measured.
 
@@ -24,7 +24,7 @@ mod post;
 
 use std::collections::BTreeMap;
 use std::io::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Instant;
 
 use kapel_core::{DType, Tensor};
@@ -108,15 +108,65 @@ pub struct Summary {
 }
 
 /// The `config.json` of the model: the file named, or the one of the
-/// directory named.
-fn model_json(path: &Path) -> Result<Value> {
+/// directory named, with the fields of `model.set` replaced.
+///
+/// # Errors
+///
+/// If the file cannot be read or is not JSON.
+pub fn model_json(config: &TrainConfig) -> Result<Value> {
+    let path = &config.model.config;
     let file = if path.is_dir() {
         path.join("config.json")
     } else {
         path.to_path_buf()
     };
     let text = std::fs::read(&file).map_err(|e| TrainError(format!("{}: {e}", file.display())))?;
-    serde_json::from_slice(&text).map_err(|e| TrainError(format!("{}: {e}", file.display())))
+    let mut json: Value = serde_json::from_slice(&text)
+        .map_err(|e| TrainError(format!("{}: {e}", file.display())))?;
+    if let Some(fields) = json.as_object_mut() {
+        for (k, v) in &config.model.set {
+            let v =
+                serde_json::to_value(v).map_err(|e| TrainError(format!("model.set.{k}: {e}")))?;
+            fields.insert(k.clone(), v);
+        }
+    }
+    Ok(json)
+}
+
+/// The operations of a step of the run's tokens: frozen weights with LoRA
+/// ([`flops::frozen_step_flops`]), [`flops::step_flops`] otherwise.
+pub fn step_flops(config: &TrainConfig, model: &Config) -> u64 {
+    let b = &config.batch;
+    let tokens = b.pass() * b.accumulate();
+    if config.lora.is_some() {
+        flops::frozen_step_flops(model, tokens, b.length)
+    } else {
+        flops::step_flops(model, tokens, b.length)
+    }
+}
+
+/// The configuration with the steps of its budget, when it has one: the
+/// budget over the operations of a step, rounded, at least one.
+///
+/// # Errors
+///
+/// If the model's configuration cannot be read, or the warmup is longer
+/// than the steps paid for.
+pub fn with_budget(config: &TrainConfig) -> Result<TrainConfig> {
+    let mut c = config.clone();
+    if let Some(budget) = c.training.budget {
+        let model = Config::from_json(&model_json(&c)?)?;
+        let per_step = step_flops(&c, &model) as f64;
+        c.schedule.steps = ((budget / per_step).round() as usize).max(1);
+        if c.schedule.warmup > c.schedule.steps {
+            return Err(TrainError(format!(
+                "training.budget {budget:e} pays for {} steps of {per_step:.3e} operations, \
+                 fewer than the {} of warmup",
+                c.schedule.steps, c.schedule.warmup
+            )));
+        }
+    }
+    Ok(c)
 }
 
 /// The parameters the configuration starts from: its adapters added, its
@@ -172,22 +222,16 @@ fn start(config: &TrainConfig, model_config: &Config) -> Result<(Parameters, Vec
 /// For a configuration, a file or a device that fails.
 #[allow(clippy::needless_return)]
 pub fn run(config: &TrainConfig, options: &RunOptions) -> Result<Summary> {
+    let mut resolved = config.clone();
     // A model of the Hub, downloaded once.
-    let resolved;
-    let config = if !config.model.config.exists()
-        && crate::config::is_hub_name(&config.model.config)
-    {
+    if !config.model.config.exists() && crate::config::is_hub_name(&config.model.config) {
         let name = config.model.config.to_string_lossy().into_owned();
-        let dir =
+        resolved.model.config =
             kapel_hub::download::snapshot(&name, "main", &kapel_hub::download::default_cache())?;
-        let mut c = config.clone();
-        c.model.config = dir;
-        c.model.hub = Some(name);
-        resolved = c;
-        &resolved
-    } else {
-        config
-    };
+        resolved.model.hub = Some(name);
+    }
+    let resolved = with_budget(&resolved)?;
+    let config = &resolved;
     let device = config.training.device.as_str();
     if device == "cpu" {
         if options.profile {
@@ -329,6 +373,11 @@ struct Run<'a, B: Compute> {
     after_first: Option<Box<dyn Fn()>>,
     /// The peak memory of the card since the run started, if it counts it.
     peak_memory: Option<Box<dyn Fn() -> usize>>,
+    /// The time of the steps done by this process, and their tokens.
+    seconds: f64,
+    tokens_here: u64,
+    /// The log for TensorBoard, if asked.
+    events: Option<crate::tensorboard::EventWriter>,
 }
 
 impl<'a, B: Compute> Run<'a, B> {
@@ -339,7 +388,7 @@ impl<'a, B: Compute> Run<'a, B> {
         synchronize: Box<dyn Fn()>,
         device_name: Option<String>,
     ) -> Result<Self> {
-        let model_json = model_json(&config.model.config)?;
+        let model_json = model_json(config)?;
         let model_config = Config::from_json(&model_json)?;
         let mut decoder = Decoder::new(model_config.clone())?;
         if let Some(l) = &config.lora {
@@ -506,12 +555,7 @@ impl<'a, B: Compute> Run<'a, B> {
                 .as_deref()
                 .and_then(|n| flops::peak_tflops(n, dtype))
         });
-        let step_tokens = b.pass() * b.accumulate();
-        let step_flops = if config.lora.is_some() {
-            flops::frozen_step_flops(&model_config, step_tokens, b.length)
-        } else {
-            flops::step_flops(&model_config, step_tokens, b.length)
-        };
+        let step_flops = step_flops(config, &model_config);
         Ok(Self {
             config,
             options,
@@ -538,6 +582,15 @@ impl<'a, B: Compute> Run<'a, B> {
             step_flops,
             after_first: None,
             peak_memory: None,
+            seconds: 0.0,
+            tokens_here: 0,
+            events: if config.log.tensorboard {
+                Some(crate::tensorboard::EventWriter::create(
+                    &config.checkpoint.dir.join("tensorboard"),
+                )?)
+            } else {
+                None
+            },
         })
     }
 
@@ -747,8 +800,41 @@ impl<'a, B: Compute> Run<'a, B> {
         })
     }
 
+    /// `summary.json` in the run's directory, once the last step is done:
+    /// what a grid of runs ([`crate::sweep`]) reads of each.
+    fn write_summary(&self, loss: f64, val_loss: Option<f64>) -> Result<()> {
+        let embedding: usize = self
+            .params
+            .iter()
+            .filter(|(n, _)| crate::model::is_table(n))
+            .map(|(_, p)| p.value.numel())
+            .sum();
+        let all = self.params.count_all();
+        let tokens_objective = matches!(self.objective, Objective::Tokens(_));
+        let summary = json!({
+            "steps": self.step,
+            "tokens": self.tokens,
+            "flops": tokens_objective.then_some(self.step_flops as f64 * self.step as f64),
+            "step_flops": tokens_objective.then_some(self.step_flops),
+            "parameters": all,
+            "non_embedding_parameters": all - embedding,
+            "trainable_parameters": self.params.count(),
+            "loss": loss,
+            "val_loss": val_loss,
+            "seconds": self.seconds,
+            "tokens_per_s": self.tokens_here as f64 / self.seconds.max(1e-9),
+            "peak_gib": self.peak_memory.as_ref().map(|p| p() as f64 / (1u64 << 30) as f64),
+        });
+        let text = serde_json::to_string_pretty(&summary).map_err(|e| TrainError(e.to_string()))?;
+        std::fs::write(self.dir.join("summary.json"), text + "\n")?;
+        Ok(())
+    }
+
     fn record(&mut self, line: Value) -> Result<()> {
         writeln!(self.log, "{line}")?;
+        if let Some(events) = &mut self.events {
+            events.line(&line)?;
+        }
         Ok(())
     }
 
@@ -800,6 +886,8 @@ impl<'a, B: Compute> Run<'a, B> {
             };
             self.step += 1;
             self.tokens += out.tokens;
+            self.seconds += seconds;
+            self.tokens_here += out.tokens;
             let mfu = self.peak.map(|p| out.flops as f64 / seconds / (p * 1e12));
             let mut line = json!({
                 "step": self.step,
@@ -871,6 +959,10 @@ impl<'a, B: Compute> Run<'a, B> {
             }
         }
         self.writer.finish()?;
+        // A run resumed at its end did nothing: its summary stays.
+        if self.step == steps && self.tokens_here > 0 {
+            self.write_summary(loss, val_loss)?;
+        }
         let params = self
             .params
             .iter()

@@ -96,7 +96,7 @@ What was left of the gap to PyTorch is the subject of section 15.12.
 
 ## 15.7 Seeing where the time goes
 
-`kapel_train::profile::Profiled<B>` wraps a backend and times each call by operation and direction (`"matmul"`, `"attention backward"`), waiting for the device before and after each. `report()` lists them, the longest first. The example `gradients` prints it with `--profile`; it is how the reductions above, and a scatter of the first loss that took three quarters of a step, were found.
+`kapel_train::profile::Profiled<B>` wraps a backend and times each call by operation and direction (`"matmul"`, `"attention backward"`), waiting for the device before and after each. It also counts the operations of the products and the attentions from the shapes of their inputs (section 17.1). `report()` lists them, the longest first, with the rate of each kind of call in Top/s. The example `gradients` prints it with `--profile`; it is how the reductions above, and a scatter of the first loss that took three quarters of a step, were found.
 
 The card's backend counts the bytes held by its live tensors: `Cuda::memory_in_use`, and `Cuda::peak_memory` since the last `reset_peak_memory`, the equivalents of `torch.cuda.memory_allocated` and `max_memory_allocated`. Buffers kept for reuse are not counted.
 
@@ -135,7 +135,7 @@ final = 0.0
 6. **Evaluation.** Every `eval.every` steps and at the end, the mean loss of the first `eval.tokens` validation tokens, computed with the parameters as constants: nothing is recorded for a backward pass.
 7. **Checkpoints**, every `checkpoint.every` steps and at the end (section 15.11).
 
-**The model's FLOP utilization.** `flops.rs` counts the operations a step's definition asks for: the products of the blocks and of the output table, and the attention's whole score matrix, as llm.c and Smallem count it, three forward passes for a step, two operations per multiply-add. Over the step's time and the card's peak in the computation's type (`flops::peak_tflops`, from the card's name, or `log.peak_tflops`), that is the MFU of the log. The test `gpt2_small_costs_what_nanogpt_counts` checks the count against nanoGPT's estimate.
+**The model's FLOP utilization.** `flops.rs` counts the operations a step's definition asks for: the products of the blocks and of the output table, and the attention's whole score matrix, as llm.c and Smallem count it, three forward passes for a step, two operations per multiply-add. Over the step's time and the card's peak in the computation's type (`flops::peak_tflops`, from the card's name, or `log.peak_tflops`), that is the MFU of the log. The test `gpt2_small_costs_what_nanogpt_counts` checks the count against nanoGPT's estimate, and `a_step_asks_for_the_operations_predicted` against the operations a step's calls really ask for (section 17.1). `training.budget` sets the steps from a budget of operations (chapter 17).
 
 `--profile` times each operation (section 15.7) from the second step on, the first compiling the kernels.
 
@@ -144,7 +144,7 @@ final = 0.0
 `Optimizer` (`optim.rs`) is one of three, with their states for the checkpoints:
 
 - **AdamW**, dense and by rows (section 15.4). Its step is one fused operation in place, `Update::adamw` (`kapel-ops/src/update.rs`): the gradient read in its type, the parameter and both moments updated in `f32` by one kernel, where the step had been fifteen operations and as many temporary tensors per parameter. `AdamWStep::apply` is the arithmetic every backend does, element by element; the conformity suite compares each with the reference, and checks that a shared parameter and a gradient of another shape are refused.
-- **Muon**, the variant Smallem measured (DeepSeek-V4's): for each matrix of the blocks, a momentum with Nesterov's look ahead, made orthogonal by ten iterations of Newton-Schulz, then scaled by `0.18 · √max(m, n)` so that its elements have the size of an AdamW step and one learning rate serves both. The matrices of one shape are orthogonalized together, as one batched product. The tables (embeddings, positions, output) and the vectors stay with AdamW.
+- **Muon**, the variant Smallem measured (DeepSeek-V4's): for each matrix of the blocks, a momentum with Nesterov's look ahead, made orthogonal by ten iterations of Newton-Schulz (four with `optimizer.newton_schulz = "short"`, SAMuon's coefficients, Smallem's `muon:short`), then scaled by `0.18 · √max(m, n)` so that its elements have the size of an AdamW step and one learning rate serves both. The matrices of one shape are orthogonalized together, as one batched product. The tables (embeddings, positions, output) and the vectors stay with AdamW.
 - **Adafactor** (Shazeer and Stern), without first moment: the second moment of a matrix kept as its means by row and by column, `β₂ = 1 − t^−0.8`, the update divided by `max(1, rms)`.
 
 A group of parameters (`optimizer.groups`) sets, for the names its pattern matches, a factor of the learning rate, whether weight decay applies, whether the parameter trains, and whether its gradient stays rows.

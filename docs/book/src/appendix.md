@@ -11,7 +11,9 @@
 | Backend | A type implementing `Run` for every operation of the catalogue: `Reference`, `Cpu` or `Cuda` |
 | Batch | Several sequences computed in the same pass, one row per new token of each, so the weights are read once for all of them (`Model::step_batch`, `kapel_infer::Batch`) |
 | Block (quantized) | The unit a quantized type stores: a scale, sometimes a minimum, and packed codes for 32 or 256 elements |
+| Bootstrap | Fitting a law again to draws of its points with replacement, for an interval of each constant (`scaling::bootstrap`) |
 | Broadcast | Repeating a tensor along dimensions of size 1 or new leading dimensions, by giving them stride 0 |
+| Budget (of a run) | The operations a run may spend, `training.budget`: its steps are the budget over the operations of a step (chapter 17) |
 | Cache (KV) | The keys and values of the positions already computed, per layer, so each new token only computes itself; in Kapel, kept by pages (`KvCache`) |
 | Cache by pages | A cache whose lines are handed out by pages of 16 positions from a common reserve, each sequence keeping the list of its pages: nothing is copied as a sequence grows, and its pages go back when it ends |
 | Calibration | Texts run through a model to measure the inputs of its projections before quantizing it with data |
@@ -29,9 +31,11 @@
 | GGUF | llama.cpp's file format: a model's configuration, tokenizer and weights, quantized or not, in one file |
 | GPTQ | Quantization column by column, the error of each column carried onto those not yet rounded through the inverse Hessian (`kapel-quant`, chapter 13) |
 | GQA | Grouped-query attention: several query heads share one key and value head |
+| Grid (sweep) | Runs of one base configuration, each with its changes, run by `kapel sweep` and noted in `results.tsv` (chapter 17) |
 | Hessian (of a projection) | `H = Σ x xᵀ` over the inputs `x` of a projection: a change `δ` of a row of weights changes the outputs by `δ H δᵀ` |
 | `infer` | The validation and shape computation shared by every backend for an operation |
 | `Isa` | A proof that the processor has the instructions a code path uses |
+| IsoFLOP curve | The losses of models of several sizes trained for one budget of operations: its lowest point is the best size for that budget (`scaling::isoflops`) |
 | llguidance | The library of structured outputs that compiles constraints into a parser over the bytes of the tokens, and gives the set of tokens allowed next |
 | Leaf | A value on a tape whose gradient is wanted: a parameter (`Tape::leaf`); a constant receives none |
 | Log-likelihood | The sum of the logarithms of the probabilities of a continuation's tokens after a context; what `kapel eval` ranks answers by (`Scorer`) |
@@ -113,6 +117,8 @@
 | Conversations and their masks | `crates/kapel-train/src/chat.rs`, `crates/kapel-train/tests/prepare.rs` |
 | LoRA and QLoRA, PEFT's files, merging | `crates/kapel-train/src/lora.rs`, `crates/kapel-cli/src/merge.rs`, `crates/kapel-train/tests/lora.rs`, `crates/kapel-train/examples/lora.rs`, `tools/train/peft_parity.py` |
 | DPO, GRPO, rewards, tasks | `crates/kapel-train/src/{preference,grpo,rewards}.rs`, `crates/kapel-train/src/trainer/post.rs`, `crates/kapel-train/tests/post.rs`, `crates/kapel-train/examples/tasks.rs` |
+| Budgets of operations, grids of runs, laws of scale | `crates/kapel-train/src/{flops,sweep,scaling}.rs`, `crates/kapel-cli/src/sweep.rs`, `crates/kapel-train/tests/flops.rs`, `recipes/scaling-smallem/`, `tools/train/smallem_tokens.py` |
+| Logs for TensorBoard and Weights & Biases | `crates/kapel-train/src/tensorboard.rs`, `tools/train/wandb_log.py` |
 | Post-training measured against TRL | `tools/train/{trl_sft,gsm8k}.py`, `recipes/{sft-lora-gsm8k,grpo-gsm8k}/` |
 | One model type for the bindings | `crates/kapel-runtime/src/lib.rs` |
 | The C API | `crates/kapel-capi/include/kapel.h`, `crates/kapel-capi/src/lib.rs`, `crates/kapel-capi/examples/c/` |

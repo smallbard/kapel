@@ -1,0 +1,57 @@
+# The base of Smallem's grids of scale (PLAN-LOIS-D-ECHELLE, steps L1 and L2):
+# its `modern` architecture (RMSNorm, SwiGLU of 8C/3, RoPE, biases everywhere,
+# the embedding table as output), Muon with four iterations of Newton-Schulz
+# (`muon:short`), 16 rows of 512 tokens a step, a cosine down to a tenth after
+# 200 steps of warmup, Smallem's tokens (BPE of 8,192 on FineWeb-Edu,
+# `tools/train/smallem_tokens.py` writes them into data/smallem). The sizes,
+# learning rates and budgets are in sweep.toml.
+
+[model]
+config = "config.json"
+init = "scratch"
+std = 0.02
+seed = 42
+
+[data]
+train = "../../data/smallem/smallem_train_*.bin"
+val = "../../data/smallem/smallem_val_*.bin"
+seed = 42
+shuffle = true
+
+[batch]
+rows = 16
+length = 512
+
+[optimizer]
+kind = "muon"
+newton_schulz = "short"
+lr = 2.17e-3
+weight_decay = 0.1
+
+# Smallem's embedding table does not decay (and stays with AdamW).
+[[optimizer.groups]]
+matches = "model.embed_tokens.weight"
+decay = false
+
+[schedule]
+kind = "cosine"
+warmup = 200
+final = 0.1
+
+[training]
+device = "cuda"
+dtype = "bf16"
+clip = 1.0
+budget = 1e16
+
+[eval]
+every = 1000
+# Smallem's final loss: 200 batches of 16 × 512.
+tokens = 1638400
+
+[checkpoint]
+every = 1000
+keep = 1
+
+[log]
+every = 500

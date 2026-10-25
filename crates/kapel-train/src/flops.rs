@@ -6,7 +6,8 @@
 //! · [K, N]` costs `M · K · N` multiply-adds, two operations each. Norms,
 //! activations and softmax cost a few operations per element and are not
 //! counted. The attention counts its whole score matrix, as Smallem and
-//! llm.c count it, though a causal kernel computes half of it. The backward
+//! llm.c count it, though a causal kernel computes half of it; a layer with
+//! a sliding window, the keys of its window. The backward
 //! pass computes two products for each product of the forward pass: a step
 //! costs three forward passes. With the weights frozen (LoRA), the products
 //! by a weight compute the gradient of their input only: two forward passes
@@ -38,13 +39,18 @@ fn parts(config: &Config, rows: usize, length: usize) -> (u64, u64) {
         Block::Gpt2 | Block::Parallel => 2 * tokens * h * i,
         Block::Sequential | Block::Sandwich => 3 * tokens * h * i,
     };
-    // Scores `q · kᵀ` and the mix of the values: `T² · H · D` each.
-    let attention = 2 * rows as u64 * t * t * q;
+    // Scores `q · kᵀ` and the mix of the values: `T² · H · D` each, or
+    // `T · W · H · D` for a layer whose window `W` is shorter.
+    let attention: u64 = c
+        .windows
+        .iter()
+        .map(|w| {
+            let keys = w.map_or(t, |w| (w as u64).min(t));
+            2 * rows as u64 * t * keys * q
+        })
+        .sum();
     let layers = c.layers as u64;
-    (
-        layers * (projections + mlp) + tokens * h * v,
-        layers * attention,
-    )
+    (layers * (projections + mlp) + tokens * h * v, attention)
 }
 
 /// The operations of a training step over `tokens` tokens in sequences of

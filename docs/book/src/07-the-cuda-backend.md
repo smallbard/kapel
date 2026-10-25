@@ -184,7 +184,7 @@ Served by `kapel serve` (chapter 12) with requests of 16 to 128 prompt tokens an
 
 Speculative decoding (chapter 11) takes Qwen3 8B in bf16 from 49.9 to 85.6 tokens per second with Qwen3 0.6B proposing four tokens per pass, the greedy answers unchanged, and MiMo-7B-RL from 54.7 to 83.8 with its own multi-token layer.
 
-Llama 3.2 1B decodes at 425 tokens per second in Q4_K_M, 412 in Q8_0 and 272 in bf16; Llama 3.2 3B at 166 in int8, 179 in int4 and 204 in Q4_0. Q4_0, the format `kapel quantize` writes by default (chapter 13), went through the generic kernel at 28 tokens per second until the tracked measures (chapter 18) showed it.
+Llama 3.2 1B decodes at 425 tokens per second in Q4_K_M, 412 in Q8_0 and 272 in bf16; Llama 3.2 3B at 166 in int8, 179 in int4 and 204 in Q4_0. Q4_0, the format `kapel quantize` writes by default (chapter 13), went through the generic kernel at 28 tokens per second until the tracked measures (chapter 19) showed it.
 
 The limits are known. At one sequence, products alone reach 92 % of the bandwidth, but the small kernels between them (norms, RoPE, cache writes, attention) take the rest of the time. Quantized weights with 9 to a few hundred rows of activations are dequantized at every pass. 4-bit formats are limited by the instructions that decode them, not by bandwidth, and `qgemv` with 2 to 8 rows is slower than it should be.
 

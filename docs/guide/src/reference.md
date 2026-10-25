@@ -11,6 +11,8 @@
 | `kapel prepare INPUT... --tokenizer PATH --output DIR` | tokenizes Parquet, JSONL or text files into shards for training, the exact duplicates left out (*The Kapel Book*, section 15.13); with `--chat`, conversations by the model's chat template, the assistant's tokens marked for the loss (section 16.1) | `kapel prepare --help` |
 | `kapel train CONFIG.toml` | trains a model as a TOML file describes it: pre-training and supervised fine-tuning (`[data]`), DPO (`[dpo]`), GRPO (`[grpo]`), with LoRA adapters (`[lora]`) or not (`recipes/`; *The Kapel Book*, chapters 15 and 16) | `kapel train --help` |
 | `kapel merge MODEL ADAPTER --output DIR` | merges a LoRA adapter, PEFT's or a checkpoint of `kapel train`, into its model (section 16.2) | `kapel merge --help` |
+| `kapel sweep SWEEP.toml` | runs a grid of trainings, several at once on one card, each noted in a table as it ends; the same command goes on after a stop (*The Kapel Book*, section 17.2) | `kapel sweep --help` |
+| `kapel fit RESULTS.tsv...` | fits laws of scale to the table of a grid: the best size for each budget, its power laws, Chinchilla's formula of the loss with intervals (section 17.3) | `kapel fit --help` |
 
 ## Loading options
 

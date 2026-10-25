@@ -1,0 +1,39 @@
+# Smallem's curve at 10¹⁶ operations (PLAN-LOIS-D-ECHELLE, step L2): five
+# widths around the best, heads of 64, as many layers as heads, each at the
+# learning rate of Smallem's step L1, 0.2002 × C^-0.761. Smallem found its
+# lowest point at 15.3 M parameters, 0.897 nats per byte.
+#
+#   kapel sweep recipes/scaling-smallem/sweep.toml
+#   kapel fit recipes/scaling-smallem/runs/results.tsv
+
+[sweep]
+base = "train.toml"
+dir = "runs"
+parallel = 2
+# Smallem's tokens: 3.897 bytes of text each, on its validation text.
+bytes_per_token = 3.897
+
+[[run]]
+name = "c1e16-e256"
+model.set = { hidden_size = 256, intermediate_size = 688, num_attention_heads = 4, num_key_value_heads = 4, num_hidden_layers = 4 }
+optimizer.lr = 2.95e-3
+
+[[run]]
+name = "c1e16-e320"
+model.set = { hidden_size = 320, intermediate_size = 856, num_attention_heads = 5, num_key_value_heads = 5, num_hidden_layers = 5 }
+optimizer.lr = 2.49e-3
+
+[[run]]
+name = "c1e16-e384"
+model.set = { hidden_size = 384, intermediate_size = 1024, num_attention_heads = 6, num_key_value_heads = 6, num_hidden_layers = 6 }
+optimizer.lr = 2.17e-3
+
+[[run]]
+name = "c1e16-e448"
+model.set = { hidden_size = 448, intermediate_size = 1200, num_attention_heads = 7, num_key_value_heads = 7, num_hidden_layers = 7 }
+optimizer.lr = 1.93e-3
+
+[[run]]
+name = "c1e16-e512"
+model.set = { hidden_size = 512, intermediate_size = 1368, num_attention_heads = 8, num_key_value_heads = 8, num_hidden_layers = 8 }
+optimizer.lr = 1.74e-3

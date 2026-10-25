@@ -26,7 +26,7 @@ Models sit above the catalogue, never above a particular backend: swapping the r
 | Bindings | `kapel-runtime` | A model on whichever device, behind one type | core, ops, cpu, cuda, hub, models, tokenizers, infer, serve |
 |  | `kapel-capi` | The C library `libkapel` and its header `kapel.h` | runtime |
 |  | `kapel-python` | The Python module `kapel` (PyO3) | runtime |
-|  | `kapel-train` | Training: the tape of gradients, losses, optimizers, the decoders on a tape, the training loop and its checkpoints, the preparation and reading of the data (chapter 15); conversations, LoRA and QLoRA, DPO, GRPO and its rewards, tasks evaluated along a run (chapter 16) | core, ops, hub, models, tokenizers, infer, cpu (cuda with its feature) |
+|  | `kapel-train` | Training: the tape of gradients, losses, optimizers, the decoders on a tape, the training loop and its checkpoints, the preparation and reading of the data (chapter 15); conversations, LoRA and QLoRA, DPO, GRPO and its rewards, tasks evaluated along a run (chapter 16); budgets of operations, grids of runs and the laws of scale fitted to them (chapter 17) | core, ops, hub, models, tokenizers, infer, cpu (cuda with its feature) |
 
 Outside the workspace, `kernels/` holds the simple CUDA kernels written in Rust for the nightly compiler. They are compiled once to PTX and the result, `crates/kapel-cuda/kernels.ptx`, is checked in, so the published crates build on stable Rust. `fuzz/` holds the fuzzing targets, `tools/parity/` the Python scripts that produce reference outputs from `transformers`, and `tools/eval/` the script that exports the tasks of lm-evaluation-harness for `kapel eval`.
 

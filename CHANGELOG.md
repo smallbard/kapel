@@ -289,6 +289,22 @@ changelog says how.
 - `kapel-ops`: `Cast` decodes quantized types to float ones.
 - `tools/train`: `peft_parity.py`, `trl_sft.py` and `gsm8k.py`; the examples
   `lora` and `tasks` of `kapel-train`.
+- `kapel sweep`: grids of runs from one file, each a part of a configuration
+  laid over a base, several at once on one card, each noted in `results.tsv`
+  from its `summary.json`, the grid going on after a stop
+  (`kapel_train::sweep`).
+- `kapel fit`: the laws of scale of a grid, the curves at constant computation
+  and Chinchilla's formula of the loss with a bootstrap (`kapel_train::scaling`,
+  Smallem's).
+- `kapel-train`: `training.budget`, the steps of a run from a budget of
+  operations; `model.set`, fields of the model's `config.json` replaced;
+  `optimizer.newton_schulz = "short"`, Muon with four iterations (Smallem's
+  `muon:short`); `log.tensorboard`, the log as TensorBoard's events; the
+  profiler counts the operations of products and attentions, and gives their
+  rate; the count of operations knows sliding windows.
+- `kapel-models`: `mlp_bias`, the biases of a gated MLP.
+- `recipes/scaling-smallem`: Smallem's curve at 10¹⁶ operations; `tools/train`:
+  `smallem_tokens.py` and `wandb_log.py`.
 
 ### Changed
 
@@ -354,6 +370,8 @@ changelog says how.
 
 ### Fixed
 
+- `kapel-models`: a Llama with `attention_bias` has a bias on its output
+  projection too, as in `transformers`; it was left out.
 - `kapel-cuda`: the backward pass of a product by quantized weights runs on
   the card, the weights dequantized there; it went through the host.
 - `kapel-tokenizers`: a `tokenizer.json` whose model has no type but merges is

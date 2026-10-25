@@ -13,7 +13,8 @@ Kapel is a Rust library for running and training transformer models. Its distinc
 | III. Backends | 6–7 | How the CPU and CUDA backends make the catalogue fast |
 | IV. From files to answers | 8–12 | Model files, tokenizers and chat templates, the models, text generation, and the server |
 | V. Making and using models | 13–14 | Quantizing with data, evaluating as lm-evaluation-harness does, and Kapel from C and Python |
-| VI. Practice | 15–16 | Safety and security, testing, benchmarks, CI, and the roadmap |
+| VI. Training | 15–17 | The tape of gradients, the training loop and its data, post-training (SFT, LoRA, DPO, GRPO), and grids of runs with their laws of scale |
+| VII. Practice | 18–19 | Safety and security, testing, benchmarks, CI, and the roadmap |
 | Appendix | — | Glossary and an index of files |
 
 **How to read it.** Read Part I first, whatever your goal. Then:
@@ -25,6 +26,6 @@ Kapel is a Rust library for running and training transformer models. Its distinc
 - To quantize or evaluate models, read chapters 10 and 13.
 - To call Kapel from another language, read chapters 11 and 14.
 - To train models, read chapters 4, 10 and 15.
-- To review a change, read chapter 17 and the testing part of chapter 18.
+- To review a change, read chapter 18 and the testing part of chapter 19.
 
 **Conventions.** Shapes are written in brackets, outermost first: `[B, H, T, D]` is batch, heads, positions, head width. File references are relative to the repository root, such as `crates/kapel-ops/src/lib.rs`. Code identifiers are in `monospace`. The book describes the repository as of 23 October 2026; where code and book disagree, the code wins, and the book should be fixed.

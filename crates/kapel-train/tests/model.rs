@@ -58,7 +58,17 @@ fn targets() -> Vec<u32> {
 /// decoder in one batch and by the inference pass one at a time.
 fn compare_with_inference(raw: Value) {
     let config = Config::from_json(&raw).unwrap();
-    let params = init(&config, 0.2, 1).unwrap();
+    let mut params = init(&config, 0.2, 1).unwrap();
+    // Biases that are not zero, so that each counts.
+    for (i, (name, p)) in params.iter_mut().enumerate() {
+        if name.ends_with(".bias") {
+            let n = p.value.numel();
+            let values: Vec<f32> = (0..n)
+                .map(|j| ((i * 7 + j * 3) % 11) as f32 * 0.02 - 0.1)
+                .collect();
+            p.value = Tensor::from_slice(&values, p.value.shape()).unwrap();
+        }
+    }
     let model = Model::new(raw, weights(&params, DType::F32)).unwrap();
     let cpu = kapel_cpu::Cpu::new();
     let decoder = Decoder::new(config).unwrap();
@@ -87,10 +97,20 @@ fn compare_with_inference(raw: Value) {
     }
 }
 
+/// Llama with every bias (`attention_bias`, `mlp_bias`), as Smallem's
+/// models have them.
+fn llama_with_biases() -> Value {
+    let mut raw = llama();
+    raw["attention_bias"] = json!(true);
+    raw["mlp_bias"] = json!(true);
+    raw
+}
+
 #[test]
 fn the_decoders_give_the_logits_of_inference() {
     compare_with_inference(gpt2());
     compare_with_inference(llama());
+    compare_with_inference(llama_with_biases());
     compare_with_inference(qwen3());
 }
 

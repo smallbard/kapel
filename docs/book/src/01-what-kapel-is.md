@@ -13,7 +13,7 @@ Five rules shape almost every design decision in the code. They are stated in `C
 1. **Every fast backend is checked against the reference.** The reference backend computes each operation in `f64`, as plainly as possible. A new operation comes with its reference definition, its gradient, and a conformity test with a written tolerance (chapter 5).
 2. **Results do not depend on the number of threads.** Work is split according to tensor shapes, never according to the hardware. Two runs give the same bits, and tests check it with 1, 2, 3 and 8 threads (chapter 6).
 3. **The library does not panic on user input.** Wrong shapes, unsupported types, corrupt files, hostile templates: each returns a typed error. `panic!` is reserved for broken internal invariants (chapters 3 and 15).
-4. **Every optimization comes with a measurement**, kept as a benchmark program next to the code it measures (chapter 18).
+4. **Every optimization comes with a measurement**, kept as a benchmark program next to the code it measures (chapter 19).
 5. **Code that can be audited**: few dependencies, short modules, documented kernels, and a `// SAFETY:` comment on every `unsafe` block.
 
 The development hardware is a Ryzen 7 7700 (Zen 4, with AVX-512 and its bf16 extension) and an RTX 3090 (Ampere, 24 GB). Several tuning constants in the code are named after it, such as the block sizes `Blocks::ZEN4`.
@@ -44,4 +44,4 @@ The inference plan targets one sequence at a time on a CPU first. Smallem showed
 - `kapel eval`, which replays tasks of lm-evaluation-harness (WikiText, HellaSwag, ARC, MMLU) and gives its perplexities within 0.001 % and its accuracies exactly (chapter 13).
 - A C library with a stable header, and a Python module (chapter 14).
 - A tape of gradients for training (chapter 15): the decoders of chapter 10 train with the same weights and operations. GPT-2 124M computes its gradients on an RTX 3090 for a batch of 16 × 1024 tokens with less than half of PyTorch's peak memory, and as close to PyTorch's f32 gradients as PyTorch's own in bf16. `kapel train` trains it from a TOML file at 1.16 times llm.c's time, and resumes a run bit for bit.
-- Fuzzing of every reader of untrusted files, and continuous integration on four platforms plus a GPU runner (chapters 16 and 17).
+- Fuzzing of every reader of untrusted files, and continuous integration on four platforms plus a GPU runner (chapters 18 and 19).

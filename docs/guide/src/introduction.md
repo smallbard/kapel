@@ -16,6 +16,6 @@ This guide is for people who want to use Kapel: run a model, serve it, quantize 
 
 **What Kapel is good at.** One user or many, on modest hardware. On a Ryzen 7 7700, a quantized Llama 3.2 1B generates at 90 % of llama.cpp's speed; on an RTX 3090, Kapel serves Llama 3.2 3B at about 20 requests per second, 90 % of vLLM's throughput for batches. Results do not depend on the number of threads: the same command gives the same answer twice.
 
-**What it is not (yet).** Kapel runs dense transformer models: Llama, Mistral, Qwen 2 and 3, Gemma 2, Phi, GPT-2 and MiMo. It does not run mixtures of experts, models that read images or sound, or one model over several cards. It trains on one card: pre-training, supervised fine-tuning, LoRA and QLoRA, DPO and GRPO (`kapel train`; the guide's pages on training are still to come, *The Kapel Book* has chapters 15 and 16 on them).
+**What it is not (yet).** Kapel runs dense transformer models: Llama, Mistral, Qwen 2 and 3, Gemma 2, Phi, GPT-2 and MiMo. It does not run mixtures of experts, models that read images or sound, or one model over several cards. It trains on one card: pre-training, supervised fine-tuning, LoRA and QLoRA, DPO and GRPO (`kapel train`), and grids of runs with the laws of scale fitted to them (`kapel sweep`, `kapel fit`); the guide's pages on training are still to come, *The Kapel Book* has chapters 15 to 17 on them.
 
 To understand how Kapel works inside, or to change it, read *The Kapel Book* (`docs/book`) instead.

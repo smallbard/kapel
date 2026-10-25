@@ -79,3 +79,65 @@ fn adamw_by_rows_moves_only_the_rows_read() {
         b.moments()["w"].0.to_vec::<f32>().unwrap()
     );
 }
+
+/// The eigenvalues of `X Xᵀ` for `X` `[m, n]`, `m ≤ n`, by Jacobi's rotations.
+fn gram_eigenvalues(x: &[f64], m: usize, n: usize) -> Vec<f64> {
+    let mut a: Vec<f64> = (0..m * m)
+        .map(|ij| (0..n).map(|k| x[ij / m * n + k] * x[ij % m * n + k]).sum())
+        .collect();
+    for _ in 0..100 {
+        for p in 0..m {
+            for q in p + 1..m {
+                if a[p * m + q].abs() < 1e-15 {
+                    continue;
+                }
+                let theta = (a[q * m + q] - a[p * m + p]) / (2.0 * a[p * m + q]);
+                let t = theta.signum() / (theta.abs() + (theta * theta + 1.0).sqrt());
+                let (c, s) = (1.0 / (t * t + 1.0).sqrt(), t / (t * t + 1.0).sqrt());
+                for k in 0..m {
+                    let (akp, akq) = (a[k * m + p], a[k * m + q]);
+                    a[k * m + p] = c * akp - s * akq;
+                    a[k * m + q] = s * akp + c * akq;
+                }
+                for k in 0..m {
+                    let (apk, aqk) = (a[p * m + k], a[q * m + k]);
+                    a[p * m + k] = c * apk - s * aqk;
+                    a[q * m + k] = s * apk + c * aqk;
+                }
+            }
+        }
+    }
+    (0..m).map(|i| a[i * m + i]).collect()
+}
+
+#[test]
+fn both_iterations_of_newton_schulz_give_nearly_orthogonal_matrices() {
+    use kapel_train::optim::{NEWTON_SCHULZ, NEWTON_SCHULZ_SHORT, orthogonalize};
+    let (m, n) = (8, 16);
+    // Singular values spread over two orders of magnitude.
+    let values: Vec<f32> = (0..m * n)
+        .map(|i| {
+            let (r, c) = (i / n, i % n);
+            (((r * 31 + c * 17) % 13) as f32 - 6.0) * 0.1 * (1.0 + r as f32).powi(2)
+        })
+        .collect();
+    let x = Tensor::from_slice(&values, &[1, m, n]).unwrap();
+    let cpu = kapel_cpu::Cpu::new();
+    for (coefficients, low, high) in [
+        (&NEWTON_SCHULZ[..], 0.9, 1.1),
+        (&NEWTON_SCHULZ_SHORT[..], 0.6, 1.3),
+    ] {
+        let o = orthogonalize(&cpu, &x, coefficients)
+            .unwrap()
+            .to_f64_vec()
+            .unwrap();
+        for e in gram_eigenvalues(&o, m, n) {
+            let s = e.sqrt();
+            assert!(
+                (low..high).contains(&s),
+                "{} iterations: {s}",
+                coefficients.len()
+            );
+        }
+    }
+}

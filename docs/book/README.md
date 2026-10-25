@@ -20,8 +20,9 @@ read, change or extend the code.
 - [14. Kapel from C and Python: kapel-runtime, kapel-capi and kapel-python](src/14-bindings.md)
 - [15. Training: kapel-train](src/15-training.md)
 - [16. Post-training: kapel-train](src/16-post-training.md)
-- [17. Safety and security](src/17-safety-and-security.md)
-- [18. Working on Kapel](src/18-working-on-kapel.md)
+- [17. Experiments: kapel-train](src/17-experiments.md)
+- [18. Safety and security](src/18-safety-and-security.md)
+- [19. Working on Kapel](src/19-working-on-kapel.md)
 - [Appendix](src/appendix.md)
 
 The chapters are plain Markdown and read well on GitHub. To build them as a

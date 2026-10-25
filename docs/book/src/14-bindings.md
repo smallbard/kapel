@@ -84,4 +84,4 @@ maturin develop --release -m crates/kapel-python/Cargo.toml
 pytest crates/kapel-python/tests
 ```
 
-The Python module links to libpython outside of maturin, which not every machine has, so `cargo test --workspace` leaves it out in continuous integration (`--exclude kapel-python`). The `bindings` job builds and tests both bindings on Linux, macOS and Windows, with the model cached between runs (chapter 18).
+The Python module links to libpython outside of maturin, which not every machine has, so `cargo test --workspace` leaves it out in continuous integration (`--exclude kapel-python`). The `bindings` job builds and tests both bindings on Linux, macOS and Windows, with the model cached between runs (chapter 19).

@@ -407,15 +407,31 @@ pub const NEWTON_SCHULZ: [(f64, f64, f64); 10] = {
     [fast, fast, fast, fast, fast, fast, fast, fast, exact, exact]
 };
 
+/// Four iterations of coefficients all different, tuned so that the answer
+/// is near 1 once a singular value passes 0.02 of the norm: twelve products
+/// instead of thirty. Those of SAMuon (arXiv 2608.25990, table 4), Smallem's
+/// `muon:short`, with which its laws of scale were measured.
+pub const NEWTON_SCHULZ_SHORT: [(f64, f64, f64); 4] = [
+    (5.30697775, -9.73226547, 4.52926445),
+    (3.99123669, -4.20899105, 1.18235242),
+    (2.66316843, -2.16650701, 0.56325209),
+    (1.93040931, -1.31219244, 0.38289258),
+];
+
 /// The orthogonal matrices nearest to a stack `[K, m, n]` of matrices, by
 /// Newton-Schulz's iterations `X ← a X + (b A + c A²) X`, `A = X Xᵀ` (or
 /// `Xᵀ X` on the other side for a tall matrix), after dividing each by its
-/// norm. Computed in `f32`.
+/// norm, with the coefficients `(a, b, c)` of each iteration
+/// ([`NEWTON_SCHULZ`] or [`NEWTON_SCHULZ_SHORT`]). Computed in `f32`.
 ///
 /// # Errors
 ///
 /// Those of the backend.
-pub fn orthogonalize<B: Compute>(backend: &B, stack: &Tensor) -> Result<Tensor> {
+pub fn orthogonalize<B: Compute>(
+    backend: &B,
+    stack: &Tensor,
+    coefficients: &[(f64, f64, f64)],
+) -> Result<Tensor> {
     use kapel_ops::{Matmul, Sum};
     let shape = stack.shape().to_vec();
     let (m, n) = (shape[1], shape[2]);
@@ -447,7 +463,7 @@ pub fn orthogonalize<B: Compute>(backend: &B, stack: &Tensor) -> Result<Tensor> 
         &[&norms],
     )?;
     let mut x = binary(backend, BinaryKind::Div, stack, &norms)?;
-    for &(a, b, c) in &NEWTON_SCHULZ {
+    for &(a, b, c) in coefficients {
         let xt = x.transpose(1, 2)?;
         let gram = if wide {
             backend.forward(&Matmul, &[&x, &xt])?
@@ -504,13 +520,14 @@ pub struct Muon {
     pub update_scale: f64,
     /// Muon's learning rate as a factor of AdamW's.
     pub lr_scale: f64,
+    /// The coefficients of Newton-Schulz's iterations.
+    pub coefficients: &'static [(f64, f64, f64)],
     momenta: BTreeMap<String, Tensor>,
 }
 
 /// Whether Muon takes the parameter `name`.
 pub fn muon_takes(name: &str, param: &crate::model::Parameter) -> bool {
-    const TABLES: [&str; 4] = ["wte", "wpe", "embed_tokens", "lm_head"];
-    param.decay && param.value.rank() == 2 && !TABLES.iter().any(|t| name.contains(t))
+    param.decay && param.value.rank() == 2 && !crate::model::is_table(name)
 }
 
 impl Muon {
@@ -521,6 +538,7 @@ impl Muon {
             momentum: 0.95,
             update_scale: 0.18,
             lr_scale: 1.0,
+            coefficients: &NEWTON_SCHULZ,
             momenta: BTreeMap::new(),
         }
     }
@@ -587,7 +605,7 @@ impl Muon {
             } else {
                 backend.forward(&kapel_ops::Concat { dim: 0 }, &refs)?
             };
-            let orthogonal = orthogonalize(backend, &stack)?;
+            let orthogonal = orthogonalize(backend, &stack, self.coefficients)?;
             let size = shape[0].max(shape[1]) as f64;
             let step = lr * self.update_scale * size.sqrt();
             for (i, (name, _)) in matrices.iter().enumerate() {
@@ -842,6 +860,9 @@ impl Optimizer {
                 muon.adamw = adamw;
                 muon.momentum = config.momentum;
                 muon.lr_scale = config.muon_lr_scale;
+                if config.newton_schulz == "short" {
+                    muon.coefficients = &NEWTON_SCHULZ_SHORT;
+                }
                 Optimizer::Muon(muon)
             }
             "adafactor" => Optimizer::Adafactor(Adafactor::new(config.lr, config.weight_decay)),

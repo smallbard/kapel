@@ -18,7 +18,8 @@
 - [14. Kapel from C and Python: kapel-runtime, kapel-capi and kapel-python](14-bindings.md)
 - [15. Training: kapel-train](15-training.md)
 - [16. Post-training: kapel-train](16-post-training.md)
-- [17. Safety and security](17-safety-and-security.md)
-- [18. Working on Kapel](18-working-on-kapel.md)
+- [17. Experiments: kapel-train](17-experiments.md)
+- [18. Safety and security](18-safety-and-security.md)
+- [19. Working on Kapel](19-working-on-kapel.md)
 
 [Appendix](appendix.md)

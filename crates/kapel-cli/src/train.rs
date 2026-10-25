@@ -6,8 +6,8 @@ use kapel_train::trainer::{RunOptions, run};
 pub(crate) const USAGE: &str = "\
 usage: kapel train CONFIG.toml [options]
 
-Trains a model as CONFIG.toml describes it (see The Kapel Book, chapters 15 and
-16): the model (a directory, or a repository of the Hub), what it learns from,
+Trains a model as CONFIG.toml describes it (see The Kapel Book, chapters 15 to
+17): the model (a directory, or a repository of the Hub), what it learns from,
 the batch, the optimizer, the schedule of learning rates, the evaluations and the
 checkpoints. A run learns from tokens ([data]: pre-training, and supervised
 fine-tuning on conversations prepared with kapel prepare --chat), from pairs of

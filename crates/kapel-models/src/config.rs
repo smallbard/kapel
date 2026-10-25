@@ -69,8 +69,12 @@ pub struct Config {
     pub activation: UnaryKind,
     /// Whether the query, key and value projections have biases.
     pub qkv_bias: bool,
-    /// Whether the output projection and the MLP have biases.
+    /// Whether the attention's output projection has a bias, and, for GPT-2
+    /// and Phi, the MLP too.
     pub out_bias: bool,
+    /// Whether the gate, up and down projections of a gated MLP have biases
+    /// (`mlp_bias`).
+    pub mlp_bias: bool,
     /// Whether queries and keys are RMS-normalized per head before RoPE (Qwen 3).
     pub qk_norm: bool,
     /// Rotary embeddings: base, scaling, rotated components; `None` for learned
@@ -327,7 +331,12 @@ impl Config {
                 "qwen2" | "mimo" | "phi" | "gpt2" => true,
                 _ => is("attention_bias").unwrap_or(false),
             },
-            out_bias: matches!(model_type.as_str(), "phi" | "gpt2"),
+            // `attention_bias` gives the output projection a bias too, as in
+            // `transformers`' Llama, Gemma and Qwen 3.
+            out_bias: matches!(model_type.as_str(), "phi" | "gpt2")
+                || (!matches!(model_type.as_str(), "qwen2" | "mimo")
+                    && is("attention_bias").unwrap_or(false)),
+            mlp_bias: is("mlp_bias").unwrap_or(false),
             qk_norm: model_type == "qwen3",
             rope,
             rope_layout: RopeLayout::Half,

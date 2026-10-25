@@ -110,6 +110,11 @@ pub struct ModelConfig {
     /// The seed of the new weights.
     #[serde(default = "one")]
     pub seed: u64,
+    /// Fields of the `config.json` replaced, for a model trained from
+    /// scratch: one file describes a family of sizes
+    /// (`set = { hidden_size = 384, num_hidden_layers = 6 }`).
+    #[serde(default, skip_serializing_if = "toml::Table::is_empty")]
+    pub set: toml::Table,
     /// The name of the model on the Hub, when `config` was one: set by the
     /// run, for the adapters' `base_model_name_or_path`.
     #[serde(skip)]
@@ -319,10 +324,18 @@ pub struct OptimizerConfig {
     /// parameters keeps `lr`.
     #[serde(default = "one_f64")]
     pub muon_lr_scale: f64,
+    /// Muon's iterations of Newton-Schulz: `"default"`, ten (DeepSeek-V4's),
+    /// or `"short"`, four (SAMuon's, Smallem's `muon:short`).
+    #[serde(default = "default_name")]
+    pub newton_schulz: String,
     /// Groups of parameters with settings of their own, the first that
     /// matches a parameter applying.
     #[serde(default)]
     pub groups: Vec<GroupConfig>,
+}
+
+fn default_name() -> String {
+    "default".into()
 }
 
 fn adamw() -> String {
@@ -364,6 +377,7 @@ impl Default for OptimizerConfig {
             weight_decay: 0.0,
             momentum: momentum_default(),
             muon_lr_scale: 1.0,
+            newton_schulz: default_name(),
             groups: Vec::new(),
         }
     }
@@ -401,7 +415,8 @@ pub struct ScheduleConfig {
     /// The steps of the linear warmup from zero.
     #[serde(default)]
     pub warmup: usize,
-    /// The steps of the run.
+    /// The steps of the run; with `training.budget`, those it pays for.
+    #[serde(default)]
     pub steps: usize,
     /// The learning rate at the end, as a fraction of the peak.
     #[serde(default)]
@@ -443,6 +458,11 @@ pub struct TrainingConfig {
     /// answers (GRPO, the tasks), in GiB.
     #[serde(default = "cache_gib_default")]
     pub cache_gib: f64,
+    /// The computation of the run, in operations (`1e16`): the steps are
+    /// those it pays for ([`crate::flops::step_flops`]), and
+    /// `schedule.steps` may be left out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<f64>,
 }
 
 fn cache_gib_default() -> f64 {
@@ -470,6 +490,7 @@ impl Default for TrainingConfig {
             checkpoint_activations: false,
             chunk: chunk_default(),
             cache_gib: cache_gib_default(),
+            budget: None,
         }
     }
 }
@@ -563,6 +584,10 @@ pub struct LogConfig {
     /// Kapel knows it.
     #[serde(default)]
     pub peak_tflops: Option<f64>,
+    /// Also write the log as TensorBoard's events, in `tensorboard/` of the
+    /// run's directory ([`crate::tensorboard`]).
+    #[serde(default)]
+    pub tensorboard: bool,
 }
 
 impl TrainConfig {
@@ -719,6 +744,12 @@ impl TrainConfig {
                 o.kind
             ));
         }
+        if !matches!(o.newton_schulz.as_str(), "default" | "short") {
+            return fail(format!(
+                "optimizer.newton_schulz: \"default\" or \"short\", got {:?}",
+                o.newton_schulz
+            ));
+        }
         for (name, value) in [("lr", o.lr), ("muon_lr_scale", o.muon_lr_scale)] {
             if !(value > 0.0 && value.is_finite()) {
                 return fail(format!("optimizer.{name}: positive, got {value}"));
@@ -753,7 +784,20 @@ impl TrainConfig {
                 s.kind
             ));
         }
-        if s.steps == 0 || s.warmup > s.steps {
+        if let Some(budget) = self.training.budget {
+            if !(budget > 0.0 && budget.is_finite()) {
+                return fail(format!("training.budget: positive, got {budget}"));
+            }
+            if !tokens {
+                return fail("training.budget: for a run of tokens, not dpo or grpo".into());
+            }
+        } else if s.steps == 0 {
+            return fail("schedule.steps: positive, or training.budget".into());
+        }
+        if !self.model.set.is_empty() && self.model.init != "scratch" {
+            return fail("model.set: for a model trained from scratch only".into());
+        }
+        if s.steps > 0 && s.warmup > s.steps {
             return fail(format!(
                 "schedule: {} steps with {} of warmup",
                 s.steps, s.warmup
