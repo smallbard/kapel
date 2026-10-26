@@ -1,0 +1,71 @@
+# A model of Llama 3.2 1B's architecture and tokenizer trained from scratch
+# on FineWeb, as `kapel prepare` makes its tokens: The Kapel Book, sections
+# 15.10 and 15.13.
+#
+#   hf download HuggingFaceFW/fineweb sample/10BT/000_00000.parquet \
+#       --repo-type dataset --local-dir data/fineweb-parquet
+#   kapel prepare data/fineweb-parquet/sample/10BT/000_00000.parquet \
+#       --tokenizer unsloth/Llama-3.2-1B --output data/fineweb-llama3 --val-every 1000
+#   kapel train recipes/llama-1b/train.toml --steps 50
+#
+# The model's config.json and tokenizer come from unsloth/Llama-3.2-1B, an
+# ungated copy of meta-llama/Llama-3.2-1B; its weights are drawn anew. The
+# whole run is one pass over the 698 million tokens of the file, 1,300 steps
+# of 524,288 tokens; `--steps 50` is its beginning.
+#
+# Expected: see recipes/README.md.
+
+[model]
+config = "unsloth/Llama-3.2-1B"
+init = "scratch"
+std = 0.02
+seed = 1
+
+[data]
+train = "../../data/fineweb-llama3"
+val = "../../data/fineweb-llama3"
+shuffle = true
+seed = 1
+
+[batch]
+rows = 4
+length = 2048
+tokens = 524288
+
+# Adafactor keeps the second moment of a matrix as its means by row and by
+# column: AdamW's two moments (10 GB) do not fit beside a model of 1.2
+# billion parameters on 24 GB, nor Muon's matrices stacked for their
+# orthogonalization.
+[optimizer]
+kind = "adafactor"
+lr = 1e-3
+weight_decay = 0.1
+
+[[optimizer.groups]]
+matches = "model.embed_tokens.weight"
+decay = false
+
+[schedule]
+kind = "cosine"
+warmup = 100
+steps = 1300
+final = 0.1
+
+[training]
+device = "cuda"
+dtype = "bf16"
+clip = 1.0
+checkpoint_activations = true
+chunk = 1024
+
+[eval]
+every = 50
+tokens = 655360
+
+[checkpoint]
+dir = "run"
+every = 50
+keep = 2
+
+[log]
+every = 1

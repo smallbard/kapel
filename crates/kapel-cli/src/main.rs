@@ -2,6 +2,7 @@
 
 mod args;
 mod eval;
+mod export;
 mod merge;
 mod prepare;
 mod quantize;
@@ -28,6 +29,7 @@ usage: kapel run MODEL [options]
        kapel prepare INPUT... --tokenizer PATH --output DIR   (kapel prepare --help)
        kapel train CONFIG.toml [options]              (kapel train --help)
        kapel merge MODEL ADAPTER --output DIR         (kapel merge --help)
+       kapel export CHECKPOINT --output DIR           (kapel export --help)
        kapel sweep SWEEP.toml [options]               (kapel sweep --help)
        kapel fit RESULTS.tsv... [options]             (kapel fit --help)
 
@@ -119,6 +121,11 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("merge") => exit(merge::execute(&args[1..])),
+        Some("export") if args.get(1).is_some_and(|a| a == "--help" || a == "-h") => {
+            print!("{}", export::USAGE);
+            ExitCode::SUCCESS
+        }
+        Some("export") => exit(export::execute(&args[1..])),
         Some("sweep") if args.get(1).is_some_and(|a| a == "--help" || a == "-h") => {
             print!("{}", sweep::USAGE);
             ExitCode::SUCCESS

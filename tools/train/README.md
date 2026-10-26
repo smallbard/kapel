@@ -30,6 +30,11 @@ Step T4 of the training plan (*The Kapel Book*, chapter 16). They need
   prompts for GRPO and the test's prompts.
 - `trl_sft.py MODEL TRAIN.jsonl OUT`: the fine-tuning of
   `recipes/sft-lora-gsm8k` by TRL, with the same settings.
+- `ultrafeedback.py OUT`: UltraFeedback's pairs that fit in 1,024 tokens of
+  Qwen 3's template, for `recipes/dpo-ultrafeedback`.
+- `trl_dpo.py MODEL TRAIN.jsonl TEST.jsonl OUT`: the DPO of
+  `recipes/dpo-ultrafeedback` by TRL, with the same settings, its log under
+  Kapel's names.
 
 ```sh
 python tools/train/gsm8k.py gsm8k
@@ -59,3 +64,11 @@ kapel fit recipes/scaling-smallem/runs/results.tsv
 kapel sweep recipes/scaling-smallem/sweep-seed43.toml   # the noise of a run
 kapel fit recipes/scaling-smallem/runs/results.tsv recipes/scaling-smallem/runs-seed43/results.tsv
 ```
+
+# Data of the recipes
+
+- `fineweb_gpt2.py OUT [--train N]`: FineWeb in GPT-2's tokens, llm.c's
+  files, for `recipes/gpt2-124m`.
+
+The recipes, their commands and their expected results are in
+`recipes/README.md`.

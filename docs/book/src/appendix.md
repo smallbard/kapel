@@ -41,6 +41,7 @@
 | Log-likelihood | The sum of the logarithms of the probabilities of a continuation's tokens after a context; what `kapel eval` ranks answers by (`Scorer`) |
 | MFU | Model FLOP utilization: the operations a step's definition asks for, over its time and the card's peak (`kapel_train::flops`) |
 | Micro-kernel | The innermost routine of the matrix product, holding a block of C in registers |
+| Model card | The `README.md` of a model on the Hub: what it is, how it was trained, how to load it; `kapel export` writes one from a run's configuration and log (`kapel_train::export`) |
 | Muon | An optimizer of matrices: a momentum made orthogonal by Newton-Schulz's iterations, scaled to the size of an AdamW step (`kapel_train::optim::Muon`) |
 | Multi-token prediction | A layer trained with the model to predict the token after the next from the model's hidden state and the next token (MiMo, DeepSeek-V3); a proposer that costs one block (`Model::multi_token`) |
 | Packing | Copying a block of an operand into the contiguous order the micro-kernel reads |
@@ -54,6 +55,7 @@
 | Prompt lookup | Proposing the tokens that followed the last ones where they last appeared in the sequence: speculative decoding without a second model (`Draft::Ngram`) |
 | Proposer (draft) | What guesses the next tokens in speculative decoding: a smaller model, prompt lookup, or a multi-token layer (`Draft`) |
 | PTX | NVIDIA's intermediate assembly; the thread kernels are checked in as PTX |
+| Recipe | A configuration of `kapel train` in `recipes/`, with the commands that prepare its data, its expected results and its cost, run again in CI for a few steps |
 | Reference | The `f64` backend that defines correct results |
 | RoPE | Rotary position embeddings: pairs of components rotated by an angle proportional to the position |
 | Rounding to the nearest (RTN) | Quantizing each block alone, without data, as `llama-quantize` does |
@@ -119,7 +121,9 @@
 | DPO, GRPO, rewards, tasks | `crates/kapel-train/src/{preference,grpo,rewards}.rs`, `crates/kapel-train/src/trainer/post.rs`, `crates/kapel-train/tests/post.rs`, `crates/kapel-train/examples/tasks.rs` |
 | Budgets of operations, grids of runs, laws of scale | `crates/kapel-train/src/{flops,sweep,scaling}.rs`, `crates/kapel-cli/src/sweep.rs`, `crates/kapel-train/tests/flops.rs`, `recipes/scaling-smallem/`, `tools/train/smallem_tokens.py` |
 | Logs for TensorBoard and Weights & Biases | `crates/kapel-train/src/tensorboard.rs`, `tools/train/wandb_log.py` |
-| Post-training measured against TRL | `tools/train/{trl_sft,gsm8k}.py`, `recipes/{sft-lora-gsm8k,grpo-gsm8k}/` |
+| Post-training measured against TRL | `tools/train/{trl_sft,trl_dpo,gsm8k,ultrafeedback}.py`, `recipes/{sft-gsm8k,sft-lora-gsm8k,dpo-ultrafeedback,grpo-gsm8k}/` |
+| Exporting a run for the Hub | `crates/kapel-train/src/export.rs`, `crates/kapel-cli/src/export.rs`, `crates/kapel-cli/tests/export.rs` |
+| The recipes, their data, their measures in CI | `recipes/`, `recipes/README.md`, `tools/train/fineweb_gpt2.py`, `tools/bench/recipes.py`, `docs/guide/src/recipes.md` |
 | One model type for the bindings | `crates/kapel-runtime/src/lib.rs` |
 | The C API | `crates/kapel-capi/include/kapel.h`, `crates/kapel-capi/src/lib.rs`, `crates/kapel-capi/examples/c/` |
 | The Python module | `crates/kapel-python/src/lib.rs`, `crates/kapel-python/kapel.pyi`, `crates/kapel-python/tests/` |

@@ -116,8 +116,9 @@ pub struct ModelConfig {
     #[serde(default, skip_serializing_if = "toml::Table::is_empty")]
     pub set: toml::Table,
     /// The name of the model on the Hub, when `config` was one: set by the
-    /// run, for the adapters' `base_model_name_or_path`.
-    #[serde(skip)]
+    /// run and saved with its checkpoints, for the adapters'
+    /// `base_model_name_or_path` and the card of `kapel export`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hub: Option<String>,
 }
 
@@ -657,6 +658,9 @@ impl TrainConfig {
         }
         if let Some(d) = &mut self.dpo {
             local(&mut d.train);
+            if let Some(v) = &mut d.val {
+                local(v);
+            }
         }
         if let Some(g) = &mut self.grpo {
             local(&mut g.prompts);

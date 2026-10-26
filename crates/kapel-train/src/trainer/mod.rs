@@ -931,7 +931,22 @@ impl<'a, B: Compute> Run<'a, B> {
             let stopping = self.options.stop_after == Some(self.step);
             if (c.eval.every > 0 && self.step.is_multiple_of(c.eval.every)) || (last && !stopping) {
                 val_loss = self.evaluate(self.val.as_deref())?;
-                if let Some(v) = val_loss {
+                if let Some(mut held) = self.evaluate_pairs()? {
+                    val_loss = held.get("val_loss").and_then(Value::as_f64);
+                    if !self.options.quiet {
+                        let get = |k: &str| held.get(k).and_then(Value::as_f64).unwrap_or(0.0);
+                        eprintln!(
+                            "step {:>6}/{steps} | val loss {:.6} | accuracy {:.4} | margin {:.4}",
+                            self.step,
+                            get("val_loss"),
+                            get("val_accuracy"),
+                            get("val_margin")
+                        );
+                    }
+                    held.insert("step".into(), json!(self.step));
+                    held.insert("tokens".into(), json!(self.tokens));
+                    self.record(Value::Object(held))?;
+                } else if let Some(v) = val_loss {
                     self.record(json!({"step": self.step, "val_loss": v, "tokens": self.tokens}))?;
                     if !self.options.quiet {
                         eprintln!("step {:>6}/{steps} | val loss {v:.6}", self.step);

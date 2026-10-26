@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # The measures Kapel tracks: runs the example `bench` of kapel-cli on a fixed
-# list of setups and writes one JSON report with all of them.
+# list of setups, and the recipes of training for a few steps each
+# (tools/bench/recipes.py), and writes one JSON report with all of them.
 #
-#     tools/bench/run.sh cpu|cuda|all OUTPUT.json
+#     tools/bench/run.sh cpu|cuda|train|all OUTPUT.json
 #
 # The models come from the Hub (into $KAPEL_CACHE); the text of the
 # perplexities is wikitext-2's test set, downloaded once into
@@ -10,8 +11,8 @@
 # baseline with tools/bench/compare.py.
 set -euo pipefail
 
-suite=${1:?usage: run.sh cpu|cuda|all OUTPUT.json}
-output=${2:?usage: run.sh cpu|cuda|all OUTPUT.json}
+suite=${1:?usage: run.sh cpu|cuda|train|all OUTPUT.json}
+output=${2:?usage: run.sh cpu|cuda|train|all OUTPUT.json}
 root=$(cd "$(dirname "$0")/../.." && pwd)
 data=${KAPEL_BENCH_DATA:-$HOME/.cache/kapel/bench}
 text=$data/wikitext-2-raw/wiki.test.raw
@@ -25,7 +26,7 @@ fi
 
 features=()
 if [ "$suite" != cpu ]; then features=(--features cuda); fi
-cargo build --release -p kapel-cli "${features[@]}" --example bench --manifest-path "$root/Cargo.toml"
+cargo build --release -p kapel-cli "${features[@]}" --bin kapel --example bench --manifest-path "$root/Cargo.toml"
 bench=$root/target/release/examples/bench
 
 work=$(mktemp -d)
@@ -44,6 +45,10 @@ if [ "$suite" = cuda ] || [ "$suite" = all ]; then
     run qwen2.5-0.5b-cuda-bf16 Qwen/Qwen2.5-0.5B-Instruct --device cuda
     run llama3.2-3b-cuda-bf16 unsloth/Llama-3.2-3B-Instruct --device cuda --batch 64
     run llama3.2-3b-cuda-q4_0 unsloth/Llama-3.2-3B-Instruct --device cuda --quantize q4_0 --quantize-output
+fi
+
+if [ "$suite" = train ] || [ "$suite" = all ]; then
+    python3 "$root/tools/bench/recipes.py" "$work" --kapel "$root/target/release/kapel"
 fi
 
 python3 - "$work" "$output" <<'PY'

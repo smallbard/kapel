@@ -1,7 +1,7 @@
 //! Post-training on the processor, with a small Qwen 3 and its chat
-//! template: DPO starts at `ln 2` and learns the preference, with adapters
-//! or without, and resumes bit for bit; GRPO makes a rewarded answer more
-//! likely; a task is evaluated along the run.
+//! template: DPO starts at `ln 2` and learns the preference, measured on
+//! pairs held out, with adapters or without, and resumes bit for bit; GRPO
+//! makes a rewarded answer more likely; a task is evaluated along the run.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -108,6 +108,7 @@ fn dpo_config(dir: &Path, lora: bool, steps: usize) -> TrainConfig {
         keep = 0
         [dpo]
         train = "pairs.jsonl"
+        val = "pairs.jsonl"
         beta = 0.5
         {lora}
         "#,
@@ -137,6 +138,15 @@ fn dpo_with_adapters_starts_at_ln_2_and_learns_the_preference() {
     assert_eq!(last["accuracy"].as_f64(), Some(1.0));
     assert!(last["margin"].as_f64().unwrap() > 0.5, "{last}");
     assert!(last["loss"].as_f64().unwrap() < 0.4, "{last}");
+    // The pairs held out (here the same), measured at the end.
+    let held = lines
+        .iter()
+        .find(|l| l.get("val_accuracy").is_some())
+        .expect("an evaluation of the pairs held out");
+    assert_eq!(held["step"], 12);
+    assert_eq!(held["val_accuracy"].as_f64(), Some(1.0), "{held}");
+    assert!(held["val_loss"].as_f64().unwrap() < 0.4, "{held}");
+    assert!(held["val_margin"].as_f64().unwrap() > 0.5, "{held}");
     // The checkpoint is an adapter.
     let (_, checkpoint) = kapel_train::checkpoint::list(&dir.join("run"))
         .pop()

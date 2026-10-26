@@ -16,3 +16,7 @@ __pycache__/
 /dist
 /recipes/*/run/
 /recipes/*/runs*/
+/recipes/*/data/
+/recipes/*/gsm8k/
+/recipes/*/fineweb/
+/recipes/*/ultrafeedback/

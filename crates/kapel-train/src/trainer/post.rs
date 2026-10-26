@@ -26,6 +26,8 @@ use crate::{flops, lora};
 /// The pairs of a run of DPO.
 pub(super) struct Pairs {
     pub(super) pairs: PairLoader,
+    /// The pairs held out.
+    val: Vec<preference::Pair>,
     config: DpoConfig,
     pad: u32,
 }
@@ -50,8 +52,19 @@ impl Pairs {
                 }
             );
         }
+        let val = match &config.val {
+            Some(path) => {
+                let (val, counts) = preference::read_pairs(path, encoder, length, None)?;
+                if !quiet {
+                    eprintln!("train: {} pairs held out", counts.pairs);
+                }
+                val
+            }
+            None => Vec::new(),
+        };
         Ok(Self {
             pairs: PairLoader::new(pairs, seed, config.shuffle),
+            val,
             config: config.clone(),
             pad: encoder.eos().unwrap_or(0),
         })
@@ -314,6 +327,62 @@ impl<B: Compute> Run<'_, B> {
                 .map(|(k, v)| (k.to_string(), json!(v)))
                 .collect(),
         })
+    }
+
+    /// The loss of DPO on the pairs held out, with their accuracy and the
+    /// mean rewards, by the current weights, without gradients; `None`
+    /// without such pairs.
+    pub(super) fn evaluate_pairs(&self) -> Result<Option<serde_json::Map<String, Value>>> {
+        let Objective::Pairs(p) = &self.objective else {
+            return Ok(None);
+        };
+        if p.val.is_empty() {
+            return Ok(None);
+        }
+        let (rows, length) = (self.config.batch.rows, self.config.batch.length);
+        let (policy_params, reference_params) =
+            (Self::frozen(&self.params), self.reference_params());
+        let mut sums: BTreeMap<&str, f64> = BTreeMap::new();
+        for chunk in p.val.chunks((rows / 2).max(1)) {
+            let sequences: Vec<&Sequence> = chunk
+                .iter()
+                .flat_map(|p| [&p.chosen, &p.rejected])
+                .collect();
+            let (ids, targets) = rows_of(&sequences, length, p.pad);
+            let sums_of = |logps: Vec<f64>| -> Vec<f64> {
+                logps.chunks(length).map(|r| r.iter().sum()).collect()
+            };
+            let policy = sums_of(self.token_logps(&policy_params, &ids, &targets)?);
+            let reference = sums_of(self.token_logps(&reference_params, &ids, &targets)?);
+            let even = |v: &[f64]| v.iter().step_by(2).copied().collect::<Vec<_>>();
+            let odd = |v: &[f64]| v.iter().skip(1).step_by(2).copied().collect::<Vec<_>>();
+            let lengths: Vec<usize> = chunk.iter().map(|p| p.chosen.answer_tokens()).collect();
+            let terms = preference::dpo_terms(
+                &even(&policy),
+                &odd(&policy),
+                &even(&reference),
+                &odd(&reference),
+                &lengths,
+                p.config.beta,
+                0.0,
+            );
+            let n = chunk.len() as f64;
+            for (k, v) in [
+                ("val_loss", terms.loss),
+                ("val_accuracy", terms.accuracy),
+                ("val_chosen_reward", terms.chosen_reward),
+                ("val_rejected_reward", terms.rejected_reward),
+                ("val_margin", terms.chosen_reward - terms.rejected_reward),
+            ] {
+                *sums.entry(k).or_default() += v * n;
+            }
+        }
+        let n = p.val.len() as f64;
+        Ok(Some(
+            sums.into_iter()
+                .map(|(k, v)| (k.to_string(), json!(v / n)))
+                .collect(),
+        ))
     }
 
     /// The model of the current weights, for inference: the adapters merged,

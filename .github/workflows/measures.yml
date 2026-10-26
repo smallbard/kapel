@@ -1,10 +1,12 @@
 name: Measures
 
-# The speeds and perplexities Kapel publishes, measured on the self-hosted
+# The speeds and perplexities Kapel publishes, and the speed, memory and loss
+# of each recipe of training on a few steps, measured on the self-hosted
 # machine (Ryzen 7 7700, RTX 3090) that nothing else uses while it runs, and
 # compared with the baseline measured there (tools/bench/baselines). A speed
-# 10 % below the baseline, or a perplexity that moved, fails the job; the
-# report is in the job's summary and its artifact.
+# 10 % below the baseline, a memory 10 % above it, or a perplexity or a loss
+# that moved, fails the job; the report is in the job's summary and its
+# artifact. The recipes' data are kept in ~/.cache/kapel/bench/recipes.
 on:
   push:
     branches: [main]
@@ -22,7 +24,7 @@ jobs:
     runs-on: [self-hosted, linux, cuda]
     permissions:
       contents: read
-    timeout-minutes: 90
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
         with:

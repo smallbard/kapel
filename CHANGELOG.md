@@ -305,6 +305,21 @@ changelog says how.
 - `kapel-models`: `mlp_bias`, the biases of a gated MLP.
 - `recipes/scaling-smallem`: Smallem's curve at 10¹⁶ operations; `tools/train`:
   `smallem_tokens.py` and `wandb_log.py`.
+- `kapel export`: a checkpoint as a repository of the Hugging Face Hub holds
+  it, the weights in bf16 without the optimizer's state, or an adapter for
+  PEFT naming its base on the Hub, or merged; the tokenizer, and a model card
+  without the machine's paths (`kapel_train::export`).
+- `kapel train --dir`: the run's directory instead of `checkpoint.dir`.
+- `kapel-train`: `dpo.val`, pairs held out measured every `eval.every` steps;
+  `model.hub` saved with the checkpoints.
+- Recipes `llama-1b`, `sft-gsm8k` and `dpo-ultrafeedback`, each recipe with its
+  expected results and cost (`recipes/README.md`); `tools/train`:
+  `fineweb_gpt2.py`, `ultrafeedback.py` and `trl_dpo.py`.
+- The guide's pages on training: pre-training, fine-tuning, long runs,
+  publishing, grids, the recipes and the configuration's reference.
+- `tools/bench/recipes.py` and the suite `train` of `tools/bench/run.sh`: the
+  speed, memory and loss of each recipe on a few steps, tracked by the
+  workflow `measures`.
 
 ### Changed
 
@@ -370,6 +385,9 @@ changelog says how.
 
 ### Fixed
 
+- `kapel merge --dtype f32` (and `kapel export --merge`) of a model in bf16
+  rounded each merged weight to bf16 first; the sums are now rounded once, to
+  the type asked, and match PEFT's merge (7 × 10⁻⁵ of the logits).
 - `kapel-models`: a Llama with `attention_bias` has a bias on its output
   projection too, as in `transformers`; it was left out.
 - `kapel-cuda`: the backward pass of a product by quantized weights runs on

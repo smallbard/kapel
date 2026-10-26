@@ -301,3 +301,51 @@ fn an_adapter_written_as_peft_reads_back() {
     }
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn a_merge_into_f32_rounds_the_sums_of_a_bf16_model_once() {
+    use kapel_ops::{Cast, Run as _};
+    let cpu = kapel_cpu::Cpu::new();
+    let (config, mut params, lora) = adapted(&llama(), false);
+    randomize(&mut params);
+    let dir = std::env::temp_dir().join(format!("kapel-merge-f32-{}", std::process::id()));
+    // The model in bf16, as the Hub's are; its adapter as PEFT writes it.
+    let mut weights = BTreeMap::new();
+    let mut factors = BTreeMap::new();
+    for (name, p) in params.iter_mut() {
+        if lora::is_factor(name) {
+            factors.insert(name.to_string(), p.value.clone());
+        } else {
+            let bf16 = cpu
+                .forward(&Cast { dtype: DType::BF16 }, &[&p.value])
+                .unwrap();
+            p.value = cpu.forward(&Cast { dtype: DType::F32 }, &[&bf16]).unwrap();
+            weights.insert(name.to_string(), bf16);
+        }
+    }
+    kapel_models::Model::new(llama(), weights)
+        .unwrap()
+        .save(dir.join("base"))
+        .unwrap();
+    let adapted_modules = lora::projections(&params, &config, &lora.targets);
+    let peft = lora::peft_config(&lora, &config, &adapted_modules, "base");
+    lora::save(&dir.join("adapter"), &factors, &peft).unwrap();
+
+    let merged =
+        lora::merge_dirs(&dir.join("base"), &dir.join("adapter"), Some(DType::F32)).unwrap();
+    merged.save(dir.join("merged")).unwrap();
+    let file =
+        kapel_hub::safetensors::SafeTensors::open(dir.join("merged/model.safetensors")).unwrap();
+    // The sums in f32, as PEFT's merge in f32 gives them.
+    let expected = lora::merge(&cpu, &params, &config, lora.scale()).unwrap();
+    for (name, p) in expected.iter() {
+        let got = file.tensor(name).unwrap();
+        assert_eq!(got.dtype(), DType::F32, "{name}");
+        close(
+            &got.to_f64_vec().unwrap(),
+            &p.value.to_f64_vec().unwrap(),
+            1e-6,
+        );
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}

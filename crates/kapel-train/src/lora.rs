@@ -545,6 +545,17 @@ pub fn save(
         .map_err(|e| format!("{}: {e}", dir.display()))
 }
 
+/// The bytes of the narrowest float type of `params`.
+fn params_dtype_bytes(params: &Parameters) -> usize {
+    params
+        .iter()
+        .map(|(_, p)| p.value.dtype())
+        .filter(|d| d.is_float())
+        .map(|d| d.block_bytes())
+        .min()
+        .unwrap_or(4)
+}
+
 /// An adapter read back: its settings, and its factors by Kapel's names.
 #[derive(Clone, Debug)]
 pub struct Adapter {
@@ -653,6 +664,17 @@ pub fn merge_dirs(
         params.insert(name, Parameter::new(t));
     }
     let cpu = kapel_cpu::Cpu::new();
+    // `merge` keeps each weight's type: weights wider than the model's are
+    // widened first, so that their sums are rounded once, to `dtype`.
+    if dtype.block_bytes() > params_dtype_bytes(&params) {
+        for (_, p) in params.iter_mut() {
+            if p.value.dtype().is_float() && p.value.dtype() != dtype {
+                p.value = cpu
+                    .forward(&Cast { dtype }, &[&p.value])
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+    }
     let merged =
         merge(&cpu, &params, &config, adapter.config.scale()).map_err(|e| e.to_string())?;
     let raw = merged_config(model.raw_config(), &params, &config);

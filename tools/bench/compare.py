@@ -2,9 +2,10 @@
 
     python3 tools/bench/compare.py BASELINE.json CURRENT.json [--tolerance 0.10]
 
-A speed more than `--tolerance` below the baseline's is a regression; a
-perplexity that moved by more than 0.01 % means the numbers changed, which a
-change must explain (and then update the baseline). A speed more than the
+A speed more than `--tolerance` below the baseline's is a regression, and so
+is a peak memory more than `--tolerance` above it; a perplexity, or the loss
+of a recipe's last step measured, that moved by more than 0.01 % means the
+numbers changed, which a change must explain (and then update the baseline). A speed more than the
 tolerance above the baseline's is reported, to update the baseline with.
 Prints a Markdown table (also appended to $GITHUB_STEP_SUMMARY when set), and
 exits with 1 on a regression or a changed perplexity.
@@ -19,8 +20,11 @@ SPEEDS = {
     "prefill_tokens_per_s": "prefill tok/s",
     "decode_tokens_per_s": "decode tok/s",
     "batch_tokens_per_s": "batch tok/s",
+    "train_tokens_per_s": "train tok/s",
 }
-PERPLEXITY_TOLERANCE = 1e-4
+# Numbers the arithmetic alone fixes.
+EXACT = {"perplexity": "perplexity", "loss": "loss"}
+EXACT_TOLERANCE = 1e-4
 
 
 def main():
@@ -41,15 +45,19 @@ def main():
         if base is None:
             rows.append(f"| {name} | (no baseline) | | | |")
             continue
-        for key, label in [*SPEEDS.items(), ("perplexity", "perplexity")]:
+        for key, label in [*SPEEDS.items(), *EXACT.items(), ("peak_gib", "peak GiB")]:
             now, then = report["results"].get(key), base["results"].get(key)
             if now is None or then is None:
                 continue
             change = now / then - 1
-            if key == "perplexity":
-                verdict = "changed" if abs(change) > PERPLEXITY_TOLERANCE else "same"
+            if key in EXACT:
+                verdict = "changed" if abs(change) > EXACT_TOLERANCE else "same"
                 if verdict == "changed":
-                    failures.append(f"{name}: perplexity {then:.4f} -> {now:.4f}")
+                    failures.append(f"{name}: {label} {then:.4f} -> {now:.4f}")
+            elif key == "peak_gib":
+                verdict = "larger" if change > args.tolerance else "ok"
+                if verdict == "larger":
+                    failures.append(f"{name}: {label} {then:.2f} -> {now:.2f} ({change:+.1%})")
             elif change < -args.tolerance:
                 verdict = "slower"
                 failures.append(f"{name}: {label} {then:.1f} -> {now:.1f} ({change:+.1%})")

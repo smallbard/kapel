@@ -285,6 +285,10 @@ pub struct DpoConfig {
     /// The pairs read at most.
     #[serde(default)]
     pub limit: Option<usize>,
+    /// Pairs held out, as `train`: their loss, accuracy and margin measured
+    /// every `eval.every` steps (`val_loss`, `val_accuracy`, `val_margin`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub val: Option<String>,
 }
 
 fn beta_default() -> f64 {

@@ -1,0 +1,61 @@
+# Qwen 3 0.6B fine-tuned on GSM8K's 7,473 problems, all its weights, one
+# epoch: The Kapel Book, section 16.7. The same data and batches as
+# sft-lora-gsm8k, the learning rate of a full fine-tuning.
+#
+#   python tools/train/gsm8k.py recipes/sft-gsm8k/gsm8k
+#   kapel prepare recipes/sft-gsm8k/gsm8k/train.jsonl --chat \
+#       --tokenizer Qwen/Qwen3-0.6B --output recipes/sft-gsm8k/data
+#   kapel train recipes/sft-gsm8k/train.toml
+#   kapel export recipes/sft-gsm8k/run --output qwen3-0.6b-gsm8k
+#
+# Expected: see recipes/README.md.
+
+[model]
+config = "Qwen/Qwen3-0.6B"
+init = "weights"
+
+[data]
+train = "data"
+pack = "padded"
+shuffle = true
+seed = 0
+
+[batch]
+rows = 16
+length = 512
+
+[optimizer]
+kind = "adamw"
+lr = 1e-5
+beta1 = 0.9
+beta2 = 0.999
+eps = 1e-8
+weight_decay = 0.0
+
+[schedule]
+kind = "linear"
+steps = 467
+
+[training]
+device = "cuda"
+dtype = "bf16"
+clip = 1.0
+chunk = 1024
+
+[eval]
+every = 0
+tokens = 0
+
+[[eval.tasks]]
+name = "gsm8k"
+prompts = "gsm8k/test.jsonl"
+max_tokens = 512
+[[eval.tasks.rewards]]
+kind = "math"
+
+[checkpoint]
+dir = "run"
+every = 0
+
+[log]
+every = 50
