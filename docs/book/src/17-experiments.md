@@ -73,14 +73,21 @@ kapel sweep recipes/scaling-smallem/sweep.toml
 kapel fit recipes/scaling-smallem/runs/results.tsv
 ```
 
-The grid ran in 1 h 13 min, two runs at a time on the card, 8,109 seconds of runs (Smallem's five took 19,815, on a card it shared). The final validation losses, in nats per byte:
+The grid ran in 1 h 13 min, two runs at a time on the card, 8,109 seconds of runs (Smallem's five took 19,815, on a card it shared). It ran a second time with another seed, for the weights and for the order of the data (`sweep-seed43.toml`), to measure what a run's chance alone moves. The final validation losses, in nats per byte:
 
-| Width | Parameters | Steps | Smallem | Kapel | Difference |
+| Width | Parameters | Steps | Smallem | Kapel, seed 42 | Kapel, seed 43 |
 | --- | --- | --- | --- | --- | --- |
-| 256 | 5.27 M | 32,254 | 0.9298 | 0.9250 | −0.0048 |
-| 320 | 8.80 M | 19,531 | 0.9055 | 0.9014 | −0.0041 |
-| 384 | 13.79 M | 12,620 | 0.8974 | 0.8935 | −0.0039 |
-| 448 | 20.62 M | 8,552 | 0.9000 | 0.8997 | −0.0003 |
-| 512 | 29.44 M | 6,057 | 0.9092 | 0.9093 | +0.0001 |
+| 256 | 5.27 M | 32,254 | 0.9298 | 0.9250 | 0.9254 |
+| 320 | 8.80 M | 19,531 | 0.9055 | 0.9014 | 0.9020 |
+| 384 | 13.79 M | 12,620 | 0.8974 | 0.8935 | 0.8960 |
+| 448 | 20.62 M | 8,552 | 0.9000 | 0.8997 | 0.8961 |
+| 512 | 29.44 M | 6,057 | 0.9092 | 0.9093 | 0.9064 |
+| Lowest point | | | 15.29 M, 0.8971 | 14.36 M, 0.8943 | 15.28 M, 0.8945 |
 
-`kapel fit` puts the lowest point at **14.36 M parameters and 0.8943 nats per byte**, against Smallem's 15.29 M and 0.8971: the loss at the lowest point within 0.3 %, its size 6.1 % below Smallem's, beyond the 5 % the plan asked. The losses of the step 1000 were already Smallem's within 0.02 (4.531 against 4.527 for the width 256). The difference is not spread evenly: the three smaller models, which take the most steps, end 0.004 to 0.005 below Smallem's, the two larger at its loss, and that moves the parabola's lowest point towards the small sizes. Noise alone would move it less: losses drawn again around Kapel's with 0.002 of noise each put the lowest point between 13.8 and 15.1 M nine times out of ten. What remains differs between the two runs of each size: the order of the rows (Kapel reads a permutation of the rows of the corpus, Smallem draws its windows), the validation tokens (Kapel's first 1.6 million, Smallem's 200 batches), RoPE's pairs (side by side in Smallem, halves in Kapel; the same model up to a permutation, not the same draws) and the rounding of the products in bf16. Five runs of one budget fit the formula of section 17.3 to nothing: its intervals span orders of magnitude, as they should.
+```sh
+kapel fit recipes/scaling-smallem/runs/results.tsv recipes/scaling-smallem/runs-seed43/results.tsv
+```
+
+**The validation is met.** The first seed put the lowest point 6.1 % below Smallem's, the second 0.07 %; the two seeds differ from each other by as much as the first from Smallem, and the ten runs fitted together put it at **14.79 M parameters and 0.8944 nats per byte**, 3.3 % below Smallem's 15.29 M. The size of the lowest point of five runs moves by some 6 % with the seed alone: a parabola through points 0.002 to 0.004 apart (a run's loss moves by about 0.002 from one seed to the other) is flat near its bottom, and a few thousandths at its ends move it. A single grid finds Smallem's within the noise of a grid, and a lowest point within 5 % asks for more than one.
+
+The loss differs more steadily. Kapel's runs end 0.003 below Smallem's on average, the smaller models a little more (0.004 to 0.005 in both seeds, against 0 to 0.004 for the larger); its lowest loss is 0.3 % below Smallem's. What differs between the two programs, besides the seeds: the order of the rows (Kapel reads a permutation of the rows of the corpus, Smallem draws its windows), the validation tokens (Kapel's first 1.6 million, Smallem's 200 batches), RoPE's pairs (side by side in Smallem, halves in Kapel; the same model up to a permutation, not the same draws) and the rounding of the products in bf16. The losses of the step 1000 were already Smallem's within 0.02 (4.531 against 4.527 for the width 256). Five or ten runs of one budget fit the formula of section 17.3 to nothing: its intervals span orders of magnitude, as they should.

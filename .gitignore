@@ -15,4 +15,4 @@ __pycache__/
 .pytest_cache/
 /dist
 /recipes/*/run/
-/recipes/*/runs/
+/recipes/*/runs*/

@@ -1,0 +1,48 @@
+# The grid of sweep.toml again with another seed, for the model's weights and
+# for the order of the data: the spread between the two measures the noise of
+# a run, and both tables fit together.
+#
+#   kapel sweep recipes/scaling-smallem/sweep-seed43.toml
+#   kapel fit recipes/scaling-smallem/runs/results.tsv recipes/scaling-smallem/runs-seed43/results.tsv
+
+[sweep]
+base = "train.toml"
+dir = "runs-seed43"
+parallel = 2
+# Smallem's tokens: 3.897 bytes of text each, on its validation text.
+bytes_per_token = 3.897
+
+[[run]]
+name = "c1e16-e256"
+model.set = { hidden_size = 256, intermediate_size = 688, num_attention_heads = 4, num_key_value_heads = 4, num_hidden_layers = 4 }
+optimizer.lr = 2.95e-3
+model.seed = 43
+data.seed = 43
+
+[[run]]
+name = "c1e16-e320"
+model.set = { hidden_size = 320, intermediate_size = 856, num_attention_heads = 5, num_key_value_heads = 5, num_hidden_layers = 5 }
+optimizer.lr = 2.49e-3
+model.seed = 43
+data.seed = 43
+
+[[run]]
+name = "c1e16-e384"
+model.set = { hidden_size = 384, intermediate_size = 1024, num_attention_heads = 6, num_key_value_heads = 6, num_hidden_layers = 6 }
+optimizer.lr = 2.17e-3
+model.seed = 43
+data.seed = 43
+
+[[run]]
+name = "c1e16-e448"
+model.set = { hidden_size = 448, intermediate_size = 1200, num_attention_heads = 7, num_key_value_heads = 7, num_hidden_layers = 7 }
+optimizer.lr = 1.93e-3
+model.seed = 43
+data.seed = 43
+
+[[run]]
+name = "c1e16-e512"
+model.set = { hidden_size = 512, intermediate_size = 1368, num_attention_heads = 8, num_key_value_heads = 8, num_hidden_layers = 8 }
+optimizer.lr = 1.74e-3
+model.seed = 43
+data.seed = 43

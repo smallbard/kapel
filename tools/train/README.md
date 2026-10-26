@@ -56,4 +56,6 @@ Step T5 of the training plan (*The Kapel Book*, chapter 17).
 python tools/train/smallem_tokens.py ~/Smallem/data/bpe data/smallem
 kapel sweep recipes/scaling-smallem/sweep.toml
 kapel fit recipes/scaling-smallem/runs/results.tsv
+kapel sweep recipes/scaling-smallem/sweep-seed43.toml   # the noise of a run
+kapel fit recipes/scaling-smallem/runs/results.tsv recipes/scaling-smallem/runs-seed43/results.tsv
 ```
