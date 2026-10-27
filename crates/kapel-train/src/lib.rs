@@ -25,6 +25,7 @@ pub mod checkpoint;
 pub mod config;
 pub mod data;
 pub mod dataset;
+pub mod dist;
 pub mod export;
 pub mod flops;
 pub mod grpo;

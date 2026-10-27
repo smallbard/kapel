@@ -365,3 +365,119 @@ fn an_offloaded_run_computes_the_bits_of_one_that_is_not() {
         );
     }
 }
+
+/// Four ranks of one pass a step compute the bits of one rank that
+/// accumulates the four passes; two ranks of two passes, within `f32`'s
+/// rounding (the sums in another order); four ranks killed and resumed, the
+/// bits of four that were not.
+#[test]
+fn ranks_compute_the_weights_of_one_that_accumulates() {
+    let dir = setup("ranks");
+    let with = |run: &str| {
+        let mut c = config(&dir, run, "adamw", 7);
+        c.batch.tokens = Some(4 * 4 * 16);
+        c.validate().unwrap();
+        c
+    };
+    let one = run(&with("one"), &QUIET).unwrap();
+    let four = kapel_train::trainer::run_threads(&with("four"), &QUIET, 4).unwrap();
+    assert_eq!(four.len(), 4);
+    for rank in &four {
+        assert_eq!(rank.loss.to_bits(), one.loss.to_bits());
+        assert_eq!(rank.val_loss, one.val_loss);
+        for (name, w) in &one.params {
+            assert_eq!(
+                w.to_f64_vec().unwrap(),
+                rank.params[name].to_f64_vec().unwrap(),
+                "{name}"
+            );
+        }
+    }
+    let two = kapel_train::trainer::run_threads(&with("two"), &QUIET, 2).unwrap();
+    for (name, w) in &one.params {
+        for (a, b) in w
+            .to_f64_vec()
+            .unwrap()
+            .iter()
+            .zip(two[1].params[name].to_f64_vec().unwrap())
+        {
+            assert!((a - b).abs() <= 1e-5, "{name}: {a} and {b}");
+        }
+    }
+    // Only rank 0 writes the log.
+    let lines = std::fs::read_to_string(dir.join("four/log.jsonl")).unwrap();
+    assert_eq!(lines.lines().filter(|l| l.contains("\"loss\"")).count(), 7);
+    let cut = with("cut");
+    let stop = RunOptions {
+        stop_after: Some(3),
+        ..QUIET
+    };
+    kapel_train::trainer::run_threads(&cut, &stop, 4).unwrap();
+    let resume = RunOptions {
+        resume: true,
+        ..QUIET
+    };
+    let resumed = kapel_train::trainer::run_threads(&cut, &resume, 4).unwrap();
+    assert_eq!(resumed[2].loss.to_bits(), one.loss.to_bits());
+    // Passes that the ranks cannot share are refused.
+    let refused = kapel_train::trainer::run_threads(&with("three"), &QUIET, 3).unwrap_err();
+    assert!(refused.0.contains("not a multiple"), "{refused}");
+}
+
+/// With the optimizer's state shared out (ZeRO 1), and the gradients too
+/// (ZeRO 2), four ranks of one pass still compute the bits of one rank, for
+/// AdamW in 32 and 8 bits and Muon; the checkpoint gathers every rank's
+/// state, and one rank resumes from it the bits of the run.
+#[test]
+fn shared_states_compute_the_weights_of_one_rank() {
+    let dir = setup("shard");
+    for optimizer in ["adamw", "adamw8bit", "muon"] {
+        let with = |run: &str, shard: &str| {
+            let mut c = config(&dir, &format!("{run}-{optimizer}"), optimizer, 7);
+            c.batch.tokens = Some(4 * 4 * 16);
+            c.training.shard = shard.into();
+            c.validate().unwrap();
+            c
+        };
+        let one = run(&with("one", "none"), &QUIET).unwrap();
+        for shard in ["optimizer", "gradients"] {
+            let four = kapel_train::trainer::run_threads(&with(shard, shard), &QUIET, 4).unwrap();
+            for rank in &four {
+                assert_eq!(
+                    rank.loss.to_bits(),
+                    one.loss.to_bits(),
+                    "{optimizer} {shard}"
+                );
+                for (name, w) in &one.params {
+                    assert_eq!(
+                        w.to_f64_vec().unwrap(),
+                        rank.params[name].to_f64_vec().unwrap(),
+                        "{optimizer} {shard} {name}"
+                    );
+                }
+            }
+        }
+        // Four ranks sharing their state, killed at step 3; one rank goes on.
+        let cut = with("cut", "gradients");
+        let stop = RunOptions {
+            stop_after: Some(3),
+            ..QUIET
+        };
+        kapel_train::trainer::run_threads(&cut, &stop, 4).unwrap();
+        let mut alone = cut.clone();
+        alone.training.shard = "none".into();
+        let resumed = run(
+            &alone,
+            &RunOptions {
+                resume: true,
+                ..QUIET
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            resumed.loss.to_bits(),
+            one.loss.to_bits(),
+            "{optimizer} resumed alone"
+        );
+    }
+}

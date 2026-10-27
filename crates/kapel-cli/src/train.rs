@@ -1,7 +1,10 @@
 //! `kapel train`: a training run described by a TOML file.
 
 use kapel_train::config::TrainConfig;
-use kapel_train::trainer::{RunOptions, run};
+use std::sync::Arc;
+
+use kapel_train::dist::{Collective, Tcp};
+use kapel_train::trainer::{RunOptions, Summary, run, run_threads, run_with};
 
 pub(crate) const USAGE: &str = "\
 usage: kapel train CONFIG.toml [options]
@@ -30,11 +33,20 @@ options:
   --quiet                  print nothing but errors
   --profile                time each operation (the device waited for around
                            each, so slower) and print the times at the end
+  --ranks N                N ranks in this process, one thread each, each its own
+                           backend on the device named, the passes of a step
+                           shared between them and their gradients summed
+
+Several processes: as torchrun starts them, each with RANK, WORLD_SIZE and
+MASTER_ADDR:MASTER_PORT (127.0.0.1:29500 by default) in its environment, joined
+by TCP; with training.device = \"cuda\", LOCAL_RANK names the card. Rank 0 alone
+writes the log, the checkpoints and the summary.
 ";
 
 pub(crate) fn execute(args: &[String]) -> Result<(), String> {
     let (mut path, mut dir) = (None, None);
     let mut options = RunOptions::default();
+    let mut ranks = 1usize;
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
         match arg.as_str() {
@@ -42,6 +54,14 @@ pub(crate) fn execute(args: &[String]) -> Result<(), String> {
             "--quiet" => options.quiet = true,
             "--profile" => options.profile = true,
             "--dir" => dir = Some(rest.next().ok_or("--dir needs a directory")?.clone()),
+            "--ranks" => {
+                let n = rest.next().ok_or("--ranks needs a number")?;
+                ranks = n
+                    .parse()
+                    .ok()
+                    .filter(|&r| r > 0)
+                    .ok_or_else(|| format!("--ranks: not a positive number: {n}"))?;
+            }
             "--steps" => {
                 let n = rest.next().ok_or("--steps needs a number")?;
                 options.stop_after = Some(
@@ -61,8 +81,31 @@ pub(crate) fn execute(args: &[String]) -> Result<(), String> {
     if let Some(dir) = dir {
         config.checkpoint.dir = dir.into();
     }
-    let summary = run(&config, &options).map_err(|e| e.to_string())?;
-    if !options.quiet {
+    let summary = match world()? {
+        Some((rank, size, address)) => {
+            if ranks > 1 {
+                return Err("--ranks and WORLD_SIZE: one or the other".into());
+            }
+            if config.training.device == "cuda"
+                && let Ok(local) = std::env::var("LOCAL_RANK")
+            {
+                config.training.device = format!("cuda:{local}");
+            }
+            let group: Arc<dyn Collective> =
+                Arc::new(Tcp::connect(&address, rank, size).map_err(|e| e.to_string())?);
+            let result = run_with(&config, &options, Some(Arc::clone(&group)));
+            if result.is_err() {
+                group.abort();
+            }
+            result.map_err(|e| e.to_string())?
+        }
+        None if ranks > 1 => first(run_threads(&config, &options, ranks))?,
+        None => run(&config, &options).map_err(|e| e.to_string())?,
+    };
+    if options.quiet || rank_env() > 0 {
+        return Ok(());
+    }
+    {
         eprintln!(
             "train: {} steps, loss {:.4}{}",
             summary.steps,
@@ -74,4 +117,51 @@ pub(crate) fn execute(args: &[String]) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// Rank 0's summary of a run of several ranks.
+fn first(
+    summaries: Result<Vec<Summary>, kapel_train::trainer::TrainError>,
+) -> Result<Summary, String> {
+    summaries
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "no rank".into())
+}
+
+/// This process's rank in torchrun's environment, 0 without it.
+fn rank_env() -> usize {
+    std::env::var("RANK")
+        .ok()
+        .and_then(|r| r.parse().ok())
+        .unwrap_or(0)
+}
+
+/// `(rank, size, address)` from torchrun's environment, if `WORLD_SIZE` is
+/// above 1.
+fn world() -> Result<Option<(usize, usize, String)>, String> {
+    let var = |name: &str| std::env::var(name).ok();
+    let Some(size) = var("WORLD_SIZE") else {
+        return Ok(None);
+    };
+    let size: usize = size
+        .parse()
+        .map_err(|_| format!("WORLD_SIZE: not a number: {size}"))?;
+    if size <= 1 {
+        return Ok(None);
+    }
+    let rank: usize = var("RANK")
+        .ok_or("WORLD_SIZE without RANK")?
+        .parse()
+        .map_err(|_| "RANK: not a number".to_string())?;
+    if rank >= size {
+        return Err(format!("RANK {rank} of WORLD_SIZE {size}"));
+    }
+    let address = format!(
+        "{}:{}",
+        var("MASTER_ADDR").unwrap_or_else(|| "127.0.0.1".into()),
+        var("MASTER_PORT").unwrap_or_else(|| "29500".into())
+    );
+    Ok(Some((rank, size, address)))
 }

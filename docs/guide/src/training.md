@@ -6,7 +6,7 @@
 kapel train recipes/sft-lora-gsm8k/train.toml
 ```
 
-Training needs Kapel built with `--features cuda` and an NVIDIA card for anything but toy models: the processor (`training.device = "cpu"`) computes the same numbers, slowly. Kapel trains on one card; several cards are not supported yet ([Long runs](resuming.md#several-cards)).
+Training needs Kapel built with `--features cuda` and an NVIDIA card for anything but toy models: the processor (`training.device = "cpu"`) computes the same numbers, slowly. Several ranks share a step's passes (`--ranks`, or processes started by torchrun), their numbers checked on one machine; NCCL, the speed of several cards, is not there yet ([Long runs](resuming.md#several-cards)).
 
 ## What it can do
 

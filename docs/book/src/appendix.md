@@ -55,6 +55,7 @@
 | Prompt lookup | Proposing the tokens that followed the last ones where they last appeared in the sequence: speculative decoding without a second model (`Draft::Ngram`) |
 | Proposer (draft) | What guesses the next tokens in speculative decoding: a smaller model, prompt lookup, or a multi-token layer (`Draft`) |
 | PTX | NVIDIA's intermediate assembly; the thread kernels are checked in as PTX |
+| Rank | One of the processes or threads of a run, each with its own backend, the passes of a step shared between them (`kapel_train::dist`, chapter 15) |
 | Recipe | A configuration of `kapel train` in `recipes/`, with the commands that prepare its data, its expected results and its cost, run again in CI for a few steps |
 | Reference | The `f64` backend that defines correct results |
 | RoPE | Rotary position embeddings: pairs of components rotated by an angle proportional to the position |
@@ -72,6 +73,7 @@
 | Throughput | Tokens generated per second for a batch of requests, compared with vLLM's `vllm bench throughput` |
 | Time to first token | From the arrival of a request at the server to its first token: what a user waits before the answer starts |
 | View | A tensor sharing another's storage with a different layout; on the GPU, the `View` struct passed to kernels |
+| ZeRO | Sharing the state of the trained parameters between ranks: each parameter's optimizer state (ZeRO 1), then its summed gradient (ZeRO 2), held by the rank that owns it (`training.shard`) |
 
 ## Where things are
 
@@ -120,6 +122,7 @@
 | LoRA and QLoRA, PEFT's files, merging | `crates/kapel-train/src/lora.rs`, `crates/kapel-cli/src/merge.rs`, `crates/kapel-train/tests/lora.rs`, `crates/kapel-train/examples/lora.rs`, `tools/train/peft_parity.py` |
 | DPO, GRPO, rewards, tasks | `crates/kapel-train/src/{preference,grpo,rewards}.rs`, `crates/kapel-train/src/trainer/post.rs`, `crates/kapel-train/tests/post.rs`, `crates/kapel-train/examples/tasks.rs` |
 | Budgets of operations, grids of runs, laws of scale | `crates/kapel-train/src/{flops,sweep,scaling}.rs`, `crates/kapel-cli/src/sweep.rs`, `crates/kapel-train/tests/flops.rs`, `recipes/scaling-smallem/`, `tools/train/smallem_tokens.py` |
+| Several ranks, collectives, shared states | `crates/kapel-train/src/dist.rs`, `crates/kapel-train/src/trainer/mod.rs`, `crates/kapel-train/tests/trainer.rs`, `crates/kapel-cli/tests/ranks.rs` |
 | Logs for TensorBoard and Weights & Biases | `crates/kapel-train/src/tensorboard.rs`, `tools/train/wandb_log.py` |
 | Post-training measured against TRL | `tools/train/{trl_sft,trl_dpo,gsm8k,ultrafeedback}.py`, `recipes/{sft-gsm8k,sft-lora-gsm8k,dpo-ultrafeedback,grpo-gsm8k}/` |
 | Exporting a run for the Hub | `crates/kapel-train/src/export.rs`, `crates/kapel-cli/src/export.rs`, `crates/kapel-cli/tests/export.rs` |

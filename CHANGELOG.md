@@ -338,6 +338,15 @@ changelog says how.
   bits of a run without it in `f32`. Llama 3.2 3B trains with all its weights
   on an RTX 3090.
 - `kapel-cpu`: AdamW reads a bf16 gradient in place, piece by piece.
+- Several ranks: `kapel train --ranks N` (threads of one process) or processes
+  started as torchrun starts them (`RANK`, `WORLD_SIZE`, `MASTER_ADDR`,
+  `MASTER_PORT`, `LOCAL_RANK`), joined by TCP (`kapel_train::dist`: every
+  collective one exchange, sums in the order of the ranks); data parallelism,
+  `training.shard = "optimizer"` (ZeRO 1) and `"gradients"` (ZeRO 2), the
+  optimizer's state gathered into one checkpoint any number of ranks resumes
+  from; a rank that stops stops the others. Four ranks compute the bits of
+  one rank that accumulates their passes.
+- `kapel_hub::safetensors::to_bytes`: a safetensors image in memory.
 
 ### Changed
 

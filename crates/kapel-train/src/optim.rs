@@ -1057,7 +1057,9 @@ impl Optimizer {
 }
 
 /// The norm of all the gradients together, `√Σ g²`, read back from the
-/// device: what clipping compares with its bound.
+/// device: what clipping compares with its bound. The sums of squares of
+/// the parameters ([`norm_parts`]) are added in `f32`, in order
+/// ([`norm_of_parts`]).
 ///
 /// # Errors
 ///
@@ -1067,8 +1069,22 @@ pub fn global_norm<B: Compute>(
     params: &Parameters,
     grads: &[(String, Grad)],
 ) -> Result<f64> {
-    use kapel_ops::Sum;
-    let mut total: Option<Tensor> = None;
+    Ok(norm_of_parts(&norm_parts(backend, params, grads)?))
+}
+
+/// The sum of squares of each gradient, `Σ g²` in `f32` on the device,
+/// read back together.
+///
+/// # Errors
+///
+/// Those of the backend.
+pub fn norm_parts<B: Compute>(
+    backend: &B,
+    params: &Parameters,
+    grads: &[(String, Grad)],
+) -> Result<Vec<f32>> {
+    use kapel_ops::{Concat, Sum};
+    let mut parts = Vec::with_capacity(grads.len());
     for (name, grad) in grads {
         let values = match grad {
             // Repeated rows count as many times as they are summed: the
@@ -1096,14 +1112,26 @@ pub fn global_norm<B: Compute>(
             },
             &[&square],
         )?;
-        let part = part.reshape(&[1])?;
-        total = Some(match total {
-            None => part,
-            Some(t) => binary(backend, BinaryKind::Add, &t, &part)?,
-        });
+        parts.push(part.reshape(&[1])?);
     }
-    match total {
-        None => Ok(0.0),
-        Some(t) => Ok(backend.download(&t)?.to_f64_vec()?[0].sqrt()),
+    if parts.is_empty() {
+        return Ok(Vec::new());
     }
+    let refs: Vec<&Tensor> = parts.iter().collect();
+    let all = backend.forward(&Concat { dim: 0 }, &refs)?;
+    Ok(backend
+        .download(&all)?
+        .to_f64_vec()?
+        .into_iter()
+        .map(|x| x as f32)
+        .collect())
+}
+
+/// `√` of the sum of `parts`, added in `f32` in their order.
+pub fn norm_of_parts(parts: &[f32]) -> f64 {
+    let mut total: Option<f32> = None;
+    for &p in parts {
+        total = Some(total.map_or(p, |t| t + p));
+    }
+    total.map_or(0.0, |t| f64::from(t).sqrt())
 }

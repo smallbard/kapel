@@ -36,6 +36,7 @@ use serde_json::{Value, json};
 use crate::checkpoint::{self, Checkpoint, State, Writer};
 use crate::config::{TrainConfig, matches};
 use crate::data::{self, Loader, Prefetched, Source};
+use crate::dist::Collective;
 use crate::flops;
 use crate::lora::{self, Projection};
 use crate::model::{Batch, Decoder, Options, Parameter, Parameters, init};
@@ -43,6 +44,7 @@ use crate::optim::{Optimizer, OptimizerState, global_norm};
 use crate::schedule::Schedule;
 use crate::tape::{Compute, Grad, Tape};
 use offload::Offload;
+use std::sync::Arc;
 
 /// What can stop a run.
 #[derive(Debug)]
@@ -67,6 +69,7 @@ macro_rules! from {
 }
 
 from!(
+    crate::dist::DistError,
     kapel_core::Error,
     crate::config::ConfigError,
     crate::data::DataError,
@@ -222,8 +225,88 @@ fn start(config: &TrainConfig, model_config: &Config) -> Result<(Parameters, Vec
 /// # Errors
 ///
 /// For a configuration, a file or a device that fails.
-#[allow(clippy::needless_return)]
 pub fn run(config: &TrainConfig, options: &RunOptions) -> Result<Summary> {
+    run_with(config, options, None)
+}
+
+/// Runs `ranks` ranks of the configuration's training, one thread each,
+/// each with its own backend on the device named (several on one card), its
+/// gradients summed with the others' ([`crate::dist::Threads`]): the
+/// summaries in the order of the ranks. A rank that fails stops the others.
+///
+/// # Errors
+///
+/// The first rank's error.
+pub fn run_threads(
+    config: &TrainConfig,
+    options: &RunOptions,
+    ranks: usize,
+) -> Result<Vec<Summary>> {
+    let handles: Vec<_> = crate::dist::Threads::group(ranks)
+        .into_iter()
+        .map(|g| {
+            let group: Arc<dyn Collective> = Arc::new(g);
+            let (config, options) = (config.clone(), options.clone());
+            std::thread::spawn(move || {
+                let result = run_with(&config, &options, Some(Arc::clone(&group)));
+                if result.is_err() {
+                    group.abort();
+                }
+                result
+            })
+        })
+        .collect();
+    let results: Vec<Result<Summary>> = handles
+        .into_iter()
+        .map(|h| {
+            h.join()
+                .unwrap_or_else(|_| Err(TrainError("a rank panicked".into())))
+        })
+        .collect();
+    // The failing rank's own error first, not another's "stopped".
+    if let Some(e) = results.iter().position(|r| {
+        r.as_ref()
+            .is_err_and(|e| !e.0.contains("another rank stopped"))
+    }) {
+        return Err(results
+            .into_iter()
+            .nth(e)
+            .expect("listed")
+            .expect_err("an error"));
+    }
+    results.into_iter().collect()
+}
+
+/// [`run`] as one rank of `group`, if any.
+///
+/// # Errors
+///
+/// As [`run`], and if another rank stops.
+#[allow(clippy::needless_return)]
+pub fn run_with(
+    config: &TrainConfig,
+    options: &RunOptions,
+    group: Option<Arc<dyn Collective>>,
+) -> Result<Summary> {
+    // The other ranks print nothing.
+    let quiet = RunOptions {
+        quiet: options.quiet || group.as_ref().is_some_and(|g| g.rank() > 0),
+        ..options.clone()
+    };
+    let options = &quiet;
+    if let Some(g) = &group {
+        let (passes, ranks) = (config.batch.accumulate(), g.size());
+        if !passes.is_multiple_of(ranks) {
+            return Err(TrainError(format!(
+                "batch: {passes} passes a step, not a multiple of the {ranks} ranks"
+            )));
+        }
+        if config.dpo.is_some() || config.grpo.is_some() || config.training.offload {
+            return Err(TrainError(
+                "several ranks train on tokens, without dpo, grpo or training.offload".into(),
+            ));
+        }
+    }
     let mut resolved = config.clone();
     // A model of the Hub, downloaded once.
     if !config.model.config.exists() && crate::config::is_hub_name(&config.model.config) {
@@ -238,7 +321,7 @@ pub fn run(config: &TrainConfig, options: &RunOptions) -> Result<Summary> {
     if device == "cpu" {
         if options.profile {
             let cpu = crate::profile::Profiled::new(kapel_cpu::Cpu::new(), || {});
-            let mut run = Run::new(config, options, cpu.clone(), Box::new(|| {}), None)?;
+            let mut run = Run::new(config, options, cpu.clone(), Box::new(|| {}), None, group)?;
             let reset = cpu.clone();
             run.after_first = Some(Box::new(move || reset.reset()));
             let summary = run.go();
@@ -251,6 +334,7 @@ pub fn run(config: &TrainConfig, options: &RunOptions) -> Result<Summary> {
             kapel_cpu::Cpu::new(),
             Box::new(|| {}),
             None,
+            group,
         )?
         .go();
     }
@@ -276,7 +360,14 @@ pub fn run(config: &TrainConfig, options: &RunOptions) -> Result<Summary> {
             let profiled = crate::profile::Profiled::new(cuda, move || {
                 s.synchronize().expect("the card");
             });
-            let mut run = Run::new(config, options, profiled.clone(), Box::new(|| {}), name)?;
+            let mut run = Run::new(
+                config,
+                options,
+                profiled.clone(),
+                Box::new(|| {}),
+                name,
+                group,
+            )?;
             let reset = profiled.clone();
             run.after_first = Some(Box::new(move || reset.reset()));
             run.peak_memory = Some(peak);
@@ -290,6 +381,7 @@ pub fn run(config: &TrainConfig, options: &RunOptions) -> Result<Summary> {
             cuda,
             Box::new(move || sync.synchronize().expect("the card")),
             name,
+            group,
         )?;
         run.peak_memory = Some(peak);
         return run.go();
@@ -366,7 +458,7 @@ struct Run<'a, B: Compute> {
     step: usize,
     tokens: u64,
     dir: PathBuf,
-    log: std::fs::File,
+    log: Option<std::fs::File>,
     writer: Writer,
     peak: Option<f64>,
     step_flops: u64,
@@ -384,6 +476,11 @@ struct Run<'a, B: Compute> {
     tokens_here: u64,
     /// The log for TensorBoard, if asked.
     events: Option<crate::tensorboard::EventWriter>,
+    /// The ranks of the run, if it has several.
+    group: Option<Arc<dyn Collective>>,
+    /// With a shared state (`training.shard`), the rank that owns each
+    /// trained parameter.
+    owners: Option<BTreeMap<String, usize>>,
 }
 
 impl<'a, B: Compute> Run<'a, B> {
@@ -393,7 +490,9 @@ impl<'a, B: Compute> Run<'a, B> {
         backend: B,
         synchronize: Box<dyn Fn()>,
         device_name: Option<String>,
+        group: Option<Arc<dyn Collective>>,
     ) -> Result<Self> {
+        let first = group.as_ref().is_none_or(|g| g.rank() == 0);
         let model_json = model_json(config)?;
         let model_config = Config::from_json(&model_json)?;
         let mut decoder = Decoder::new(model_config.clone())?;
@@ -479,6 +578,18 @@ impl<'a, B: Compute> Run<'a, B> {
         };
         let dir = config.checkpoint.dir.clone();
         std::fs::create_dir_all(&dir)?;
+        // With a shared state, the rank that owns each trained parameter.
+        let owners = match &group {
+            Some(g) if config.training.shard != "none" => {
+                let sizes: Vec<(String, usize)> = params
+                    .iter()
+                    .filter(|(_, p)| p.trainable)
+                    .map(|(n, p)| (n.to_string(), p.value.numel()))
+                    .collect();
+                Some(crate::dist::owners(&sizes, g.size()))
+            }
+            _ => None,
+        };
         let (mut step, mut tokens) = (0, 0);
         if options.resume
             && let Some((_, path)) = checkpoint::list(&dir).pop()
@@ -503,10 +614,19 @@ impl<'a, B: Compute> Run<'a, B> {
                     }
                 }
             }
-            // With offload, the optimizer's state stays on the processor.
+            // With offload, the optimizer's state stays on the processor;
+            // shared out, each rank keeps its parameters'.
+            let rank = group.as_ref().map_or(0, |g| g.rank());
             let tensors = saved
                 .optimizer
                 .iter()
+                .filter(|(n, _)| {
+                    owners.as_ref().is_none_or(|o| {
+                        n.split_once('.')
+                            .and_then(|(_, p)| o.get(p))
+                            .is_none_or(|&r| r == rank)
+                    })
+                })
                 .map(|(n, t)| {
                     Ok((
                         n.clone(),
@@ -572,10 +692,17 @@ impl<'a, B: Compute> Run<'a, B> {
             DType::F32
         };
         let params = params.to_mixed(&backend, master, config.dtype())?;
-        let log = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(dir.join("log.jsonl"))?;
+        // Rank 0 alone writes the log, the checkpoints and the summary.
+        let log = if first {
+            Some(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(dir.join("log.jsonl"))?,
+            )
+        } else {
+            None
+        };
         let dtype = config.dtype();
         let peak = config.log.peak_tflops.or_else(|| {
             device_name
@@ -613,7 +740,9 @@ impl<'a, B: Compute> Run<'a, B> {
             peak_memory: None,
             seconds: 0.0,
             tokens_here: 0,
-            events: if config.log.tensorboard {
+            group,
+            owners,
+            events: if config.log.tensorboard && first {
                 Some(crate::tensorboard::EventWriter::create(
                     &config.checkpoint.dir.join("tensorboard"),
                 )?)
@@ -639,7 +768,11 @@ impl<'a, B: Compute> Run<'a, B> {
         let mut sum = Summed::default();
         // The tokens and operations of joined batches, which vary.
         let mut joined = (0u64, 0u64);
-        for _ in 0..accumulate {
+        // With several ranks, each reads every batch of the step and
+        // computes its own: rank r the r-th run of `accumulate / ranks`.
+        let (rank, ranks) = self.ranks();
+        let mine = accumulate / ranks;
+        for i in 0..accumulate {
             let Objective::Tokens(train) = &mut self.objective else {
                 unreachable!("a step of tokens");
             };
@@ -648,13 +781,28 @@ impl<'a, B: Compute> Run<'a, B> {
                 joined.0 += tokens.ids.len() as u64;
                 joined.1 += self.joined_flops(&tokens);
             }
+            if i / mine != rank {
+                continue;
+            }
             let (l, grads) = self.pass(&tokens)?;
             losses.push(l);
+            // ZeRO 2: each pass's gradients summed at their owners alone.
+            let grads = if self.shards("gradients") {
+                self.to_owners(grads)?
+            } else {
+                grads
+            };
             self.accumulate(&mut sum, grads)?;
         }
-        let mut values = Vec::with_capacity(losses.len());
+        let mut values = Vec::with_capacity(accumulate);
         for l in &losses {
             values.push(self.backend.download(l)?.to_f64_vec()?[0]);
+        }
+        if let Some(g) = &self.group {
+            values = g.all_gather_f64(&values)?;
+            if !self.shards("gradients") {
+                self.reduce(&mut sum)?;
+            }
         }
         Ok(StepOutput {
             grads: sum.0.into_iter().collect(),
@@ -672,6 +820,153 @@ impl<'a, B: Compute> Run<'a, B> {
             },
             metrics: serde_json::Map::new(),
         })
+    }
+
+    /// This rank and the number of ranks: `(0, 1)` alone.
+    fn ranks(&self) -> (usize, usize) {
+        self.group.as_ref().map_or((0, 1), |g| (g.rank(), g.size()))
+    }
+
+    /// Whether this rank writes the run's files: the first, or the only.
+    fn first(&self) -> bool {
+        self.ranks().0 == 0
+    }
+
+    /// The sums of the gradients of every rank, on every rank: each
+    /// gradient brought to the host, summed in the order of the ranks
+    /// ([`Collective::all_reduce_sum`]), sent back in `f32`.
+    fn reduce(&self, sum: &mut Summed) -> Result<()> {
+        let Some(group) = &self.group else {
+            return Ok(());
+        };
+        for (name, grad) in sum.0.iter_mut() {
+            let shape = self
+                .params
+                .get(name)
+                .expect("a parameter")
+                .value
+                .shape()
+                .to_vec();
+            let dense = std::mem::replace(grad, Grad::Dense(Tensor::zeros(DType::F32, &[0])?))
+                .dense(&self.backend, &shape)?;
+            let host = self.backend.download(&dense)?;
+            let mut values: Vec<f32> = if host.dtype() == DType::F32 && host.is_contiguous() {
+                host.to_vec::<f32>()?
+            } else {
+                host.to_f64_vec()?.into_iter().map(|x| x as f32).collect()
+            };
+            group.all_reduce_sum(&mut values)?;
+            *grad = Grad::Dense(self.backend.upload(&Tensor::from_slice(&values, &shape)?)?);
+        }
+        Ok(())
+    }
+
+    /// Whether the state is shared out as far as `what` (`training.shard`):
+    /// `"optimizer"` holds with `"gradients"` too.
+    fn shards(&self, what: &str) -> bool {
+        self.owners.is_some()
+            && match what {
+                "optimizer" => true,
+                _ => self.config.training.shard == what,
+            }
+    }
+
+    /// A pass's gradients summed over the ranks, kept by the rank that owns
+    /// each parameter only (ZeRO 2's reduce-scatter), in the order of the
+    /// ranks.
+    fn to_owners(&self, mut grads: Vec<(String, Grad)>) -> Result<Vec<(String, Grad)>> {
+        let (Some(group), Some(owners)) = (&self.group, &self.owners) else {
+            return Ok(grads);
+        };
+        grads.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut mine = Vec::new();
+        for (name, grad) in grads {
+            let shape = self
+                .params
+                .get(&name)
+                .expect("a parameter")
+                .value
+                .shape()
+                .to_vec();
+            let dense = grad.dense(&self.backend, &shape)?;
+            let host = self.backend.download(&dense)?;
+            let mut values: Vec<f32> = host.to_f64_vec()?.into_iter().map(|x| x as f32).collect();
+            // Every rank gives its values; the owner adds them.
+            let bytes: Vec<u8> = values.iter().flat_map(|x| x.to_le_bytes()).collect();
+            let all = group.exchange(&bytes)?;
+            if owners.get(&name) != Some(&group.rank()) {
+                continue;
+            }
+            for (k, bytes) in all.iter().enumerate() {
+                for (v, b) in values.iter_mut().zip(bytes.as_chunks::<4>().0) {
+                    let x = f32::from_le_bytes(*b);
+                    *v = if k == 0 { x } else { *v + x };
+                }
+            }
+            let summed = self.backend.upload(&Tensor::from_slice(&values, &shape)?)?;
+            mine.push((name, Grad::Dense(summed)));
+        }
+        Ok(mine)
+    }
+
+    /// The norm of the gradients that each rank owns: each rank's sums of
+    /// squares ([`crate::optim::norm_parts`]) gathered and added in the
+    /// order of the parameters' names, as [`global_norm`] adds them.
+    fn shared_norm(&self, grads: &[(String, Grad)]) -> Result<f64> {
+        let Some(group) = &self.group else {
+            return Ok(global_norm(&self.backend, &self.params, grads)?);
+        };
+        let parts = crate::optim::norm_parts(&self.backend, &self.params, grads)?;
+        let mut mine = Vec::new();
+        for ((name, _), part) in grads.iter().zip(&parts) {
+            mine.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            mine.extend_from_slice(name.as_bytes());
+            mine.extend_from_slice(&part.to_le_bytes());
+        }
+        let mut all: Vec<(String, f32)> = Vec::new();
+        for bytes in group.exchange(&mine)? {
+            let mut at = 0;
+            while at < bytes.len() {
+                let n = u32::from_le_bytes(bytes[at..at + 4].try_into().expect("4 bytes")) as usize;
+                let name = String::from_utf8_lossy(&bytes[at + 4..at + 4 + n]).into_owned();
+                let part =
+                    f32::from_le_bytes(bytes[at + 4 + n..at + 8 + n].try_into().expect("4 bytes"));
+                all.push((name, part));
+                at += 8 + n;
+            }
+        }
+        all.sort_by(|a, b| a.0.cmp(&b.0));
+        let parts: Vec<f32> = all.into_iter().map(|(_, p)| p).collect();
+        Ok(crate::optim::norm_of_parts(&parts))
+    }
+
+    /// Each rank gives the values of the parameters it owns, after its
+    /// step, and writes the others' into its copies.
+    fn share_params(&mut self) -> Result<()> {
+        let (Some(group), Some(owners)) = (&self.group, &self.owners) else {
+            return Ok(());
+        };
+        let rank = group.rank();
+        let mut mine = Vec::new();
+        for (name, p) in self.params.iter() {
+            if owners.get(name) == Some(&rank) {
+                mine.push((name.to_string(), self.backend.download(&p.value)?));
+            }
+        }
+        let all = group.exchange(&crate::dist::pack(&mine)?)?;
+        for (r, bytes) in all.into_iter().enumerate() {
+            if r == rank {
+                continue;
+            }
+            for (name, value) in crate::dist::unpack(bytes)? {
+                let p = self
+                    .params
+                    .get_mut(&name)
+                    .ok_or_else(|| TrainError(format!("rank {r} gave {name}, not a parameter")))?;
+                self.backend.copy_from_host(&mut p.value, &value)?;
+            }
+        }
+        Ok(())
     }
 
     /// Whether the batches are joined ([`data::Pack::Joined`]): one row of
@@ -877,11 +1172,24 @@ impl<'a, B: Compute> Run<'a, B> {
             .map(|(n, p)| Ok((n.to_string(), self.saved(self.value(n, p))?)))
             .collect::<Result<_>>()?;
         let state = self.optimizer.state();
-        let optimizer = state
+        let mut optimizer: BTreeMap<String, Tensor> = state
             .tensors
             .iter()
             .map(|(n, t)| Ok((n.clone(), self.saved(t)?)))
             .collect::<Result<_>>()?;
+        // Shared out, rank 0 gathers every rank's part: the checkpoint is
+        // that of one rank, which any number of ranks reads.
+        if let (Some(group), Some(_)) = (&self.group, &self.owners) {
+            let mine: Vec<(String, Tensor)> = optimizer
+                .iter()
+                .map(|(n, t)| (n.clone(), t.clone()))
+                .collect();
+            if let Some(all) = group.gather(&crate::dist::pack(&mine)?)? {
+                for bytes in all.into_iter().skip(1) {
+                    optimizer.extend(crate::dist::unpack(bytes)?);
+                }
+            }
+        }
         // The optimizer's own handles only, during the next steps.
         let steps = state.steps;
         drop(state);
@@ -932,7 +1240,9 @@ impl<'a, B: Compute> Run<'a, B> {
     }
 
     fn record(&mut self, line: Value) -> Result<()> {
-        writeln!(self.log, "{line}")?;
+        if let Some(log) = &mut self.log {
+            writeln!(log, "{line}")?;
+        }
         if let Some(events) = &mut self.events {
             events.line(&line)?;
         }
@@ -971,6 +1281,7 @@ impl<'a, B: Compute> Run<'a, B> {
             // norm computed there, as the card would.
             let norm = match &self.offload {
                 Some(o) if c.batch.accumulate() > 1 => global_norm(&o.cpu, &o.params, &grads)?,
+                _ if self.shards("gradients") => self.shared_norm(&grads)?,
                 _ => global_norm(&self.backend, &self.params, &grads)?,
             } * scale;
             let clip = c.training.clip;
@@ -979,7 +1290,9 @@ impl<'a, B: Compute> Run<'a, B> {
             } else {
                 1.0
             };
-            if !grads.is_empty() {
+            // With a shared state, every rank takes part, owning gradients or
+            // not.
+            if !grads.is_empty() || self.owners.is_some() {
                 match &mut self.offload {
                     Some(o) => o.step(
                         &mut self.optimizer,
@@ -988,14 +1301,32 @@ impl<'a, B: Compute> Run<'a, B> {
                         grads,
                         scale * factor,
                     )?,
-                    None => {
-                        self.optimizer.step(
-                            &self.backend,
-                            &mut self.params,
-                            grads,
-                            scale * factor,
-                        )?;
-                    }
+                    None => match &self.owners {
+                        // Each rank steps the parameters it owns, then gives
+                        // their values to the others.
+                        Some(owners) => {
+                            let rank = self.ranks().0;
+                            let mine: Vec<(String, Grad)> = grads
+                                .into_iter()
+                                .filter(|(n, _)| owners.get(n) == Some(&rank))
+                                .collect();
+                            self.optimizer.step(
+                                &self.backend,
+                                &mut self.params,
+                                mine,
+                                scale * factor,
+                            )?;
+                            self.share_params()?;
+                        }
+                        None => {
+                            self.optimizer.step(
+                                &self.backend,
+                                &mut self.params,
+                                grads,
+                                scale * factor,
+                            )?;
+                        }
+                    },
                 }
             }
             loss = out.loss;
@@ -1009,7 +1340,10 @@ impl<'a, B: Compute> Run<'a, B> {
             self.tokens += out.tokens;
             self.seconds += seconds;
             self.tokens_here += out.tokens;
-            let mfu = self.peak.map(|p| out.flops as f64 / seconds / (p * 1e12));
+            // The peak of every rank's card.
+            let mfu = self
+                .peak
+                .map(|p| out.flops as f64 / seconds / (p * 1e12 * self.ranks().1 as f64));
             let mut line = json!({
                 "step": self.step,
                 "loss": loss,
@@ -1085,7 +1419,9 @@ impl<'a, B: Compute> Run<'a, B> {
             }
             if (c.checkpoint.every > 0 && self.step.is_multiple_of(c.checkpoint.every)) || last {
                 let checkpoint = self.checkpoint()?;
-                self.writer.write(checkpoint, &self.dir)?;
+                if self.first() {
+                    self.writer.write(checkpoint, &self.dir)?;
+                }
                 if self.offload.is_some() {
                     // It holds the processor's tensors, which the next step
                     // writes in place.
@@ -1101,7 +1437,7 @@ impl<'a, B: Compute> Run<'a, B> {
         }
         self.writer.finish()?;
         // A run resumed at its end did nothing: its summary stays.
-        if self.step == steps && self.tokens_here > 0 {
+        if self.step == steps && self.tokens_here > 0 && self.first() {
             self.write_summary(loss, val_loss)?;
         }
         // With offload, the trained values are already in host memory: moved,

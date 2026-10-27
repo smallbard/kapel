@@ -341,6 +341,10 @@ fn default_name() -> String {
     "default".into()
 }
 
+fn shard_none() -> String {
+    "none".into()
+}
+
 fn adamw() -> String {
     "adamw".into()
 }
@@ -460,6 +464,12 @@ pub struct TrainingConfig {
     /// the optimizer steps on the processor (ZeRO-Offload).
     #[serde(default)]
     pub offload: bool,
+    /// With several ranks, what each holds of the trained parameters' state
+    /// alone: `"none"` (every rank all of it), `"optimizer"` (the optimizer's
+    /// state, ZeRO 1) or `"gradients"` (the optimizer's state and the summed
+    /// gradients, ZeRO 2). Each parameter has one rank that owns it.
+    #[serde(default = "shard_none")]
+    pub shard: String,
     /// The rows of logits the loss forms at once.
     #[serde(default = "chunk_default")]
     pub chunk: usize,
@@ -498,6 +508,7 @@ impl Default for TrainingConfig {
             clip: 1.0,
             checkpoint_activations: false,
             offload: false,
+            shard: shard_none(),
             chunk: chunk_default(),
             cache_gib: cache_gib_default(),
             budget: None,
@@ -727,6 +738,15 @@ impl TrainConfig {
                     b.rows
                 ));
             }
+        }
+        if !matches!(
+            self.training.shard.as_str(),
+            "none" | "optimizer" | "gradients"
+        ) {
+            return fail(format!(
+                "training.shard: \"none\", \"optimizer\" or \"gradients\", got {:?}",
+                self.training.shard
+            ));
         }
         if self.training.offload {
             if !matches!(self.optimizer.kind.as_str(), "adamw" | "adamw8bit") {

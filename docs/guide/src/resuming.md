@@ -29,7 +29,16 @@ The terminal and `log.jsonl` give the speed of each step, in tokens per second. 
 
 ## Several cards
 
-Kapel trains on one card. Data, tensor and pipeline parallelism over several cards, and over several machines, are not done yet. Until they are, on one card:
+Several ranks share the passes of a step, their gradients summed, each with the same weights after it:
+
+```sh
+kapel train train.toml --ranks 2                      # two ranks in one process
+torchrun --nproc-per-node 8 --no-python kapel train train.toml   # one process a rank
+```
+
+`kapel train` reads torchrun's `RANK`, `WORLD_SIZE`, `MASTER_ADDR`, `MASTER_PORT` and `LOCAL_RANK` (the card, with `training.device = "cuda"`). The passes of a step (`batch.tokens` over `rows` × `length`) must be a multiple of the ranks. `training.shard = "optimizer"` keeps each parameter's optimizer state on one rank (ZeRO 1), `"gradients"` its summed gradient too (ZeRO 2); a checkpoint is the same whatever the number of ranks, and resumes with any. Rank 0 alone writes the log and the checkpoints. The ranks talk through the processor's memory and TCP for now, not NCCL: their numbers are right, their speed is not that of several cards yet; tensor parallelism and FSDP are not done.
+
+On one card:
 
 - With AdamW, which keeps 16 bytes a parameter (the weights, their gradients and two moments in `f32`), a model of up to about 0.8 billion parameters trains with all its weights on 24 GB: Qwen 3 0.6B (0.75 billion with its table) takes 21.3 GiB in the recipe `sft-gsm8k`. Beyond, Adafactor keeps almost nothing for its moments: Llama 3.2 1B's architecture (1.24 billion) trains with it in 16.1 GiB, with `training.checkpoint_activations = true` (the recipe `llama-1b`).
 - `optimizer.kind = "adamw8bit"` keeps AdamW's moments in 8 bits: 2 bytes a parameter for them instead of 8. Qwen 3 1.7B trains with all its weights on 24 GB with it, which AdamW cannot.

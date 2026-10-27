@@ -67,6 +67,7 @@ Every field of the TOML file `kapel train` reads, by table. Relative paths are t
 | `dtype` | `"bf16"` | The computation: `"bf16"`, `"f16"` or `"f32"`; weights and optimizer stay in `f32` |
 | `clip` | 1 | The norm the gradient is clipped to; 0 for none |
 | `checkpoint_activations` | false | Recompute each block in the backward pass: less memory |
+| `shard` | `"none"` | With several ranks: `"optimizer"` keeps each parameter's optimizer state on one rank (ZeRO 1), `"gradients"` its summed gradient too (ZeRO 2) |
 | `offload` | false | The trained parameters in `f32`, their gradients and the optimizer's state in the processor's memory, the card holding the parameters in the computation's type only: larger models, slower steps |
 | `chunk` | 4096 | Rows of logits the loss forms at once |
 | `cache_gib` | 4 | Memory for the keys and values when the model writes answers (GRPO, tasks) |

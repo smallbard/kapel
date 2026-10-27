@@ -267,6 +267,29 @@ pub fn save(
     metadata: &BTreeMap<String, String>,
 ) -> Result<()> {
     let path = path.as_ref();
+    let bytes = image(path, tensors, metadata)?;
+    // Through a temporary file renamed into place: the file replaced may be the
+    // one the tensors are mapped from.
+    crate::write_atomic(path, |file| file.write_all(&bytes))
+}
+
+/// [`save`]'s image in memory, which [`SafeTensors::from_bytes`] reads back.
+///
+/// # Errors
+///
+/// As [`save`], but for writing.
+pub fn to_bytes(
+    tensors: &[(&str, &Tensor)],
+    metadata: &BTreeMap<String, String>,
+) -> Result<Vec<u8>> {
+    image(Path::new("<memory>"), tensors, metadata)
+}
+
+fn image(
+    path: &Path,
+    tensors: &[(&str, &Tensor)],
+    metadata: &BTreeMap<String, String>,
+) -> Result<Vec<u8>> {
     let mut header = Map::new();
     if !metadata.is_empty() {
         header.insert(
@@ -312,13 +335,11 @@ pub fn save(
     while !json.len().is_multiple_of(8) {
         json.push(b' ');
     }
-    // Through a temporary file renamed into place: the file replaced may be the
-    // one the tensors are mapped from.
-    crate::write_atomic(path, |file| {
-        file.write_all(&(json.len() as u64).to_le_bytes())?;
-        file.write_all(&json)?;
-        file.write_all(&data)
-    })
+    let mut out = Vec::with_capacity(8 + json.len() + data.len());
+    out.extend_from_slice(&(json.len() as u64).to_le_bytes());
+    out.extend_from_slice(&json);
+    out.extend_from_slice(&data);
+    Ok(out)
 }
 
 #[cfg(test)]
