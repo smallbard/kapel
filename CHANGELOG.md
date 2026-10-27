@@ -346,6 +346,12 @@ changelog says how.
   optimizer's state gathered into one checkpoint any number of ranks resumes
   from; a rank that stops stops the others. Four ranks compute the bits of
   one rank that accumulates their passes.
+- `training.shard = "weights"` (FSDP): each weight held by one rank, fetched
+  by the others where they use it (`parallel::fetch`), its gradients summed
+  at its owner; the bits of one rank, a quarter of the weights a rank.
+- `kapel_train::parallel`: tensor parallelism (Megatron-LM's shares of the
+  heads and of the MLP, `enter` and `reduce` on the tape), the loss and the
+  gradients of the whole model.
 - `kapel_hub::safetensors::to_bytes`: a safetensors image in memory.
 
 ### Changed

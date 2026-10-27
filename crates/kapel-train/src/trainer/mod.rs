@@ -110,6 +110,9 @@ pub struct Summary {
     pub val_loss: Option<f64>,
     /// The parameters at the end, in host memory, `f32`.
     pub params: BTreeMap<String, Tensor>,
+    /// The bytes of the parameters this rank held at the end (with FSDP, the
+    /// weights it owns), and of its optimizer's state.
+    pub held: (usize, usize),
 }
 
 /// The `config.json` of the model: the file named, or the one of the
@@ -481,6 +484,9 @@ struct Run<'a, B: Compute> {
     /// With a shared state (`training.shard`), the rank that owns each
     /// trained parameter.
     owners: Option<BTreeMap<String, usize>>,
+    /// The model's values, all and trained, and those of its tables, counted
+    /// before FSDP shares them out.
+    counts: (usize, usize, usize),
 }
 
 impl<'a, B: Compute> Run<'a, B> {
@@ -691,7 +697,41 @@ impl<'a, B: Compute> Run<'a, B> {
         } else {
             DType::F32
         };
-        let params = params.to_mixed(&backend, master, config.dtype())?;
+        let mut params = params.to_mixed(&backend, master, config.dtype())?;
+        let counts = (
+            params.count_all(),
+            params.count(),
+            params
+                .iter()
+                .filter(|(n, _)| crate::model::is_table(n))
+                .map(|(_, p)| p.value.numel())
+                .sum(),
+        );
+        // FSDP: each rank keeps the weights it owns, an empty tensor for the
+        // others', and the decoder fetches them where it uses them.
+        if let (Some(g), Some(o)) = (&group, &owners)
+            && config.training.shard == "weights"
+        {
+            if !config.eval.tasks.is_empty() {
+                return Err(TrainError(
+                    "training.shard = \"weights\": not with eval.tasks".into(),
+                ));
+            }
+            let mut shapes = BTreeMap::new();
+            for (name, p) in params.iter_mut() {
+                if let Some(&r) = o.get(name) {
+                    shapes.insert(name.to_string(), p.value.shape().to_vec());
+                    if r != g.rank() {
+                        p.value = backend.upload(&Tensor::zeros(DType::F32, &[0])?)?;
+                    }
+                }
+            }
+            decoder = decoder.with_shards(crate::parallel::Shards {
+                group: crate::parallel::Group(Arc::clone(g)),
+                owners: Arc::new(o.clone()),
+                shapes: Arc::new(shapes),
+            })?;
+        }
         // Rank 0 alone writes the log, the checkpoints and the summary.
         let log = if first {
             Some(
@@ -742,6 +782,7 @@ impl<'a, B: Compute> Run<'a, B> {
             tokens_here: 0,
             group,
             owners,
+            counts,
             events: if config.log.tensorboard && first {
                 Some(crate::tensorboard::EventWriter::create(
                     &config.checkpoint.dir.join("tensorboard"),
@@ -786,8 +827,11 @@ impl<'a, B: Compute> Run<'a, B> {
             }
             let (l, grads) = self.pass(&tokens)?;
             losses.push(l);
-            // ZeRO 2: each pass's gradients summed at their owners alone.
-            let grads = if self.shards("gradients") {
+            // ZeRO 2: each pass's gradients summed at their owners alone;
+            // FSDP's fetches have summed them there already.
+            let grads = if self.shards("weights") {
+                self.owned(grads)
+            } else if self.shards("gradients") {
                 self.to_owners(grads)?
             } else {
                 grads
@@ -864,11 +908,55 @@ impl<'a, B: Compute> Run<'a, B> {
     /// Whether the state is shared out as far as `what` (`training.shard`):
     /// `"optimizer"` holds with `"gradients"` too.
     fn shards(&self, what: &str) -> bool {
-        self.owners.is_some()
-            && match what {
-                "optimizer" => true,
-                _ => self.config.training.shard == what,
+        let level = |s: &str| {
+            ["none", "optimizer", "gradients", "weights"]
+                .iter()
+                .position(|l| *l == s)
+        };
+        self.owners.is_some() && level(&self.config.training.shard) >= level(what)
+    }
+
+    /// The gradients of the parameters this rank owns.
+    fn owned(&self, grads: Vec<(String, Grad)>) -> Vec<(String, Grad)> {
+        let (Some(owners), rank) = (&self.owners, self.ranks().0) else {
+            return grads;
+        };
+        grads
+            .into_iter()
+            .filter(|(n, _)| owners.get(n).is_none_or(|&r| r == rank))
+            .collect()
+    }
+
+    /// With FSDP, every rank's weights, whole: rank 0 alone receives them
+    /// (`all` false) for a checkpoint, or every rank.
+    fn gather_weights(&self, all: bool) -> Result<Option<BTreeMap<String, Tensor>>> {
+        let (Some(group), Some(owners)) = (&self.group, &self.owners) else {
+            return Ok(None);
+        };
+        if !self.shards("weights") {
+            return Ok(None);
+        }
+        let rank = group.rank();
+        let mut mine = Vec::new();
+        for (name, p) in self.params.iter() {
+            if owners.get(name) == Some(&rank) {
+                mine.push((name.to_string(), self.host_copy(&p.value)?));
             }
+        }
+        let bytes = crate::dist::pack(&mine)?;
+        let parts = if all {
+            Some(group.exchange(&bytes)?)
+        } else {
+            group.gather(&bytes)?
+        };
+        let Some(parts) = parts else {
+            return Ok(None);
+        };
+        let mut out = BTreeMap::new();
+        for bytes in parts {
+            out.extend(crate::dist::unpack(bytes)?);
+        }
+        Ok(Some(out))
     }
 
     /// A pass's gradients summed over the ranks, kept by the rank that owns
@@ -1171,6 +1259,11 @@ impl<'a, B: Compute> Run<'a, B> {
             .filter(|(_, p)| adapter.is_none() || p.trainable)
             .map(|(n, p)| Ok((n.to_string(), self.saved(self.value(n, p))?)))
             .collect::<Result<_>>()?;
+        // FSDP: rank 0 gathers the weights the others own.
+        let mut params: BTreeMap<String, Tensor> = params;
+        if let Some(whole) = self.gather_weights(false)? {
+            params.extend(whole);
+        }
         let state = self.optimizer.state();
         let mut optimizer: BTreeMap<String, Tensor> = state
             .tensors
@@ -1212,13 +1305,7 @@ impl<'a, B: Compute> Run<'a, B> {
     /// `summary.json` in the run's directory, once the last step is done:
     /// what a grid of runs ([`crate::sweep`]) reads of each.
     fn write_summary(&self, loss: f64, val_loss: Option<f64>) -> Result<()> {
-        let embedding: usize = self
-            .params
-            .iter()
-            .filter(|(n, _)| crate::model::is_table(n))
-            .map(|(_, p)| p.value.numel())
-            .sum();
-        let all = self.params.count_all();
+        let (all, _, embedding) = self.counts;
         let tokens_objective = matches!(self.objective, Objective::Tokens(_));
         let summary = json!({
             "steps": self.step,
@@ -1227,7 +1314,7 @@ impl<'a, B: Compute> Run<'a, B> {
             "step_flops": tokens_objective.then_some(self.step_flops),
             "parameters": all,
             "non_embedding_parameters": all - embedding,
-            "trainable_parameters": self.params.count(),
+            "trainable_parameters": self.counts.1,
             "loss": loss,
             "val_loss": val_loss,
             "seconds": self.seconds,
@@ -1260,10 +1347,7 @@ impl<'a, B: Compute> Run<'a, B> {
         if !self.options.quiet && self.step == 0 {
             eprintln!(
                 "train: {} parameters, {} tokens a step ({accumulate} × {} × {}), {steps} steps",
-                self.params.count(),
-                step_tokens,
-                c.batch.rows,
-                c.batch.length
+                self.counts.1, step_tokens, c.batch.rows, c.batch.length
             );
         }
         while self.step < steps {
@@ -1316,7 +1400,9 @@ impl<'a, B: Compute> Run<'a, B> {
                                 mine,
                                 scale * factor,
                             )?;
-                            self.share_params()?;
+                            if !self.shards("weights") {
+                                self.share_params()?;
+                            }
                         }
                         None => {
                             self.optimizer.step(
@@ -1440,10 +1526,17 @@ impl<'a, B: Compute> Run<'a, B> {
         if self.step == steps && self.tokens_here > 0 && self.first() {
             self.write_summary(loss, val_loss)?;
         }
+        let bytes = |t: &Tensor| t.dtype().storage_bytes(t.numel()).unwrap_or(0);
+        let held = (
+            self.params.iter().map(|(_, p)| bytes(&p.value)).sum(),
+            self.optimizer.state().tensors.values().map(bytes).sum(),
+        );
+        // FSDP: every rank receives the weights the others own.
+        let whole = self.gather_weights(true)?;
         // With offload, the trained values are already in host memory: moved,
         // not copied.
         let mut master = self.offload.take().map(|o| o.params);
-        let params = self
+        let mut params: BTreeMap<String, Tensor> = self
             .params
             .iter()
             .map(|(n, p)| {
@@ -1454,11 +1547,13 @@ impl<'a, B: Compute> Run<'a, B> {
                 Ok((n.to_string(), value))
             })
             .collect::<Result<_>>()?;
+        params.extend(whole.unwrap_or_default());
         Ok(Summary {
             steps: self.step,
             loss,
             val_loss,
             params,
+            held,
         })
     }
 }

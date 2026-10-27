@@ -33,6 +33,7 @@ pub mod lora;
 pub mod loss;
 pub mod model;
 pub mod optim;
+pub mod parallel;
 pub mod preference;
 pub mod prepare;
 pub mod profile;

@@ -419,6 +419,20 @@ fn ranks_compute_the_weights_of_one_that_accumulates() {
     };
     let resumed = kapel_train::trainer::run_threads(&cut, &resume, 4).unwrap();
     assert_eq!(resumed[2].loss.to_bits(), one.loss.to_bits());
+    // Cut on four ranks, resumed on two: within f32's rounding.
+    let other = with("other");
+    kapel_train::trainer::run_threads(&other, &stop, 4).unwrap();
+    let on_two = kapel_train::trainer::run_threads(&other, &resume, 2).unwrap();
+    for (name, w) in &one.params {
+        for (a, b) in w
+            .to_f64_vec()
+            .unwrap()
+            .iter()
+            .zip(on_two[0].params[name].to_f64_vec().unwrap())
+        {
+            assert!((a - b).abs() <= 1e-5, "{name}: {a} and {b}");
+        }
+    }
     // Passes that the ranks cannot share are refused.
     let refused = kapel_train::trainer::run_threads(&with("three"), &QUIET, 3).unwrap_err();
     assert!(refused.0.contains("not a multiple"), "{refused}");
@@ -440,8 +454,28 @@ fn shared_states_compute_the_weights_of_one_rank() {
             c
         };
         let one = run(&with("one", "none"), &QUIET).unwrap();
-        for shard in ["optimizer", "gradients"] {
+        for shard in ["optimizer", "gradients", "weights"] {
             let four = kapel_train::trainer::run_threads(&with(shard, shard), &QUIET, 4).unwrap();
+            // Each rank holds about a quarter of the optimizer's state, and
+            // with FSDP of the weights: within the largest parameter.
+            let largest = one.params.values().map(|t| 4 * t.numel()).max().unwrap();
+            let state: usize = four.iter().map(|r| r.held.1).sum();
+            assert_eq!(state, one.held.1, "{optimizer} {shard}");
+            for rank in &four {
+                assert!(
+                    rank.held.1 <= one.held.1 / 4 + 2 * largest,
+                    "{optimizer} {shard}"
+                );
+                if shard == "weights" {
+                    assert!(
+                        rank.held.0 <= one.held.0 / 4 + largest,
+                        "{shard} {:?}",
+                        rank.held
+                    );
+                } else {
+                    assert_eq!(rank.held.0, one.held.0);
+                }
+            }
             for rank in &four {
                 assert_eq!(
                     rank.loss.to_bits(),
@@ -457,8 +491,9 @@ fn shared_states_compute_the_weights_of_one_rank() {
                 }
             }
         }
-        // Four ranks sharing their state, killed at step 3; one rank goes on.
-        let cut = with("cut", "gradients");
+        // Four ranks sharing their weights, killed at step 3; one rank goes
+        // on.
+        let cut = with("cut", "weights");
         let stop = RunOptions {
             stop_after: Some(3),
             ..QUIET

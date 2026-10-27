@@ -36,7 +36,7 @@ kapel train train.toml --ranks 2                      # two ranks in one process
 torchrun --nproc-per-node 8 --no-python kapel train train.toml   # one process a rank
 ```
 
-`kapel train` reads torchrun's `RANK`, `WORLD_SIZE`, `MASTER_ADDR`, `MASTER_PORT` and `LOCAL_RANK` (the card, with `training.device = "cuda"`). The passes of a step (`batch.tokens` over `rows` × `length`) must be a multiple of the ranks. `training.shard = "optimizer"` keeps each parameter's optimizer state on one rank (ZeRO 1), `"gradients"` its summed gradient too (ZeRO 2); a checkpoint is the same whatever the number of ranks, and resumes with any. Rank 0 alone writes the log and the checkpoints. The ranks talk through the processor's memory and TCP for now, not NCCL: their numbers are right, their speed is not that of several cards yet; tensor parallelism and FSDP are not done.
+`kapel train` reads torchrun's `RANK`, `WORLD_SIZE`, `MASTER_ADDR`, `MASTER_PORT` and `LOCAL_RANK` (the card, with `training.device = "cuda"`). The passes of a step (`batch.tokens` over `rows` × `length`) must be a multiple of the ranks. `training.shard = "optimizer"` keeps each parameter's optimizer state on one rank (ZeRO 1), `"gradients"` its summed gradient too (ZeRO 2), `"weights"` its weight too, fetched by the other ranks where they use it (FSDP; with `training.checkpoint_activations`, a block's weights are whole only while it runs); a checkpoint is the same whatever the number of ranks, and resumes with any. Rank 0 alone writes the log and the checkpoints. The ranks talk through the processor's memory and TCP for now, not NCCL: their numbers are right, their speed is not that of several cards yet; tensor parallelism is checked but not used by `kapel train` yet.
 
 On one card:
 

@@ -466,8 +466,9 @@ pub struct TrainingConfig {
     pub offload: bool,
     /// With several ranks, what each holds of the trained parameters' state
     /// alone: `"none"` (every rank all of it), `"optimizer"` (the optimizer's
-    /// state, ZeRO 1) or `"gradients"` (the optimizer's state and the summed
-    /// gradients, ZeRO 2). Each parameter has one rank that owns it.
+    /// state, ZeRO 1), `"gradients"` (the optimizer's state and the summed
+    /// gradients, ZeRO 2) or `"weights"` (the weights too, fetched where
+    /// they are used: FSDP). Each parameter has one rank that owns it.
     #[serde(default = "shard_none")]
     pub shard: String,
     /// The rows of logits the loss forms at once.
@@ -741,10 +742,10 @@ impl TrainConfig {
         }
         if !matches!(
             self.training.shard.as_str(),
-            "none" | "optimizer" | "gradients"
+            "none" | "optimizer" | "gradients" | "weights"
         ) {
             return fail(format!(
-                "training.shard: \"none\", \"optimizer\" or \"gradients\", got {:?}",
+                "training.shard: \"none\", \"optimizer\", \"gradients\" or \"weights\", got {:?}",
                 self.training.shard
             ));
         }

@@ -308,6 +308,10 @@ pub struct Decoder {
     config: Rc<Config>,
     /// The scale of the LoRA adapters' products, if any.
     lora: Option<f64>,
+    /// The ranks its blocks are shared out between ([`crate::parallel`]).
+    tensor: Option<crate::parallel::Group>,
+    /// Its trained parameters held by one rank each (FSDP).
+    shards: Option<crate::parallel::Shards>,
 }
 
 /// What the blocks share in one pass.
@@ -324,6 +328,8 @@ struct Pass {
     lora: Option<f64>,
     /// The type of the computation.
     dtype: DType,
+    /// The ranks of tensor parallelism.
+    tensor: Option<crate::parallel::Group>,
 }
 
 impl Decoder {
@@ -353,7 +359,59 @@ impl Decoder {
         Ok(Self {
             config: Rc::new(config),
             lora: None,
+            tensor: None,
+            shards: None,
         })
+    }
+
+    /// The decoder whose trained parameters are held by one rank each,
+    /// fetched where they are used ([`crate::parallel::Shards`]).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidArgument`] with LoRA's adapters.
+    pub fn with_shards(mut self, shards: crate::parallel::Shards) -> Result<Self> {
+        if self.lora.is_some() {
+            return Err(Error::InvalidArgument {
+                op: "sharded weights",
+                message: "not with LoRA's adapters".into(),
+            });
+        }
+        self.shards = Some(shards);
+        Ok(self)
+    }
+
+    /// The parameter `name` whole: fetched from its rank if shared out.
+    fn whole<B: Compute>(&self, leaves: &Leaves<B>, name: &str) -> Result<Option<Var<B>>> {
+        match (leaves.optional(name), &self.shards) {
+            (Some(v), Some(s)) => s.fetch(name, v).map(Some),
+            (v, _) => Ok(v.cloned()),
+        }
+    }
+
+    /// The decoder of one rank of tensor parallelism: its configuration is
+    /// [`crate::parallel::local_config`]'s, its parameters
+    /// [`crate::parallel::shard`]'s, and `group` the ranks.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidArgument`] with LoRA's adapters, or blocks other than
+    /// Llama's.
+    pub fn with_tensor_parallel(mut self, group: crate::parallel::Group) -> Result<Self> {
+        if self.lora.is_some() {
+            return Err(Error::InvalidArgument {
+                op: "tensor parallelism",
+                message: "not with LoRA's adapters".into(),
+            });
+        }
+        if !matches!(self.config.block, Block::Sequential | Block::Sandwich) {
+            return Err(Error::InvalidArgument {
+                op: "tensor parallelism",
+                message: format!("blocks of {:?} are not shared out", self.config.block),
+            });
+        }
+        self.tensor = Some(group);
+        Ok(self)
     }
 
     /// The decoder that adds the products of the LoRA adapters it finds
@@ -457,7 +515,10 @@ impl Decoder {
         let ids = upload(batch.ids, &[n])?;
         let positions = positions(n, length, batch.segments);
         let dtype = options.dtype;
-        let embed = leaves.get(self.embed_name())?;
+        leaves.get(self.embed_name())?;
+        let embed = &self
+            .whole(leaves, self.embed_name())?
+            .expect("checked above");
         // The rows of the table, gathered from the parameter itself: its
         // gradient stays rows.
         let mut x = embed.gather_rows(&ids)?.cast(dtype)?;
@@ -476,7 +537,10 @@ impl Decoder {
             x = x.scale(rounded(dtype, scale))?;
         }
         if c.block == Block::Gpt2 {
-            let wpe = leaves.get("transformer.wpe.weight")?;
+            leaves.get("transformer.wpe.weight")?;
+            let wpe = self
+                .whole(leaves, "transformer.wpe.weight")?
+                .expect("checked above");
             x = x.add(&wpe.gather_rows(&upload(&positions, &[n])?)?.cast(dtype)?)?;
         }
         let pass = Rc::new(Pass {
@@ -496,6 +560,7 @@ impl Decoder {
                 .transpose()?,
             lora: self.lora,
             dtype,
+            tensor: self.tensor.clone(),
         });
         let prefix = match c.block {
             Block::Gpt2 => "transformer.h",
@@ -509,14 +574,32 @@ impl Decoder {
                 .keys()
                 .filter_map(|k| k.strip_prefix(&p).map(str::to_string))
                 .collect();
+            // Shared out, the leaves themselves: each block fetches its
+            // weights where it runs, and lets them go after.
+            let shards = self.shards.clone();
             let weights: Vec<Var<B>> = names
                 .iter()
-                .map(|k| computed(leaves.get(&format!("{p}{k}"))?, dtype))
+                .map(|k| {
+                    let v = leaves.get(&format!("{p}{k}"))?;
+                    if shards.is_some() {
+                        Ok(v.clone())
+                    } else {
+                        computed(v, dtype)
+                    }
+                })
                 .collect::<Result<_>>()?;
             let config = Rc::clone(&self.config);
             let pass = Rc::clone(&pass);
             let run = move |_: &Tape<B>, xs: &[Var<B>]| -> Result<Var<B>> {
-                let found = |name: &str| names.iter().position(|k| k == name).map(|i| &xs[i + 1]);
+                let fetched: Vec<Var<B>> = match &shards {
+                    Some(s) => names
+                        .iter()
+                        .zip(&xs[1..])
+                        .map(|(k, v)| computed(&s.fetch(&format!("{p}{k}"), v)?, dtype))
+                        .collect::<Result<_>>()?,
+                    None => xs[1..].to_vec(),
+                };
+                let found = |name: &str| names.iter().position(|k| k == name).map(|i| &fetched[i]);
                 block(&config, layer, &xs[0], &found, &pass)
             };
             let mut inputs = vec![&x];
@@ -533,7 +616,7 @@ impl Decoder {
             _ => "model.norm",
         };
         let weight = |name: &str| -> Result<Option<Var<B>>> {
-            leaves.optional(name).map(|w| w.cast(dtype)).transpose()
+            self.whole(leaves, name)?.map(|w| w.cast(dtype)).transpose()
         };
         let h = norm(
             c,
@@ -541,9 +624,9 @@ impl Decoder {
             weight(&format!("{final_norm}.weight"))?.as_ref(),
             weight(&format!("{final_norm}.bias"))?.as_ref(),
         )?;
-        let head = match leaves.optional("lm_head.weight") {
+        let head = match self.whole(leaves, "lm_head.weight")? {
             Some(w) if !c.tie_embeddings => w,
-            _ => embed,
+            _ => embed.clone(),
         };
         Ok((h, head.cast(dtype)?))
     }
@@ -744,6 +827,11 @@ fn block<'a, B: Compute + 'a>(
             } else {
                 None
             };
+            // Tensor parallelism: the input as it is, its gradient summed.
+            let h = match &pass.tensor {
+                Some(g) => crate::parallel::enter(&h, g)?,
+                None => h,
+            };
             let qkv = project(&h, &names, bias.as_ref())?;
             let (wq, wk) = (hq * d, hkv * d);
             let split = |start: usize, h: usize, norm_name: Option<&str>| -> Result<Var<B>> {
@@ -779,7 +867,21 @@ fn block<'a, B: Compute + 'a>(
             } else {
                 None
             };
-            let mut a = project(&merged(y)?, &["self_attn.o_proj"], bias)?;
+            // Tensor parallelism: the ranks' products summed, the bias added
+            // once after.
+            let mut a = match &pass.tensor {
+                Some(g) => {
+                    let a = crate::parallel::reduce(
+                        &project(&merged(y)?, &["self_attn.o_proj"], None)?,
+                        g,
+                    )?;
+                    match bias {
+                        Some(b) => a.add(b)?,
+                        None => a,
+                    }
+                }
+                None => project(&merged(y)?, &["self_attn.o_proj"], bias)?,
+            };
             if sandwich {
                 a = norm(c, &a, w("post_attention_layernorm.weight"), None)?;
             }
@@ -801,9 +903,23 @@ fn block<'a, B: Compute + 'a>(
             } else {
                 (None, None)
             };
+            let h = match &pass.tensor {
+                Some(g) => crate::parallel::enter(&h, g)?,
+                None => h,
+            };
             let inner = project(&h, &["mlp.gate_proj", "mlp.up_proj"], gate_up.as_ref())?
                 .glu(c.activation)?;
-            let mut m = project(&inner, &["mlp.down_proj"], down)?;
+            let mut m = match &pass.tensor {
+                Some(g) => {
+                    let m =
+                        crate::parallel::reduce(&project(&inner, &["mlp.down_proj"], None)?, g)?;
+                    match down {
+                        Some(b) => m.add(b)?,
+                        None => m,
+                    }
+                }
+                None => project(&inner, &["mlp.down_proj"], down)?,
+            };
             if sandwich {
                 m = norm(c, &m, w("post_feedforward_layernorm.weight"), None)?;
             }

@@ -27,6 +27,7 @@
 | Decoding | Generating one token at a time after the prompt, bound by memory bandwidth |
 | Determinism | The same bits whatever the number of threads, achieved by splitting work by shape |
 | f8 | The 8-bit floats E4M3 and E5M2, used by Kapel for caches of keys and values half the size of bf16 |
+| FSDP | Fully sharded data parallelism: each weight held by one rank, fetched by the others where they use it, its gradient summed at its owner (`training.shard = "weights"`) |
 | Fusing | Stacking the projections that read the same input into one weight, one product instead of several (`Model::fused`) |
 | GGUF | llama.cpp's file format: a model's configuration, tokenizer and weights, quantized or not, in one file |
 | GPTQ | Quantization column by column, the error of each column carried onto those not yet rounded through the inverse Hessian (`kapel-quant`, chapter 13) |
@@ -69,6 +70,7 @@
 | Stride | The distance in the buffer between two consecutive elements of a dimension |
 | Suspension (preemption) | Taking the pages of the request admitted last when the cache runs out, to compute its tokens again later |
 | Tape | The record of a computation, run backwards to get the gradients of a loss (`kapel_train::Tape`) |
+| Tensor parallelism | Each block's heads and MLP shared out between ranks, the products of the output projections summed over them (`kapel_train::parallel`) |
 | Thread kernel / tile kernel | A CUDA kernel with one thread per element, written for cuda-oxide / a kernel over tiles of a matrix, written for cutile-rs |
 | Throughput | Tokens generated per second for a batch of requests, compared with vLLM's `vllm bench throughput` |
 | Time to first token | From the arrival of a request at the server to its first token: what a user waits before the answer starts |
@@ -122,7 +124,7 @@
 | LoRA and QLoRA, PEFT's files, merging | `crates/kapel-train/src/lora.rs`, `crates/kapel-cli/src/merge.rs`, `crates/kapel-train/tests/lora.rs`, `crates/kapel-train/examples/lora.rs`, `tools/train/peft_parity.py` |
 | DPO, GRPO, rewards, tasks | `crates/kapel-train/src/{preference,grpo,rewards}.rs`, `crates/kapel-train/src/trainer/post.rs`, `crates/kapel-train/tests/post.rs`, `crates/kapel-train/examples/tasks.rs` |
 | Budgets of operations, grids of runs, laws of scale | `crates/kapel-train/src/{flops,sweep,scaling}.rs`, `crates/kapel-cli/src/sweep.rs`, `crates/kapel-train/tests/flops.rs`, `recipes/scaling-smallem/`, `tools/train/smallem_tokens.py` |
-| Several ranks, collectives, shared states | `crates/kapel-train/src/dist.rs`, `crates/kapel-train/src/trainer/mod.rs`, `crates/kapel-train/tests/trainer.rs`, `crates/kapel-cli/tests/ranks.rs` |
+| Several ranks, collectives, shared states, tensor parallelism | `crates/kapel-train/src/dist.rs`, `crates/kapel-train/src/parallel.rs`, `crates/kapel-train/tests/parallel.rs`, `crates/kapel-train/src/trainer/mod.rs`, `crates/kapel-train/tests/trainer.rs`, `crates/kapel-cli/tests/ranks.rs` |
 | Logs for TensorBoard and Weights & Biases | `crates/kapel-train/src/tensorboard.rs`, `tools/train/wandb_log.py` |
 | Post-training measured against TRL | `tools/train/{trl_sft,trl_dpo,gsm8k,ultrafeedback}.py`, `recipes/{sft-gsm8k,sft-lora-gsm8k,dpo-ultrafeedback,grpo-gsm8k}/` |
 | Exporting a run for the Hub | `crates/kapel-train/src/export.rs`, `crates/kapel-cli/src/export.rs`, `crates/kapel-cli/tests/export.rs` |
