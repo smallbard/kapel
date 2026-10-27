@@ -81,6 +81,11 @@ impl Parameters {
         self.map.get_mut(name)
     }
 
+    /// Takes the parameter `name` out.
+    pub fn remove(&mut self, name: &str) -> Option<Parameter> {
+        self.map.remove(name)
+    }
+
     /// Adds or replaces a parameter.
     pub fn insert(&mut self, name: impl Into<String>, parameter: Parameter) {
         self.map.insert(name.into(), parameter);

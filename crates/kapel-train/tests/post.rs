@@ -157,6 +157,43 @@ fn dpo_with_adapters_starts_at_ln_2_and_learns_the_preference() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// Pairs joined in one row without padding train as padded ones: the same
+/// losses and held-out measures but for the order of the sums, fewer tokens.
+#[test]
+fn joined_pairs_train_as_padded_ones() {
+    if !have_model() {
+        return;
+    }
+    let measure = |name: &str, joined: bool| -> Vec<Value> {
+        let dir = temp(name);
+        pairs(&dir);
+        let mut c = dpo_config(&dir, true, 4);
+        if joined {
+            c.data.pack = kapel_train::data::Pack::Joined;
+        }
+        c.validate().unwrap();
+        run(&c, &QUIET).unwrap();
+        let lines = log(&dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+        lines
+    };
+    let (padded, joined) = (measure("dpo-padded", false), measure("dpo-joined", true));
+    assert_eq!(padded.len(), joined.len());
+    for (a, b) in padded.iter().zip(&joined) {
+        for key in ["loss", "accuracy", "margin", "val_loss", "val_margin"] {
+            if let (Some(x), Some(y)) = (a.get(key), b.get(key)) {
+                let (x, y) = (x.as_f64().unwrap(), y.as_f64().unwrap());
+                assert!(
+                    (x - y).abs() <= 1e-5 * (1.0 + x.abs()),
+                    "{key}: {x} and {y}"
+                );
+            }
+        }
+    }
+    let tokens = |lines: &[Value]| steps(lines).last().unwrap()["tokens"].as_f64().unwrap();
+    assert!(tokens(&joined) < tokens(&padded));
+}
+
 #[test]
 fn dpo_without_adapters_resumes_bit_for_bit() {
     if !have_model() {

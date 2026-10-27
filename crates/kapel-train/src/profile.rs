@@ -348,6 +348,20 @@ impl<B: kapel_ops::Update> kapel_ops::Update for Profiled<B> {
             || self.inner.adamw(param, m, v, grad, step),
         )
     }
+
+    fn adamw8bit(
+        &self,
+        param: &mut Tensor,
+        moments: &mut kapel_ops::Moments8,
+        grad: &Tensor,
+        maps: &Tensor,
+        step: &kapel_ops::AdamWStep,
+    ) -> Result<()> {
+        self.time(
+            || "adamw8bit".into(),
+            || self.inner.adamw8bit(param, moments, grad, maps, step),
+        )
+    }
 }
 
 impl<B: Record> Record for Profiled<B> {

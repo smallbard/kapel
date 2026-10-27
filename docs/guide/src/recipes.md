@@ -8,9 +8,9 @@ The Python tools need `huggingface_hub`, `pyarrow` and `transformers` (`pip inst
 | --- | --- | --- | --- |
 | [`gpt2-124m`](#gpt-2-124m) | validation loss 6.170 at step 250 | 43 min | 7.9 GiB |
 | [`llama-1b`](#llama-1b) | validation loss 8.210 at step 50 | 1 h 36 | 16.1 GiB |
-| [`sft-gsm8k`](#supervised-fine-tuning-on-gsm8k) | GSM8K 50.0 % | 7 min | 21.3 GiB |
-| [`sft-lora-gsm8k`](#supervised-fine-tuning-on-gsm8k) | GSM8K 48.3 % | 7 min | 13.3 GiB |
-| [`dpo-ultrafeedback`](#dpo-on-ultrafeedback) | held-out pairs: loss 0.627, accuracy 64.8 % | 26 min | 13.3 GiB |
+| [`sft-gsm8k`](#supervised-fine-tuning-on-gsm8k) | GSM8K 50.0 % | 5 min 24 | 15.9 GiB |
+| [`sft-lora-gsm8k`](#supervised-fine-tuning-on-gsm8k) | GSM8K 48.0 % | 4 min 25 | 7.9 GiB |
+| [`dpo-ultrafeedback`](#dpo-on-ultrafeedback) | held-out pairs: loss 0.629, accuracy 65.0 % | 14 min | 11.5 GiB |
 | [`grpo-gsm8k`](#grpo-on-gsm8k) | GSM8K from 61.2 % to 69.3 % | 1 h 34 | 11.5 GiB |
 | [`scaling-smallem`](experiments.md#the-recipe) | lowest point 14.4 M parameters | 1 h 13 | |
 
@@ -40,7 +40,7 @@ Expected: the validation loss 8.210 at step 50 (12.16 at the first step), the tr
 
 ## Supervised fine-tuning on GSM8K
 
-Qwen 3 0.6B taught GSM8K's 7,473 worked answers, one pass, with TRL's settings: every weight (`sft-gsm8k`, AdamW at 1e-5) or LoRA adapters of rank 16 on every projection (`sft-lora-gsm8k`, 2e-4).
+Qwen 3 0.6B taught GSM8K's 7,473 worked answers, one pass, with TRL's settings: every weight (`sft-gsm8k`, AdamW at 1e-5) or LoRA adapters of rank 16 on every projection (`sft-lora-gsm8k`, 2e-4). The 16 examples of a step are laid one after the other in a single row (`pack = "joined"`), so no padding is computed.
 
 ```sh
 python tools/train/gsm8k.py recipes/sft-gsm8k/gsm8k
@@ -52,9 +52,11 @@ kapel train recipes/sft-gsm8k/train.toml
 
 | | Every weight | LoRA | TRL, LoRA |
 | --- | --- | --- | --- |
-| GSM8K | 50.0 % | 48.3 % | 47.5 % |
+| GSM8K | 50.0 % | 48.0 % | 47.5 % |
 | Loss, mean of steps 401–450 | 0.408 | 0.419 | 0.422 |
-| Time, memory | 7 min, 21.3 GiB | 7 min, 13.3 GiB | 6 min 22 s, 2.5 GiB |
+| Time, memory | 5 min 24 s, 15.9 GiB | 4 min 25 s, 7.9 GiB | 6 min 22 s, 2.5 GiB |
+
+With `pack = "padded"`, one example a row of 512 tokens as TRL pads without packing, the same runs take 7 minutes, 21.3 and 13.3 GiB, for 50.0 % and 48.3 %: the greedy answers of two runs part ways at the first token that differs, by about a point.
 
 Qwen 3 0.6B answers 61.2 % of them before, without thinking: GSM8K's answers reason in few words, and learning to imitate them costs accuracy. That is what the next two recipes are for.
 
@@ -72,13 +74,13 @@ Expected, on the 500 held-out pairs, against TRL with the same settings (`tools/
 | Step | Kapel: loss, accuracy, margin | TRL |
 | --- | --- | --- |
 | 0 | 0.693, 0 %, 0 | 0.693, 0 %, 0 |
-| 100 | 0.657, 64.4 %, 0.51 | 0.664, 63.5 %, 0.41 |
-| 200 | 0.648, 65.0 %, 0.51 | 0.657, 63.3 %, 0.45 |
-| 300 | 0.633, 62.0 %, 0.44 | 0.643, 65.1 %, 0.45 |
-| 400 | 0.630, 65.8 %, 0.49 | 0.622, 65.9 %, 0.47 |
-| 500 | 0.627, 64.8 %, 0.47 | 0.622, 65.1 %, 0.49 |
+| 100 | 0.658, 64.2 %, 0.51 | 0.664, 63.5 %, 0.41 |
+| 200 | 0.650, 64.2 %, 0.51 | 0.657, 63.3 %, 0.45 |
+| 300 | 0.635, 63.6 %, 0.43 | 0.643, 65.1 %, 0.45 |
+| 400 | 0.634, 65.4 %, 0.48 | 0.622, 65.9 %, 0.47 |
+| 500 | 0.629, 65.0 %, 0.46 | 0.622, 65.1 %, 0.49 |
 
-Each step is two passes of 4 pairs (8 rows of 1,024 tokens); 16 rows in one pass do not fit with every activation kept. 2.4 seconds a step, 6,900 tokens a second, 13.3 GiB, 26 minutes; TRL took 28. The batches come in another order than TRL's, so the two runs agree within the noise of 500 pairs (a point of accuracy is 5 pairs), not exactly.
+Each step is two passes of 4 pairs, their 8 answers of at most 1,024 tokens one after the other in a row (`pack = "joined"`): 1.3 seconds a step, 11.5 GiB, 14 minutes; TRL took 28. Padded to 1,024 tokens each, the same run takes 26 minutes and 13.3 GiB, for 0.627 and 64.8 % at the end. The batches come in another order than TRL's, so the two runs agree within the noise of 500 pairs (a point of accuracy is 5 pairs), not exactly.
 
 ## GRPO on GSM8K
 

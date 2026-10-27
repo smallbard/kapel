@@ -42,7 +42,10 @@ pub use paged::{
 };
 pub use reduce::{ArgMax, Max, Mean, Sum};
 pub use rope::{Rope, RopeLayout, RopeScaling};
-pub use update::{ADAMW, AdamWStep, Update, check_adamw};
+pub use update::{
+    ADAMW, ADAMW8, AdamWStep, BLOCK8, Moments8, Update, check_adamw, check_adamw8bit, dynamic_map,
+    nearest_code,
+};
 
 /// The shape and data type of an operation's output.
 #[derive(Clone, Debug, PartialEq, Eq)]

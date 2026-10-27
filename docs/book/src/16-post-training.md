@@ -17,7 +17,7 @@ The text is then encoded piece by piece, the assistant's pieces apart, with the 
 
 **Preparing.** `kapel prepare FILES --chat --tokenizer MODEL --output DIR` reads the examples of JSONL or Parquet files (a row of Parquet read as a JSON object, its nested lists of messages included), tokenizes them on every core as for text (section 15.13), leaves the exact duplicates out, and an example with nothing to learn as empty. The shards have a third file beside their index: the mask, one bit per token, 1 where the loss counts the token as a target (`dataset.rs`). No separator goes before a conversation: the template begins it, and the manifest says so (`"separated": false`). The loader reads the mask with the shard, and every target outside it becomes `IGNORE`. The test `conversations_keep_the_assistant_s_tokens_as_the_only_targets` prepares conversations of both forms from JSONL and Parquet, and counts, over one epoch of whole documents, exactly the assistant's tokens as targets.
 
-**Rows.** With `data.pack = "documents"` and `data.mask`, conversations fill rows whole, each seeing only itself, positions from zero: no padding to compute, and the same function as one conversation a row. `"padded"` puts one document in each row, cut to its length or padded: the batches of `transformers` without packing, for comparing with TRL step for step.
+**Rows.** With `data.pack = "documents"` and `data.mask`, conversations fill rows whole, each seeing only itself, positions from zero: no padding to compute, and the same function as one conversation a row. `"padded"` puts one document in each row, cut to its length or padded: the batches of `transformers` without packing, for comparing with TRL step for step. `"joined"` takes the same documents a pass and lays them in one row without their padding (section 15.13): the same training, without computing the padding.
 
 **Against forgetting.** Smallem's model forgot much of what it knew of FineWeb-Edu when fine-tuned on conversations alone (its loss from 0.88 to 1.48 nats per byte), and kept it when half of each batch was ordinary text (0.89). That is `data.sources`: a source of conversations and one of text, each with its weight (section 15.13); the text has no mask, and its targets all count. `eval.control` names a text whose loss is measured every `eval.every` steps, as the validation's: what the fine-tuning makes the model forget, in the log as `control_loss`.
 
@@ -141,6 +141,19 @@ The steps took 6 minutes 55 seconds in Kapel, 881 ms each at 9,300 tokens a seco
 | 500 | 0.627 | 0.622 | 64.8 % | 65.1 % | 0.47 | 0.49 |
 
 The training's means over steps 1–50 and 451–500: the loss 0.680 and 0.621 in Kapel, 0.697 and 0.644 in TRL; the accuracy 58.5 % and 65.0 %, against 59 % and 63.2 %. The two runs agree within what 500 pairs can tell (a point is 5 pairs). Kapel's steps are two passes of 4 pairs, as 16 rows of 1,024 tokens with every activation kept do not fit on the card: 2.4 seconds a step at 6,900 tokens a second, 13.3 GiB at the peak, 26 minutes in all against TRL's 28.
+
+**Without padding.** The runs above pad every example to its row, as TRL pads without packing. With `data.pack = "joined"` (section 15.13), the same examples a pass are laid one after the other in a single row, and only their tokens are computed: a step of GSM8K's 16 examples is about 3,100 tokens instead of 8,192. The same runs again, the recipes as they now are:
+
+| | Padded | Joined |
+| --- | --- | --- |
+| Every weight: GSM8K, loss 401–450 | 50.0 %, 0.408 | 50.0 %, 0.408 |
+| Every weight: time, memory | 7 min 20 s, 21.3 GiB | 5 min 24 s, 15.9 GiB |
+| LoRA: GSM8K, loss 401–450 | 48.3 %, 0.419 | 48.0 %, 0.419 |
+| LoRA: time, memory | 7 min, 13.3 GiB | 4 min 25 s, 7.9 GiB |
+| DPO: held-out loss and accuracy at step 500 | 0.627, 64.8 % | 0.629, 65.0 % |
+| DPO: time, memory | 26 min, 13.3 GiB | 14 min, 11.5 GiB |
+
+The fine-tuning with LoRA now takes less time than TRL's (6 min 22 s), the DPO half of it (28 min). The losses agree to the third decimal; the greedy answers part ways at the first token that differs, by a point at most here. The model's share of the card's peak falls (43 % for every weight, against 53 %): one row of 3,100 tokens makes smaller products than 16 of 512.
 
 **GRPO on GSM8K.** Qwen 3 0.6B without thinking, on the problems of GSM8K's training split (`recipes/grpo-gsm8k`): each step 16 problems, 8 answers each of at most 512 tokens at temperature 1, the reward 1 for the right final number; LoRA of rank 16 on every projection, AdamW at 2 × 10⁻⁵; `β` 0.04, `ε` 0.2, the paper's averaging; 200 steps. The accuracy of the 1,319 problems of the test split, answered greedily every 50 steps, and the training's means by window:
 

@@ -588,6 +588,103 @@ pub fn adamw(
     }
 }
 
+/// The code of `x` in the sorted map of 256 values `maps[base..base + 256]`:
+/// the number of midpoints between neighbouring values below `x`, so the
+/// nearest value, the lower at a tie (`kapel_ops::nearest_code`).
+#[inline(always)]
+fn nearest_code(maps: &[f32], base: usize, x: f32) -> u8 {
+    let (mut lo, mut hi) = (0usize, 255usize);
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if (maps[base + mid] + maps[base + mid + 1]) * 0.5 < x {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo as u8
+}
+
+/// `x` within `[−1, 1]`.
+#[inline(always)]
+fn unit(x: f32) -> f32 {
+    if x < -1.0 {
+        -1.0
+    } else if x > 1.0 {
+        1.0
+    } else {
+        x
+    }
+}
+
+/// One AdamW step whose moments are kept in 8 bits
+/// (`kapel_ops::Update::adamw8bit`), one block of 256 threads per block of
+/// 256 elements, one thread per element: the moments read from their codes
+/// (`maps[0..256]` signed, `maps[256..512]` unsigned) times their block's
+/// scales, the step of `adamw`, then the block's largest magnitudes by
+/// `block_max`, the new scales, and each moment written as its nearest
+/// code, as `AdamWStep::apply_block8` computes them on the host.
+#[kernel]
+#[launch_bounds(256)]
+pub fn adamw8bit(
+    mut p: DisjointSlice<f32>,
+    mut m: DisjointSlice<u8>,
+    mut v: DisjointSlice<u8>,
+    mut m_scale: DisjointSlice<f32>,
+    mut v_scale: DisjointSlice<f32>,
+    kg: u32,
+    g: &[u8],
+    vg: View,
+    maps: &[f32],
+    beta1: f32,
+    beta2: f32,
+    keep: f32,
+    step: f32,
+    correction2: f32,
+    eps: f32,
+    grad_scale: f32,
+) {
+    let block = thread::blockIdx_x() as usize;
+    let i = block * 256 + thread::threadIdx_x() as usize;
+    let here = i < p.len() && i < m.len() && i < v.len() && block < m_scale.len() && block < v_scale.len() && maps.len() == 512;
+    let (mut first, mut second) = (0.0f32, 0.0f32);
+    if here {
+        let grad = read(kg, g, vg.at(i as u32) as usize) * grad_scale;
+        // SAFETY: `i` and `block` are below the lengths (checked above);
+        // element `i` is this thread's own, and the block's scales are only
+        // read here, before the barriers of `block_max`.
+        unsafe {
+            let pm = p.as_mut_ptr().add(i);
+            let mm = m.as_mut_ptr().add(i);
+            let vm = v.as_mut_ptr().add(i);
+            let old_m = maps[*mm as usize] * *m_scale.as_mut_ptr().add(block);
+            let old_v = maps[256 + *vm as usize] * *v_scale.as_mut_ptr().add(block);
+            first = beta1 * old_m + (1.0 - beta1) * grad;
+            second = beta2 * old_v + (1.0 - beta2) * (grad * grad);
+            let denominator = (second / correction2).sqrt() + eps;
+            *pm = keep * *pm - step * (first / denominator);
+        }
+    }
+    // Every thread of the block, in range or not, takes part.
+    let top_m = block_max(first.abs());
+    let top_v = block_max(second.abs());
+    if here {
+        let im = if top_m > 0.0 { 1.0 / top_m } else { 0.0 };
+        let iv = if top_v > 0.0 { 1.0 / top_v } else { 0.0 };
+        // SAFETY: as above; the block's scales are written by its first
+        // thread only, after every thread has read them (the barriers of
+        // `block_max`).
+        unsafe {
+            *m.as_mut_ptr().add(i) = nearest_code(maps, 0, unit(first * im));
+            *v.as_mut_ptr().add(i) = nearest_code(maps, 256, unit(second * iv));
+            if thread::threadIdx_x() == 0 {
+                *m_scale.as_mut_ptr().add(block) = top_m;
+                *v_scale.as_mut_ptr().add(block) = top_v;
+            }
+        }
+    }
+}
+
 /// `out[i] = scale · g[owner[i]]`: each element receives its result's gradient.
 #[kernel]
 #[launch_bounds(256)]

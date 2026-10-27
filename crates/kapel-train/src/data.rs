@@ -18,7 +18,11 @@
 //!   padded (ids of the separator, targets [`crate::IGNORE`]); a document
 //!   longer than a row is cut into rows of its own;
 //! - [`Pack::Padded`]: one document a row, the rest of a longer one left
-//!   out, as TRL's batches without packing.
+//!   out, as TRL's batches without packing;
+//! - [`Pack::Joined`]: the rows of [`Pack::Padded`] without their padding,
+//!   the batch's documents one after the other in a single row, attention
+//!   kept within each: the same examples a pass, only their own tokens
+//!   computed (TRL's `padding_free`).
 //!
 //! Each row also reads the token after it, its last target. A shard of
 //! conversations has a mask of the tokens the loss counts: the targets
@@ -254,6 +258,10 @@ pub enum Pack {
     /// One document a row, cut to the row (its rest left out) or padded:
     /// the batches of `transformers` without packing.
     Padded,
+    /// The documents of [`Pack::Padded`]'s rows one after the other in one
+    /// row, without padding: a batch of `rows` documents is one row of their
+    /// tokens, each attending to its own only.
+    Joined,
 }
 
 /// How a [`Loader`] reads.
@@ -556,7 +564,7 @@ struct Row {
 fn rows_of(shard: &OpenShard, length: usize, pack: Pack) -> Vec<Row> {
     let n = shard.file.len();
     match pack {
-        Pack::Padded => {
+        Pack::Padded | Pack::Joined => {
             let starts = shard.starts.as_deref().unwrap_or(&[]);
             let ends = starts
                 .iter()
@@ -681,9 +689,28 @@ pub struct Tokens {
     pub ids: Vec<u32>,
     /// As many targets: each the token after, [`crate::IGNORE`] for padding.
     pub targets: Vec<u32>,
-    /// With `mask`, the document of each token: equal numbers for the
-    /// tokens of one document of one row, different ones otherwise.
+    /// With `mask` (and always with [`Pack::Joined`]), the document of each
+    /// token: equal numbers for the tokens of one document of one row,
+    /// different ones otherwise.
     pub segments: Option<Vec<u32>>,
+}
+
+impl Tokens {
+    /// The lengths of the documents, in order: runs of one segment, or the
+    /// whole batch without segments.
+    pub fn documents(&self) -> Vec<usize> {
+        let Some(segments) = &self.segments else {
+            return vec![self.ids.len()];
+        };
+        let mut lengths = Vec::new();
+        for (i, s) in segments.iter().enumerate() {
+            if i == 0 || *s != segments[i - 1] {
+                lengths.push(0);
+            }
+            *lengths.last_mut().expect("pushed") += 1;
+        }
+        lengths
+    }
 }
 
 /// A source being read.
@@ -780,8 +807,9 @@ impl Reader {
         let (_, open, _, _) = self.current.as_ref().expect("a shard open");
         let file = &open.file;
         let (start, len) = (row.start as usize, row.len as usize);
-        // A padded row is its document: nothing after it is a target.
-        let after = usize::from(reading.pack != Pack::Padded);
+        // A padded or joined row is its document: nothing after it is a
+        // target.
+        let after = usize::from(!matches!(reading.pack, Pack::Padded | Pack::Joined));
         let available = (file.len() - start).min(len + after);
         let mut tokens = Vec::with_capacity(len + 1);
         file.extend(start, available, &mut tokens);
@@ -799,7 +827,11 @@ impl Reader {
         if available < len + 1 {
             out.targets.push(crate::IGNORE);
         }
-        let pad = reading.length - len;
+        let pad = if reading.pack == Pack::Joined {
+            0
+        } else {
+            reading.length - len
+        };
         let filler = self.source.separator.or(reading.separator).unwrap_or(0);
         out.ids.extend(std::iter::repeat_n(filler, pad));
         out.targets.extend(std::iter::repeat_n(crate::IGNORE, pad));
@@ -942,7 +974,8 @@ impl Loader {
         let mut out = Tokens {
             ids: Vec::with_capacity(n),
             targets: Vec::with_capacity(n),
-            segments: self.reading.mask.then(|| Vec::with_capacity(n)),
+            segments: (self.reading.mask || self.reading.pack == Pack::Joined)
+                .then(|| Vec::with_capacity(n)),
         };
         let mut segment = 0u32;
         for _ in 0..self.reading.rows {

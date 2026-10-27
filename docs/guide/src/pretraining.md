@@ -53,6 +53,7 @@ A step is `batch.tokens` tokens: `batch.rows` sequences of `batch.length` tokens
 ## The optimizer
 
 - **AdamW** (`kind = "adamw"`), the usual: `lr`, `beta1`, `beta2`, `eps`, `weight_decay`.
+- **AdamW in 8 bits** (`kind = "adamw8bit"`): AdamW with its two moments kept in 8 bits, as bitsandbytes' `AdamW8bit`: 2 bytes a parameter for them instead of 8, the same settings.
 - **Muon** (`kind = "muon"`): the update of each matrix of the blocks made orthogonal, AdamW for the tables and the vectors. Its update is scaled to the size of AdamW's, so one learning rate serves both; it reaches a loss in fewer steps, and keeps one moment instead of two.
 - **Adafactor** (`kind = "adafactor"`): moments factored by rows and columns, for the least memory.
 

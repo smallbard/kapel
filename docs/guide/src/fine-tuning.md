@@ -41,7 +41,8 @@ kapel prepare train.jsonl --chat --tokenizer Qwen/Qwen3-0.6B --output data
 ```toml
 [data]
 train = "data"
-pack = "padded"      # one conversation a row, as TRL without packing; "documents" packs several
+pack = "joined"      # the conversations of a pass one after the other, no padding computed;
+                     # "padded": one a row, as TRL without packing; "documents" packs several a row
 shuffle = true
 ```
 
@@ -91,7 +92,7 @@ beta = 0.1                   # how far from the starting model the run may go
 nll = 0.0                    # the weight of the likelihood of the preferred answers (TRL's rpo_alpha)
 ```
 
-`batch.rows` is twice the pairs of a pass. Each step logs the share of pairs whose preferred answer the model now prefers (`accuracy`), the rewards of both answers and their `margin`. When both answers' likelihoods fall while their margin grows, the model drifts towards answers neither of them is; `nll = 1.0` holds the preferred ones up.
+`batch.rows` is twice the pairs of a pass. `[data] pack = "joined"` lays the answers of a pass one after the other without padding, as for fine-tuning. Each step logs the share of pairs whose preferred answer the model now prefers (`accuracy`), the rewards of both answers and their `margin`. When both answers' likelihoods fall while their margin grows, the model drifts towards answers neither of them is; `nll = 1.0` holds the preferred ones up.
 
 ## Rewards: GRPO
 

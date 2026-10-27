@@ -170,6 +170,119 @@ fn update_failures<B: Backend + Transfer>(backend: &B, dtype: DType) -> Vec<Fail
     if refused.is_ok() {
         fail("a gradient of another shape", "accepted".into());
     }
+    failures.extend(update8_failures(backend, dtype, &step));
+    failures
+}
+
+/// AdamW with moments in 8 bits, compared with the reference: three full
+/// blocks and a partial one, from codes and scales drawn at random. The
+/// parameters and the scales agree within `f32`'s rounding; a code may be
+/// its neighbour, a moment that rounding put on the other side of a
+/// midpoint.
+fn update8_failures<B: Backend + Transfer>(
+    backend: &B,
+    dtype: DType,
+    step: &kapel_ops::AdamWStep,
+) -> Vec<Failure> {
+    use kapel_ops::{ADAMW8, Moments8, Update, dynamic_map};
+    let mut failures = Vec::new();
+    let mut rng = Rng::new(19);
+    let (rows, cols) = (3usize, 300usize);
+    let n = rows * cols;
+    let blocks = n.div_ceil(kapel_ops::BLOCK8);
+    let p0 = random(&mut rng, &[rows, cols], DType::F32, -1.0, 1.0);
+    let codes = |rng: &mut Rng| -> Tensor {
+        let c: Vec<u8> = (0..n).map(|_| rng.below(256) as u8).collect();
+        Tensor::from_bytes(DType::U8, &[rows, cols], &c).expect("sizes agree")
+    };
+    let (m0, v0) = (codes(&mut rng), codes(&mut rng));
+    let ms0 = random(&mut rng, &[blocks], DType::F32, 0.01, 0.1);
+    let vs0 = random(&mut rng, &[blocks], DType::F32, 0.0001, 0.01);
+    let grad = random(&mut rng, &[cols, rows], dtype, -1.0, 1.0);
+    let mut table = dynamic_map(true).to_vec();
+    table.extend(dynamic_map(false));
+    let maps = Tensor::from_slice(&table, &[512]).expect("sizes agree");
+    let case = format!("[3, 300], a gradient in {dtype} seen transposed");
+    let copy = |t: &Tensor| -> Result<Tensor> {
+        let bytes = t.storage().host_bytes().expect("on the host").to_vec();
+        Tensor::from_bytes(t.dtype(), t.shape(), &bytes)
+    };
+    let state = |up: &dyn Fn(&Tensor) -> Result<Tensor>| -> Result<(Tensor, Moments8)> {
+        Ok((
+            up(&p0)?,
+            Moments8 {
+                m: up(&m0)?,
+                v: up(&v0)?,
+                m_scale: up(&ms0)?,
+                v_scale: up(&vs0)?,
+            },
+        ))
+    };
+    let outcome = (|| -> Result<Option<String>> {
+        let (mut rp, mut rm) = state(&copy)?;
+        Reference.adamw8bit(&mut rp, &mut rm, &grad.transpose(0, 1)?, &maps, step)?;
+        let (mut bp, mut bm) = state(&|t| backend.upload(&copy(t)?))?;
+        let bg = backend.upload(&grad)?.transpose(0, 1)?;
+        backend.adamw8bit(&mut bp, &mut bm, &bg, &backend.upload(&maps)?, step)?;
+        for (name, expected, got) in [
+            ("p", &rp, &bp),
+            ("m_scale", &rm.m_scale, &bm.m_scale),
+            ("v_scale", &rm.v_scale, &bm.v_scale),
+        ] {
+            let got = backend.download(got)?.to_f64_vec()?;
+            for (i, (a, b)) in got.iter().zip(&expected.to_f64_vec()?).enumerate() {
+                if (a - b).abs() > 1e-6 * (1.0 + b.abs()) {
+                    return Ok(Some(format!("{name}[{i}] = {a}, expected {b}")));
+                }
+            }
+        }
+        for (name, expected, got) in [("m", &rm.m, &bm.m), ("v", &rm.v, &bm.v)] {
+            let got = backend.download(got)?.to_f64_vec()?;
+            for (i, (a, b)) in got.iter().zip(&expected.to_f64_vec()?).enumerate() {
+                if (a - b).abs() > 1.0 {
+                    return Ok(Some(format!("code {name}[{i}] = {a}, expected {b}")));
+                }
+            }
+        }
+        Ok(None)
+    })();
+    match outcome {
+        Ok(None) => {}
+        Ok(Some(message)) => failures.push(Failure {
+            op: ADAMW8,
+            case,
+            message,
+        }),
+        Err(error) => failures.push(Failure {
+            op: ADAMW8,
+            case,
+            message: error.to_string(),
+        }),
+    }
+    let refused = (|| -> Result<()> {
+        let (mut p, mut m) = state(&|t| backend.upload(&copy(t)?))?;
+        m.m_scale = backend.upload(&random(
+            &mut Rng::new(1),
+            &[blocks + 1],
+            DType::F32,
+            0.0,
+            1.0,
+        ))?;
+        backend.adamw8bit(
+            &mut p,
+            &mut m,
+            &backend.upload(&grad)?.transpose(0, 1)?,
+            &backend.upload(&maps)?,
+            step,
+        )
+    })();
+    if refused.is_ok() {
+        failures.push(Failure {
+            op: ADAMW8,
+            case: "scales of another number of blocks".into(),
+            message: "accepted".into(),
+        });
+    }
     failures
 }
 

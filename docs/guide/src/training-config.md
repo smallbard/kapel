@@ -21,7 +21,7 @@ Every field of the TOML file `kapel train` reads, by table. Relative paths are t
 | `val` | | The validation: a dataset's `val` split, or files |
 | `shuffle` | false | Read shards and rows in an order drawn for each epoch |
 | `seed` | 0 | The seed of the order and the mixing |
-| `pack` | `"stream"` | `"stream"`: cut every `batch.length`; `"documents"`: whole documents, then padding; `"padded"`: one document a row |
+| `pack` | `"stream"` | `"stream"`: cut every `batch.length`; `"documents"`: whole documents, then padding; `"padded"`: one document a row; `"joined"`: the documents of `"padded"` in one row without padding (fine-tuning, DPO) |
 | `mask` | false | Each token attends to its own document only |
 | `separator` | | The token that starts each document, for files without an index (50256 for GPT-2's) |
 | `prefetch` | 4 | Batches read ahead |
@@ -39,7 +39,7 @@ Every field of the TOML file `kapel train` reads, by table. Relative paths are t
 
 | Field | Default | Meaning |
 | --- | --- | --- |
-| `kind` | `"adamw"` | `"adamw"`, `"muon"` (the blocks' matrices; AdamW for the rest) or `"adafactor"` |
+| `kind` | `"adamw"` | `"adamw"`, `"adamw8bit"` (its moments in 8 bits), `"muon"` (the blocks' matrices; AdamW for the rest) or `"adafactor"` |
 | `lr` | 6e-4 | The peak learning rate |
 | `beta1`, `beta2`, `eps` | 0.9, 0.95, 1e-8 | AdamW's |
 | `weight_decay` | 0 | Decoupled weight decay |
@@ -67,6 +67,7 @@ Every field of the TOML file `kapel train` reads, by table. Relative paths are t
 | `dtype` | `"bf16"` | The computation: `"bf16"`, `"f16"` or `"f32"`; weights and optimizer stay in `f32` |
 | `clip` | 1 | The norm the gradient is clipped to; 0 for none |
 | `checkpoint_activations` | false | Recompute each block in the backward pass: less memory |
+| `offload` | false | The trained parameters in `f32`, their gradients and the optimizer's state in the processor's memory, the card holding the parameters in the computation's type only: larger models, slower steps |
 | `chunk` | 4096 | Rows of logits the loss forms at once |
 | `cache_gib` | 4 | Memory for the keys and values when the model writes answers (GRPO, tasks) |
 | `budget` | | The run's computation in operations (`1e18`): the steps it pays for |

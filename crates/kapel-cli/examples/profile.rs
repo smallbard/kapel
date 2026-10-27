@@ -102,6 +102,17 @@ impl<B: kapel_ops::Update> kapel_ops::Update for Timed<B> {
     ) -> kapel_core::Result<()> {
         self.inner.adamw(param, m, v, grad, step)
     }
+
+    fn adamw8bit(
+        &self,
+        param: &mut Tensor,
+        moments: &mut kapel_ops::Moments8,
+        grad: &Tensor,
+        maps: &Tensor,
+        step: &kapel_ops::AdamWStep,
+    ) -> kapel_core::Result<()> {
+        self.inner.adamw8bit(param, moments, grad, maps, step)
+    }
 }
 
 impl<B: Transfer> Transfer for Timed<B> {

@@ -10,7 +10,7 @@
 #
 # Expected: the loss from 1.5 to about 0.42 (mean of the last 50 steps), 48 %
 # of GSM8K's test answered right greedily (TRL: 47.5 %; the model before:
-# 61 % without thinking); 7 minutes and 13.3 GiB on an RTX 3090.
+# 61 % without thinking); 4 minutes 25 and 7.9 GiB on an RTX 3090.
 
 [model]
 config = "Qwen/Qwen3-0.6B"
@@ -18,7 +18,7 @@ init = "weights"
 
 [data]
 train = "data"
-pack = "padded"
+pack = "joined"          # the 16 examples of a step in one row, no padding
 shuffle = true
 seed = 0
 

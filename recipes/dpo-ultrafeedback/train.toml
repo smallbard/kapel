@@ -49,6 +49,9 @@ every = 0
 [log]
 every = 10
 
+[data]
+pack = "joined"          # the 8 answers of a pass in one row, no padding
+
 [lora]
 r = 16
 alpha = 32

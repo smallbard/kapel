@@ -24,6 +24,15 @@ use crate::tape::{Compute, Grad};
 /// values and moments; the bias correction is that of the global step.
 ///
 /// Parameters, moments and the update are in `f32`.
+///
+/// With [`AdamW::eight_bit`], the moments of a parameter in `f32` of at
+/// least [`MIN_8BIT`] elements with a dense gradient are kept in 8 bits, as
+/// bitsandbytes' `AdamW8bit` keeps them ([`kapel_ops::Update::adamw8bit`]):
+/// a code a moment and a scale every 256 elements, 2 bytes a parameter
+/// instead of 8. The step is computed in `f32` from the moments read back.
+/// Smaller parameters, the tables (embeddings, positions, the output, as
+/// bitsandbytes advises with its `StableEmbedding`) and parameters in other
+/// types keep their moments in `f32`.
 #[derive(Debug)]
 pub struct AdamW {
     /// The learning rate.
@@ -36,9 +45,18 @@ pub struct AdamW {
     pub eps: f64,
     /// The weight decay `λ`.
     pub weight_decay: f64,
+    /// Whether the moments are kept in 8 bits where they can be.
+    pub eight_bit: bool,
     steps: u64,
     moments: BTreeMap<String, (Tensor, Tensor)>,
+    quantized: BTreeMap<String, kapel_ops::Moments8>,
+    /// The maps of the codes ([`kapel_ops::dynamic_map`]) on the device.
+    maps: Option<Tensor>,
 }
+
+/// The fewest elements of a parameter whose moments [`AdamW::eight_bit`]
+/// keeps in 8 bits: bitsandbytes' `min_8bit_size`.
+pub const MIN_8BIT: usize = 4096;
 
 impl AdamW {
     /// With nanoGPT's settings: `β₁ = 0.9`, `β₂ = 0.95`, `ε = 10⁻⁸`.
@@ -49,8 +67,11 @@ impl AdamW {
             beta2: 0.95,
             eps: 1e-8,
             weight_decay,
+            eight_bit: false,
             steps: 0,
             moments: BTreeMap::new(),
+            quantized: BTreeMap::new(),
+            maps: None,
         }
     }
 
@@ -64,10 +85,30 @@ impl AdamW {
         &self.moments
     }
 
+    /// The moments kept in 8 bits, by parameter.
+    pub fn quantized(&self) -> &BTreeMap<String, kapel_ops::Moments8> {
+        &self.quantized
+    }
+
     /// Puts the optimizer back in a saved state: steps and moments.
     pub fn restore(&mut self, steps: u64, moments: BTreeMap<String, (Tensor, Tensor)>) {
         self.steps = steps;
         self.moments = moments;
+        self.quantized.clear();
+    }
+
+    /// The maps of the codes on the backend's device, uploaded once.
+    fn maps<B: Compute>(&mut self, backend: &B, device: kapel_core::Device) -> Result<Tensor> {
+        if let Some(maps) = &self.maps
+            && maps.device() == device
+        {
+            return Ok(maps.clone());
+        }
+        let mut table = kapel_ops::dynamic_map(true).to_vec();
+        table.extend(kapel_ops::dynamic_map(false));
+        let maps = backend.upload(&Tensor::from_slice(&table, &[512])?)?;
+        self.maps = Some(maps.clone());
+        Ok(maps)
     }
 
     /// One step: each parameter of `params` with a gradient in `grads` (by
@@ -88,7 +129,29 @@ impl AdamW {
         grads: Vec<(String, Grad)>,
         grad_scale: f64,
     ) -> Result<()> {
+        self.advance();
+        self.update(backend, params, grads, grad_scale)
+    }
+
+    /// Counts a step begun: [`AdamW::update`] then moves parameters with
+    /// its bias corrections, all at once or a few at a time.
+    pub fn advance(&mut self) {
         self.steps += 1;
+    }
+
+    /// The moves of the step [`AdamW::advance`] began, for the parameters
+    /// with a gradient in `grads`: [`AdamW::step`] without counting a step.
+    ///
+    /// # Errors
+    ///
+    /// As [`AdamW::step`].
+    pub fn update<B: Compute>(
+        &mut self,
+        backend: &B,
+        params: &mut Parameters,
+        grads: Vec<(String, Grad)>,
+        grad_scale: f64,
+    ) -> Result<()> {
         let t = self.steps as i32;
         let c1 = 1.0 - self.beta1.powi(t);
         let c2 = 1.0 - self.beta2.powi(t);
@@ -101,13 +164,6 @@ impl AdamW {
                 })?;
             let decay = if param.decay { self.weight_decay } else { 0.0 };
             let shape = param.value.shape().to_vec();
-            let (m, v) = match self.moments.remove(&name) {
-                Some(mv) => mv,
-                None => (
-                    backend.zeros(&shape, DType::F32)?,
-                    backend.zeros(&shape, DType::F32)?,
-                ),
-            };
             let s = Step {
                 lr: self.lr * param.lr_scale,
                 beta1: self.beta1,
@@ -117,6 +173,39 @@ impl AdamW {
                 c1,
                 c2,
                 grad_scale,
+            };
+            let eight = self.eight_bit
+                && param.value.dtype() == DType::F32
+                && param.value.numel() >= MIN_8BIT
+                && !crate::model::is_table(&name)
+                && !matches!(grad, Grad::Rows { .. })
+                && !self.moments.contains_key(&name);
+            if eight {
+                let mut moments = match self.quantized.remove(&name) {
+                    Some(q) => q,
+                    None => {
+                        let blocks = [param.value.numel().div_ceil(kapel_ops::BLOCK8)];
+                        kapel_ops::Moments8 {
+                            m: backend.zeros(&shape, DType::U8)?,
+                            v: backend.zeros(&shape, DType::U8)?,
+                            m_scale: backend.zeros(&blocks, DType::F32)?,
+                            v_scale: backend.zeros(&blocks, DType::F32)?,
+                        }
+                    }
+                };
+                let maps = self.maps(backend, param.value.device())?;
+                let g = grad.dense(backend, &shape)?;
+                unshare(backend, &mut param.value)?;
+                backend.adamw8bit(&mut param.value, &mut moments, &g, &maps, &s.fused())?;
+                self.quantized.insert(name, moments);
+                continue;
+            }
+            let (m, v) = match self.moments.remove(&name) {
+                Some(mv) => mv,
+                None => (
+                    backend.zeros(&shape, DType::F32)?,
+                    backend.zeros(&shape, DType::F32)?,
+                ),
             };
             let (m, v) = match grad {
                 Grad::Rows { indices, values } => {
@@ -347,19 +436,27 @@ impl AdamW {
             tensors.insert(format!("m.{name}"), m.clone());
             tensors.insert(format!("v.{name}"), v.clone());
         }
+        for (name, q) in &self.quantized {
+            tensors.insert(format!("m.{name}"), q.m.clone());
+            tensors.insert(format!("v.{name}"), q.v.clone());
+            tensors.insert(format!("m_scale.{name}"), q.m_scale.clone());
+            tensors.insert(format!("v_scale.{name}"), q.v_scale.clone());
+        }
         OptimizerState {
             steps: self.steps,
             tensors,
         }
     }
 
-    /// Back to a saved state.
+    /// Back to a saved state. Moments in `u8` are codes, with their scales.
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidArgument`] if a moment lacks its pair.
+    /// [`Error::InvalidArgument`] if a moment lacks its pair, or codes their
+    /// scales.
     pub fn restore_state(&mut self, state: OptimizerState) -> Result<()> {
         let mut moments = BTreeMap::new();
+        let mut quantized = BTreeMap::new();
         let mut tensors = state.tensors;
         let names: Vec<String> = tensors
             .keys()
@@ -373,9 +470,31 @@ impl AdamW {
                     op: "AdamW::restore_state",
                     message: format!("a first moment without a second for {name}"),
                 })?;
-            moments.insert(name, (m, v));
+            if m.dtype() == DType::U8 {
+                let mut scale = |prefix: &str| {
+                    tensors.remove(&format!("{prefix}.{name}")).ok_or_else(|| {
+                        Error::InvalidArgument {
+                            op: "AdamW::restore_state",
+                            message: format!("moments in 8 bits without {prefix} for {name}"),
+                        }
+                    })
+                };
+                let (m_scale, v_scale) = (scale("m_scale")?, scale("v_scale")?);
+                quantized.insert(
+                    name,
+                    kapel_ops::Moments8 {
+                        m,
+                        v,
+                        m_scale,
+                        v_scale,
+                    },
+                );
+            } else {
+                moments.insert(name, (m, v));
+            }
         }
         self.restore(state.steps, moments);
+        self.quantized = quantized;
         Ok(())
     }
 }
@@ -866,6 +985,10 @@ impl Optimizer {
                 Optimizer::Muon(muon)
             }
             "adafactor" => Optimizer::Adafactor(Adafactor::new(config.lr, config.weight_decay)),
+            "adamw8bit" => {
+                adamw.eight_bit = true;
+                Optimizer::AdamW(adamw)
+            }
             _ => Optimizer::AdamW(adamw),
         }
     }

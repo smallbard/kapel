@@ -264,3 +264,104 @@ fn a_resumed_run_on_the_card_computes_the_same_bits() {
     }
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// Joined batches are padded ones without their padding: the same
+/// documents a pass, the same losses and weights but for the order of the
+/// sums, fewer tokens computed.
+#[test]
+fn joined_batches_train_as_padded_ones() {
+    let dir = setup("joined");
+    let with = |run: &str, pack| {
+        let mut c = config(&dir, run, "adamw", 4);
+        c.data.pack = pack;
+        c.data.separator = Some(0);
+        c.validate().unwrap();
+        c
+    };
+    let padded = run(&with("padded", kapel_train::data::Pack::Padded), &QUIET).unwrap();
+    let joined = run(&with("joined", kapel_train::data::Pack::Joined), &QUIET).unwrap();
+    let close = |a: f64, b: f64| (a - b).abs() <= 1e-5 * (1.0 + b.abs());
+    assert!(
+        close(joined.loss, padded.loss),
+        "{} and {}",
+        joined.loss,
+        padded.loss
+    );
+    assert!(close(joined.val_loss.unwrap(), padded.val_loss.unwrap()));
+    for (name, w) in &padded.params {
+        let (a, b) = (
+            joined.params[name].to_f64_vec().unwrap(),
+            w.to_f64_vec().unwrap(),
+        );
+        for (x, y) in a.iter().zip(&b) {
+            assert!((x - y).abs() <= 1e-4, "{name}: {x} and {y}");
+        }
+    }
+    let tokens = |run: &str| -> Vec<f64> {
+        std::fs::read_to_string(dir.join(run).join("log.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .filter_map(|v| v.get("loss").and(v.get("tokens")).and_then(|t| t.as_f64()))
+            .collect()
+    };
+    let (p, j) = (tokens("padded"), tokens("joined"));
+    assert_eq!(p.len(), j.len());
+    assert!(j.last() < p.last(), "joined {j:?}, padded {p:?}");
+}
+
+/// With offload, the trained parameters, their summed gradients and the
+/// optimizer's state are on the processor; in `f32` the run computes the
+/// bits of one without, killed and resumed too.
+#[test]
+fn an_offloaded_run_computes_the_bits_of_one_that_is_not() {
+    let dir = setup("offload");
+    // One pass a step (the gradients on the card) and two (summed on the
+    // processor).
+    for (optimizer, tokens) in [("adamw", 64), ("adamw", 128), ("adamw8bit", 128)] {
+        let with = |run: &str, offload: bool| {
+            let mut c = config(&dir, &format!("{run}-{optimizer}-{tokens}"), optimizer, 7);
+            c.batch.tokens = Some(tokens);
+            c.training.offload = offload;
+            c.validate().unwrap();
+            c
+        };
+        let plain = run(&with("plain", false), &QUIET).unwrap();
+        let offloaded = run(&with("offloaded", true), &QUIET).unwrap();
+        assert_eq!(
+            plain.loss.to_bits(),
+            offloaded.loss.to_bits(),
+            "{optimizer}"
+        );
+        assert_eq!(plain.val_loss, offloaded.val_loss);
+        for (name, w) in &plain.params {
+            assert_eq!(
+                w.to_f64_vec().unwrap(),
+                offloaded.params[name].to_f64_vec().unwrap(),
+                "{optimizer} {name}"
+            );
+        }
+        let cut = with("cut", true);
+        run(
+            &cut,
+            &RunOptions {
+                stop_after: Some(3),
+                ..QUIET
+            },
+        )
+        .unwrap();
+        let resumed = run(
+            &cut,
+            &RunOptions {
+                resume: true,
+                ..QUIET
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            resumed.loss.to_bits(),
+            plain.loss.to_bits(),
+            "{optimizer} resumed"
+        );
+    }
+}

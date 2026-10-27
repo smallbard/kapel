@@ -20,6 +20,7 @@
 //! the losses of validation and of the text of control, and the accuracy of
 //! the tasks, are measured.
 
+mod offload;
 mod post;
 
 use std::collections::BTreeMap;
@@ -41,6 +42,7 @@ use crate::model::{Batch, Decoder, Options, Parameter, Parameters, init};
 use crate::optim::{Optimizer, OptimizerState, global_norm};
 use crate::schedule::Schedule;
 use crate::tape::{Compute, Grad, Tape};
+use offload::Offload;
 
 /// What can stop a run.
 #[derive(Debug)]
@@ -368,6 +370,10 @@ struct Run<'a, B: Compute> {
     writer: Writer,
     peak: Option<f64>,
     step_flops: u64,
+    /// The model, for the operations of joined batches.
+    model_config: Config,
+    /// The trained parameters on the processor, with `training.offload`.
+    offload: Option<Offload>,
     /// Called once the first step is done: a profile forgets the
     /// compilation of the kernels.
     after_first: Option<Box<dyn Fn()>>,
@@ -497,10 +503,20 @@ impl<'a, B: Compute> Run<'a, B> {
                     }
                 }
             }
+            // With offload, the optimizer's state stays on the processor.
             let tensors = saved
                 .optimizer
                 .iter()
-                .map(|(n, t)| Ok((n.clone(), backend.upload(t)?)))
+                .map(|(n, t)| {
+                    Ok((
+                        n.clone(),
+                        if config.training.offload {
+                            crate::model::owned(t)?
+                        } else {
+                            backend.upload(t)?
+                        },
+                    ))
+                })
                 .collect::<Result<_>>()?;
             optimizer.restore(OptimizerState {
                 steps: saved.state.optimizer_steps,
@@ -543,8 +559,19 @@ impl<'a, B: Compute> Run<'a, B> {
             None
         };
         // The frozen parameters in the computation's type: half the memory
-        // of a frozen model in `f32`.
-        let params = params.to_mixed(&backend, DType::F32, config.dtype())?;
+        // of a frozen model in `f32`. With offload, the trained ones too, their
+        // values in `f32` kept on the processor.
+        let offload = if config.training.offload {
+            Some(Offload::new(&backend, &params, config.dtype())?)
+        } else {
+            None
+        };
+        let master = if offload.is_some() {
+            config.dtype()
+        } else {
+            DType::F32
+        };
+        let params = params.to_mixed(&backend, master, config.dtype())?;
         let log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -580,6 +607,8 @@ impl<'a, B: Compute> Run<'a, B> {
             writer: Writer::new(config.checkpoint.keep),
             peak,
             step_flops,
+            model_config: model_config.clone(),
+            offload,
             after_first: None,
             peak_memory: None,
             seconds: 0.0,
@@ -608,11 +637,17 @@ impl<'a, B: Compute> Run<'a, B> {
         let accumulate = self.config.batch.accumulate();
         let mut losses = Vec::with_capacity(accumulate);
         let mut sum = Summed::default();
+        // The tokens and operations of joined batches, which vary.
+        let mut joined = (0u64, 0u64);
         for _ in 0..accumulate {
             let Objective::Tokens(train) = &mut self.objective else {
                 unreachable!("a step of tokens");
             };
             let tokens = train.next_batch()?;
+            if self.joined() {
+                joined.0 += tokens.ids.len() as u64;
+                joined.1 += self.joined_flops(&tokens);
+            }
             let (l, grads) = self.pass(&tokens)?;
             losses.push(l);
             self.accumulate(&mut sum, grads)?;
@@ -625,14 +660,59 @@ impl<'a, B: Compute> Run<'a, B> {
             grads: sum.0.into_iter().collect(),
             scale: 1.0 / accumulate as f64,
             loss: values.iter().sum::<f64>() / values.len() as f64,
-            tokens: (self.config.batch.pass() * accumulate) as u64,
-            flops: self.step_flops,
+            tokens: if self.joined() {
+                joined.0
+            } else {
+                (self.config.batch.pass() * accumulate) as u64
+            },
+            flops: if self.joined() {
+                joined.1
+            } else {
+                self.step_flops
+            },
             metrics: serde_json::Map::new(),
         })
     }
 
-    /// Adds the gradients of a pass to those of the step.
+    /// Whether the batches are joined ([`data::Pack::Joined`]): one row of
+    /// a varying length a pass.
+    fn joined(&self) -> bool {
+        self.config.data.pack == data::Pack::Joined
+    }
+
+    /// The rows of a pass of `tokens`.
+    fn rows(&self) -> usize {
+        if self.joined() {
+            1
+        } else {
+            self.config.batch.rows
+        }
+    }
+
+    /// The operations of a pass of a joined batch: each document's, its
+    /// attention over itself.
+    fn joined_flops(&self, tokens: &data::Tokens) -> u64 {
+        tokens
+            .documents()
+            .into_iter()
+            .map(|n| {
+                if self.config.lora.is_some() {
+                    flops::frozen_step_flops(&self.model_config, n, n)
+                } else {
+                    flops::step_flops(&self.model_config, n, n)
+                }
+            })
+            .sum()
+    }
+
+    /// Adds the gradients of a pass to those of the step: on the processor,
+    /// in `f32`, with offload and several passes a step.
     fn accumulate(&self, sum: &mut Summed, grads: Vec<(String, Grad)>) -> Result<()> {
+        if let Some(o) = &self.offload
+            && self.config.batch.accumulate() > 1
+        {
+            return o.accumulate(&self.backend, &mut sum.0, grads);
+        }
         for (name, g) in grads {
             let merged = match sum.0.remove(&name) {
                 Some(t) => {
@@ -659,7 +739,7 @@ impl<'a, B: Compute> Run<'a, B> {
         let batch = Batch {
             ids: &tokens.ids,
             targets: &tokens.targets,
-            rows: self.config.batch.rows,
+            rows: self.rows(),
             segments: tokens.segments.as_deref(),
         };
         let loss = self.decoder.loss(&leaves, &batch, &self.options())?;
@@ -732,13 +812,34 @@ impl<'a, B: Compute> Run<'a, B> {
             let batch = Batch {
                 ids: &tokens.ids,
                 targets: &tokens.targets,
-                rows: self.config.batch.rows,
+                rows: self.rows(),
                 segments: tokens.segments.as_deref(),
             };
             let loss = self.decoder.loss(&leaves, &batch, &self.options())?;
             total += self.backend.download(&loss.value())?.to_f64_vec()?[0];
         }
         Ok(Some(total / val.len().max(1) as f64))
+    }
+
+    /// The value of a parameter: its `f32` copy on the processor with
+    /// offload, else its own.
+    fn value<'p>(&'p self, name: &str, p: &'p Parameter) -> &'p Tensor {
+        self.offload
+            .as_ref()
+            .and_then(|o| o.params.get(name))
+            .map_or(&p.value, |m| &m.value)
+    }
+
+    /// What a checkpoint keeps of `t`: with offload, the processor's
+    /// tensors themselves, the checkpoint written before the next step
+    /// changes them (no copy of the state: it may be most of the memory);
+    /// otherwise [`Self::host_copy`].
+    fn saved(&self, t: &Tensor) -> Result<Tensor> {
+        if self.offload.is_some() && t.device() == kapel_core::Device::Cpu {
+            Ok(t.clone())
+        } else {
+            self.host_copy(t)
+        }
     }
 
     /// A copy of `t` in host memory, of its own: the checkpoint is written
@@ -773,13 +874,13 @@ impl<'a, B: Compute> Run<'a, B> {
             .params
             .iter()
             .filter(|(_, p)| adapter.is_none() || p.trainable)
-            .map(|(n, p)| Ok((n.to_string(), self.host_copy(&p.value)?)))
+            .map(|(n, p)| Ok((n.to_string(), self.saved(self.value(n, p))?)))
             .collect::<Result<_>>()?;
         let state = self.optimizer.state();
         let optimizer = state
             .tensors
             .iter()
-            .map(|(n, t)| Ok((n.clone(), self.host_copy(t)?)))
+            .map(|(n, t)| Ok((n.clone(), self.saved(t)?)))
             .collect::<Result<_>>()?;
         // The optimizer's own handles only, during the next steps.
         let steps = state.steps;
@@ -866,7 +967,12 @@ impl<'a, B: Compute> Run<'a, B> {
                 Objective::Answers(_) => self.answer_step()?,
             };
             let (grads, scale) = (out.grads, out.scale);
-            let norm = global_norm(&self.backend, &self.params, &grads)? * scale;
+            // Summed on the processor with offload and several passes: their
+            // norm computed there, as the card would.
+            let norm = match &self.offload {
+                Some(o) if c.batch.accumulate() > 1 => global_norm(&o.cpu, &o.params, &grads)?,
+                _ => global_norm(&self.backend, &self.params, &grads)?,
+            } * scale;
             let clip = c.training.clip;
             let factor = if clip > 0.0 && norm > clip {
                 clip / norm
@@ -874,8 +980,23 @@ impl<'a, B: Compute> Run<'a, B> {
                 1.0
             };
             if !grads.is_empty() {
-                self.optimizer
-                    .step(&self.backend, &mut self.params, grads, scale * factor)?;
+                match &mut self.offload {
+                    Some(o) => o.step(
+                        &mut self.optimizer,
+                        &self.backend,
+                        &mut self.params,
+                        grads,
+                        scale * factor,
+                    )?,
+                    None => {
+                        self.optimizer.step(
+                            &self.backend,
+                            &mut self.params,
+                            grads,
+                            scale * factor,
+                        )?;
+                    }
+                }
             }
             loss = out.loss;
             (self.synchronize)();
@@ -965,6 +1086,11 @@ impl<'a, B: Compute> Run<'a, B> {
             if (c.checkpoint.every > 0 && self.step.is_multiple_of(c.checkpoint.every)) || last {
                 let checkpoint = self.checkpoint()?;
                 self.writer.write(checkpoint, &self.dir)?;
+                if self.offload.is_some() {
+                    // It holds the processor's tensors, which the next step
+                    // writes in place.
+                    self.writer.finish()?;
+                }
             }
             if let Some(first) = self.after_first.take() {
                 first();
@@ -978,10 +1104,19 @@ impl<'a, B: Compute> Run<'a, B> {
         if self.step == steps && self.tokens_here > 0 {
             self.write_summary(loss, val_loss)?;
         }
+        // With offload, the trained values are already in host memory: moved,
+        // not copied.
+        let mut master = self.offload.take().map(|o| o.params);
         let params = self
             .params
             .iter()
-            .map(|(n, p)| Ok((n.to_string(), self.host_copy(&p.value)?)))
+            .map(|(n, p)| {
+                let value = match master.as_mut().and_then(|m| m.remove(n)) {
+                    Some(m) => m.value,
+                    None => self.host_copy(&p.value)?,
+                };
+                Ok((n.to_string(), value))
+            })
             .collect::<Result<_>>()?;
         Ok(Summary {
             steps: self.step,

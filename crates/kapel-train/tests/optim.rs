@@ -141,3 +141,99 @@ fn both_iterations_of_newton_schulz_give_nearly_orthogonal_matrices() {
         }
     }
 }
+
+/// The target of [`bowl`].
+fn target() -> Vec<f32> {
+    (0..64 * 128)
+        .map(|i| ((i * 7919) % 1000) as f32 / 500.0 - 1.0)
+        .collect()
+}
+
+/// `steps` steps of `opt` on the bowl `½ |w − target|²` from `p`, a
+/// parameter `[64, 128]` (32 blocks of 8-bit moments); the distance to the
+/// target after each.
+fn bowl(opt: &mut AdamW, p: &mut Parameters, steps: usize) -> Vec<f64> {
+    let cpu = kapel_cpu::Cpu::new();
+    let target = target();
+    let mut distances = Vec::new();
+    for _ in 0..steps {
+        let w = p.get("w").unwrap().value.to_vec::<f32>().unwrap();
+        let g: Vec<f32> = w.iter().zip(&target).map(|(w, t)| w - t).collect();
+        let grad = Tensor::from_slice(&g, &[64, 128]).unwrap();
+        opt.step(&cpu, p, vec![("w".into(), Grad::Dense(grad))], 1.0)
+            .unwrap();
+        let w = p.get("w").unwrap().value.to_vec::<f32>().unwrap();
+        let d: f64 = w
+            .iter()
+            .zip(&target)
+            .map(|(w, t)| f64::from(w - t).powi(2))
+            .sum();
+        distances.push(d.sqrt());
+    }
+    distances
+}
+
+fn zeros() -> Parameters {
+    params(&vec![0.0; 64 * 128], &[64, 128], false)
+}
+
+fn eight_bit(lr: f64) -> AdamW {
+    let mut opt = AdamW::new(lr, 0.0);
+    opt.eight_bit = true;
+    opt
+}
+
+#[test]
+fn adamw_in_8_bits_follows_adamw() {
+    let a = bowl(&mut AdamW::new(0.01, 0.0), &mut zeros(), 200);
+    let mut eight = eight_bit(0.01);
+    let b = bowl(&mut eight, &mut zeros(), 200);
+    assert!(eight.moments().is_empty());
+    assert_eq!(eight.quantized()["w"].m_scale.shape(), &[32]);
+    // Both from 51.5 to near the target, never apart by more than 1 % of
+    // where they started.
+    let worst = a
+        .iter()
+        .zip(&b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0, f64::max);
+    eprintln!(
+        "from {:.3} to {:.4} and {:.4}, at most {:.4} apart",
+        a[0], a[199], b[199], worst
+    );
+    assert!(
+        a[199] < 0.001 * a[0] && b[199] < 0.001 * a[0],
+        "{} and {}",
+        a[199],
+        b[199]
+    );
+    assert!(worst < 0.01 * a[0], "{worst}");
+}
+
+#[test]
+fn small_parameters_keep_their_moments_in_f32() {
+    let cpu = kapel_cpu::Cpu::new();
+    let mut p = params(&[1.0, -2.0, 0.5], &[3], true);
+    let mut opt = eight_bit(0.1);
+    let grad = Tensor::from_slice(&[0.5f32, -1.0, 2.0], &[3]).unwrap();
+    opt.step(&cpu, &mut p, vec![("w".into(), Grad::Dense(grad))], 1.0)
+        .unwrap();
+    assert!(opt.quantized().is_empty());
+    assert_eq!(opt.moments()["w"].0.dtype(), kapel_core::DType::F32);
+}
+
+#[test]
+fn moments_in_8_bits_resume_bit_for_bit() {
+    let straight = bowl(&mut eight_bit(0.01), &mut zeros(), 10);
+    let mut p = zeros();
+    let mut half = eight_bit(0.01);
+    bowl(&mut half, &mut p, 5);
+    let state = half.state();
+    drop(half);
+    assert_eq!(state.tensors["m.w"].dtype(), kapel_core::DType::U8);
+    assert!(state.tensors.contains_key("v_scale.w"));
+    let mut resumed = eight_bit(0.01);
+    resumed.restore_state(state).unwrap();
+    let rest = bowl(&mut resumed, &mut p, 5);
+    assert_eq!(rest[4].to_bits(), straight[9].to_bits());
+}

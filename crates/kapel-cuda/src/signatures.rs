@@ -91,6 +91,13 @@ pub(crate) const KERNELS: &[(&str, &[Param])] = &[
         ],
     ),
     (
+        "adamw8bit",
+        &[
+            Slice, Slice, Slice, Slice, Slice, U32, Slice, View, Slice, F32, F32, F32, F32, F32,
+            F32, F32,
+        ],
+    ),
+    (
         "cross_entropy_rows",
         &[U32, Slice, U32, U32, Slice, U32, Slice],
     ),

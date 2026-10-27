@@ -162,7 +162,9 @@ pub struct DataConfig {
     pub shuffle: bool,
     /// `"stream"`: the tokens cut every `batch.length`; `"documents"`:
     /// whole documents in each row, padded; `"padded"`: one document a row,
-    /// cut or padded (TRL's batches without packing).
+    /// cut or padded (TRL's batches without packing); `"joined"`: the
+    /// documents of `"padded"`'s rows in one row without their padding
+    /// (TRL's `padding_free`).
     #[serde(default)]
     pub pack: crate::data::Pack,
     /// Each token attends to its own document only, and positions start
@@ -299,8 +301,8 @@ impl BatchConfig {
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OptimizerConfig {
-    /// `"adamw"`, `"muon"` (the matrices of the blocks; AdamW for the rest)
-    /// or `"adafactor"`.
+    /// `"adamw"`, `"adamw8bit"` (its moments in 8 bits), `"muon"` (the
+    /// matrices of the blocks; AdamW for the rest) or `"adafactor"`.
     #[serde(default = "adamw")]
     pub kind: String,
     /// The peak learning rate.
@@ -452,6 +454,12 @@ pub struct TrainingConfig {
     /// Recompute each block during the backward pass.
     #[serde(default)]
     pub checkpoint_activations: bool,
+    /// Keep the trained parameters in `f32`, their gradients summed over
+    /// the passes and the optimizer's state in the processor's memory: the
+    /// card holds the parameters in the type of the computation only, and
+    /// the optimizer steps on the processor (ZeRO-Offload).
+    #[serde(default)]
+    pub offload: bool,
     /// The rows of logits the loss forms at once.
     #[serde(default = "chunk_default")]
     pub chunk: usize,
@@ -489,6 +497,7 @@ impl Default for TrainingConfig {
             dtype: bf16(),
             clip: 1.0,
             checkpoint_activations: false,
+            offload: false,
             chunk: chunk_default(),
             cache_gib: cache_gib_default(),
             budget: None,
@@ -719,6 +728,20 @@ impl TrainConfig {
                 ));
             }
         }
+        if self.training.offload {
+            if !matches!(self.optimizer.kind.as_str(), "adamw" | "adamw8bit") {
+                return fail(format!(
+                    "training.offload: with adamw or adamw8bit, not {}",
+                    self.optimizer.kind
+                ));
+            }
+            if self.grpo.is_some() {
+                return fail("training.offload: with tokens or dpo, not grpo".into());
+            }
+        }
+        if self.grpo.is_some() && d.pack == crate::data::Pack::Joined {
+            return fail("data.pack: \"joined\" with tokens or dpo, not grpo".into());
+        }
         if let Some(g) = &self.grpo {
             g.validate().map_err(ConfigError)?;
             if g.max_tokens >= b.length {
@@ -742,9 +765,12 @@ impl TrainConfig {
             return fail("data.prefetch: at least 1".into());
         }
         let o = &self.optimizer;
-        if !matches!(o.kind.as_str(), "adamw" | "muon" | "adafactor") {
+        if !matches!(
+            o.kind.as_str(),
+            "adamw" | "adamw8bit" | "muon" | "adafactor"
+        ) {
             return fail(format!(
-                "optimizer.kind: \"adamw\", \"muon\" or \"adafactor\", got {:?}",
+                "optimizer.kind: \"adamw\", \"adamw8bit\", \"muon\" or \"adafactor\", got {:?}",
                 o.kind
             ));
         }

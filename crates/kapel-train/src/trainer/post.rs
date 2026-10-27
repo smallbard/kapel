@@ -167,6 +167,78 @@ fn rows_of(sequences: &[&Sequence], length: usize, pad: u32) -> (Vec<u32>, Vec<u
     preference::rows(sequences, length, pad)
 }
 
+/// Sequences laid out for a pass: a row of `length` each, padded, or with
+/// [`crate::data::Pack::Joined`] one row of all of them without padding, each
+/// attending to itself only.
+struct Laid {
+    ids: Vec<u32>,
+    targets: Vec<u32>,
+    rows: usize,
+    segments: Option<Vec<u32>>,
+    /// Where each sequence is: its first token and its tokens.
+    spans: Vec<(usize, usize)>,
+}
+
+impl Laid {
+    fn new(sequences: &[&Sequence], length: usize, pad: u32, joined: bool) -> Self {
+        let (ids, targets) = rows_of(sequences, length, pad);
+        if !joined {
+            return Self {
+                ids,
+                targets,
+                rows: sequences.len(),
+                segments: None,
+                spans: (0..sequences.len()).map(|i| (i * length, length)).collect(),
+            };
+        }
+        let mut laid = Self {
+            ids: Vec::new(),
+            targets: Vec::new(),
+            rows: 1,
+            segments: Some(Vec::new()),
+            spans: Vec::new(),
+        };
+        for (i, s) in sequences.iter().enumerate() {
+            let n = s.tokens.len().min(length);
+            let start = laid.ids.len();
+            laid.ids.extend_from_slice(&ids[i * length..i * length + n]);
+            laid.targets
+                .extend_from_slice(&targets[i * length..i * length + n]);
+            if let Some(segments) = &mut laid.segments {
+                segments.extend(std::iter::repeat_n(i as u32, n));
+            }
+            laid.spans.push((start, n));
+        }
+        laid
+    }
+
+    fn batch(&self) -> Batch<'_> {
+        Batch {
+            ids: &self.ids,
+            targets: &self.targets,
+            rows: self.rows,
+            segments: self.segments.as_deref(),
+        }
+    }
+
+    /// The sum over each sequence of per-token values.
+    fn sums(&self, values: &[f64]) -> Vec<f64> {
+        self.spans
+            .iter()
+            .map(|&(s, n)| values[s..s + n].iter().sum())
+            .collect()
+    }
+
+    /// One value a sequence spread over its tokens.
+    fn spread(&self, per_sequence: &[f32]) -> Vec<f32> {
+        let mut out = vec![0.0; self.ids.len()];
+        for (&(s, n), &v) in self.spans.iter().zip(per_sequence) {
+            out[s..s + n].fill(v);
+        }
+        out
+    }
+}
+
 impl<B: Compute> Run<'_, B> {
     /// `params` frozen: constants on a tape.
     fn frozen(params: &Parameters) -> Parameters {
@@ -200,19 +272,49 @@ impl<B: Compute> Run<'_, B> {
     /// gradients: `[rows · length]`, 0 where the target is ignored.
     fn token_logps(&self, params: &Parameters, ids: &[u32], targets: &[u32]) -> Result<Vec<f64>> {
         let rows = ids.len() / self.config.batch.length;
+        self.batch_logps(
+            params,
+            &Batch {
+                ids,
+                targets,
+                rows,
+                segments: None,
+            },
+        )
+    }
+
+    /// [`Self::token_logps`] of a batch laid out as it is.
+    fn batch_logps(&self, params: &Parameters, batch: &Batch<'_>) -> Result<Vec<f64>> {
         let tape = Tape::new(self.backend.clone());
         let leaves = params.leaves(&tape);
-        let batch = Batch {
-            ids,
-            targets,
-            rows,
-            segments: None,
-        };
-        let losses = self
-            .decoder
-            .token_losses(&leaves, &batch, &self.options())?;
+        let losses = self.decoder.token_losses(&leaves, batch, &self.options())?;
         let values = self.backend.download(&losses.value())?.to_f64_vec()?;
         Ok(values.into_iter().map(|l| -l).collect())
+    }
+
+    /// Whether pairs are joined ([`crate::data::Pack::Joined`]).
+    fn joined_pairs(&self) -> bool {
+        self.config.data.pack == crate::data::Pack::Joined
+    }
+
+    /// The operations of a pass of training over `laid`, and of
+    /// `references` forward passes over it: by sequence when joined.
+    fn laid_flops(&self, laid: &Laid, references: usize) -> u64 {
+        if laid.segments.is_none() {
+            return self.pass_flops(laid.rows, references);
+        }
+        let c = self.decoder.config();
+        laid.spans
+            .iter()
+            .map(|&(_, n)| {
+                let train = if self.config.lora.is_some() {
+                    flops::frozen_step_flops(c, n, n)
+                } else {
+                    flops::step_flops(c, n, n)
+                };
+                train + 2 * references as u64 * flops::forward_macs(c, 1, n)
+            })
+            .sum()
     }
 
     /// The operations of the passes of training over `rows` rows, and of
@@ -235,7 +337,7 @@ impl<B: Compute> Run<'_, B> {
         let (rows, length) = (self.config.batch.rows, self.config.batch.length);
         let reference = self.reference_params();
         let mut sum = Summed::default();
-        let (mut loss, mut tokens) = (0.0, 0u64);
+        let (mut loss, mut tokens, mut flops) = (0.0, 0u64, 0u64);
         let mut means: BTreeMap<&str, f64> = BTreeMap::new();
         for _ in 0..accumulate {
             let Objective::Pairs(p) = &mut self.objective else {
@@ -248,28 +350,16 @@ impl<B: Compute> Run<'_, B> {
                 .iter()
                 .flat_map(|p| [&p.chosen, &p.rejected])
                 .collect();
-            let (ids, targets) = rows_of(&sequences, length, pad);
-            let sums = |logps: &[f64]| -> Vec<f64> {
-                logps.chunks(length).map(|r| r.iter().sum()).collect()
-            };
-            let reference = sums(&self.token_logps(&reference, &ids, &targets)?);
+            let laid = Laid::new(&sequences, length, pad, self.joined_pairs());
+            let reference = laid.sums(&self.batch_logps(&reference, &laid.batch())?);
             let tape = Tape::new(self.backend.clone());
             let leaves = self.params.leaves(&tape);
-            let batch = Batch {
-                ids: &ids,
-                targets: &targets,
-                rows,
-                segments: None,
-            };
             // `−ln π` of each token, summed on the host as the reference's.
             let losses = self
                 .decoder
-                .token_losses(&leaves, &batch, &self.options())?;
+                .token_losses(&leaves, &laid.batch(), &self.options())?;
             let values = self.backend.download(&losses.value())?.to_f64_vec()?;
-            let policy: Vec<f64> = values
-                .chunks(length)
-                .map(|r| -r.iter().sum::<f64>())
-                .collect();
+            let policy: Vec<f64> = laid.sums(&values).iter().map(|v| -v).collect();
             let even = |v: &[f64]| v.iter().step_by(2).copied().collect::<Vec<_>>();
             let odd = |v: &[f64]| v.iter().skip(1).step_by(2).copied().collect::<Vec<_>>();
             let lengths: Vec<usize> = pairs.iter().map(|p| p.chosen.answer_tokens()).collect();
@@ -284,16 +374,14 @@ impl<B: Compute> Run<'_, B> {
             );
             // Each token of a row holds its part of `−ln π`: its gradient is
             // the opposite of the row's (the ignored ones give none).
-            let g: Vec<f32> = terms
+            let per_sequence: Vec<f32> = terms
                 .chosen
                 .iter()
                 .zip(&terms.rejected)
                 .flat_map(|(c, r)| [-*c as f32, -*r as f32])
-                .flat_map(|d| std::iter::repeat_n(d, length))
                 .collect();
-            let g = self
-                .backend
-                .upload(&Tensor::from_slice(&g, &[rows * length])?)?;
+            let g = laid.spread(&per_sequence);
+            let g = self.backend.upload(&Tensor::from_slice(&g, &[g.len()])?)?;
             let g = self.backend.forward(
                 &kapel_ops::Cast {
                     dtype: losses.dtype(),
@@ -305,7 +393,8 @@ impl<B: Compute> Run<'_, B> {
             let grads = leaves.gradients(&mut grads);
             self.accumulate(&mut sum, grads)?;
             loss += terms.loss / accumulate as f64;
-            tokens += (rows * length) as u64;
+            tokens += laid.ids.len() as u64;
+            flops += self.laid_flops(&laid, 1);
             for (k, v) in [
                 ("accuracy", terms.accuracy),
                 ("chosen_reward", terms.chosen_reward),
@@ -321,7 +410,7 @@ impl<B: Compute> Run<'_, B> {
             scale: 1.0 / accumulate as f64,
             loss,
             tokens,
-            flops: accumulate as u64 * self.pass_flops(rows, 1),
+            flops,
             metrics: means
                 .into_iter()
                 .map(|(k, v)| (k.to_string(), json!(v)))
@@ -348,12 +437,9 @@ impl<B: Compute> Run<'_, B> {
                 .iter()
                 .flat_map(|p| [&p.chosen, &p.rejected])
                 .collect();
-            let (ids, targets) = rows_of(&sequences, length, p.pad);
-            let sums_of = |logps: Vec<f64>| -> Vec<f64> {
-                logps.chunks(length).map(|r| r.iter().sum()).collect()
-            };
-            let policy = sums_of(self.token_logps(&policy_params, &ids, &targets)?);
-            let reference = sums_of(self.token_logps(&reference_params, &ids, &targets)?);
+            let laid = Laid::new(&sequences, length, p.pad, self.joined_pairs());
+            let policy = laid.sums(&self.batch_logps(&policy_params, &laid.batch())?);
+            let reference = laid.sums(&self.batch_logps(&reference_params, &laid.batch())?);
             let even = |v: &[f64]| v.iter().step_by(2).copied().collect::<Vec<_>>();
             let odd = |v: &[f64]| v.iter().skip(1).step_by(2).copied().collect::<Vec<_>>();
             let lengths: Vec<usize> = chunk.iter().map(|p| p.chosen.answer_tokens()).collect();

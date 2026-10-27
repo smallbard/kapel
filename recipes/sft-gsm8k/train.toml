@@ -16,7 +16,7 @@ init = "weights"
 
 [data]
 train = "data"
-pack = "padded"
+pack = "joined"          # the 16 examples of a step in one row, no padding
 shuffle = true
 seed = 0
 

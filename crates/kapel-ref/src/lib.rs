@@ -203,6 +203,17 @@ mod tests {
         ) -> Result<()> {
             Reference.adamw(param, m, v, grad, step)
         }
+
+        fn adamw8bit(
+            &self,
+            param: &mut Tensor,
+            moments: &mut kapel_ops::Moments8,
+            grad: &Tensor,
+            maps: &Tensor,
+            step: &kapel_ops::AdamWStep,
+        ) -> Result<()> {
+            Reference.adamw8bit(param, moments, grad, maps, step)
+        }
     }
 
     impl kapel_ops::Record for Typed {

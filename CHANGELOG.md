@@ -320,6 +320,24 @@ changelog says how.
 - `tools/bench/recipes.py` and the suite `train` of `tools/bench/run.sh`: the
   speed, memory and loss of each recipe on a few steps, tracked by the
   workflow `measures`.
+- `optimizer.kind = "adamw8bit"`: AdamW with its moments in 8 bits, as
+  bitsandbytes' blockwise `AdamW8bit` (its dynamic maps bit for bit, a scale
+  every 256 elements), 2 bytes a parameter instead of 8, the tables' moments
+  in `f32`; `Update::adamw8bit` on every backend, a kernel on the card. Qwen 3
+  1.7B trains with all its weights on an RTX 3090.
+- `data.pack = "joined"`: the documents of `"padded"` one after the other in a
+  single row without their padding, attention within each, for fine-tuning
+  and DPO's pairs: the same examples a pass, only their tokens computed (TRL's
+  `padding_free`). The recipes `sft-gsm8k`, `sft-lora-gsm8k` and
+  `dpo-ultrafeedback` use it: 5 min 24 s, 4 min 25 s and 14 min instead of 7,
+  7 and 26, for the same results.
+- `training.offload`: the trained parameters in `f32` and AdamW's state in the
+  processor's memory, the card holding the parameters in the computation's
+  type (ZeRO-Offload), each parameter's step made on the processor as its
+  gradient comes down; the gradients summed there over several passes; the
+  bits of a run without it in `f32`. Llama 3.2 3B trains with all its weights
+  on an RTX 3090.
+- `kapel-cpu`: AdamW reads a bf16 gradient in place, piece by piece.
 
 ### Changed
 

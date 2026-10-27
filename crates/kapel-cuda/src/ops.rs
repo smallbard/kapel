@@ -2472,4 +2472,53 @@ impl kapel_ops::Update for Cuda {
                 .f32(step.grad_scale as f32),
         )
     }
+
+    /// One block of 256 threads per block of the moments, one thread per
+    /// element; the block's scales from its largest moments.
+    fn adamw8bit(
+        &self,
+        param: &mut Tensor,
+        moments: &mut kapel_ops::Moments8,
+        grad: &Tensor,
+        maps: &Tensor,
+        step: &kapel_ops::AdamWStep,
+    ) -> Result<()> {
+        let op = kapel_ops::ADAMW8;
+        kapel_ops::check_adamw8bit(param, moments, grad, maps)?;
+        let n = param.numel();
+        let blocks = n.div_ceil(kapel_ops::BLOCK8);
+        let g = self.float_arg(op, grad, grad.layout())?;
+        let table = self.flat(op, maps)?;
+        let kapel_ops::Moments8 {
+            m,
+            v,
+            m_scale,
+            v_scale,
+        } = moments;
+        let (pp, mp, vp) = (
+            self.writable(op, param)?,
+            self.writable(op, m)?,
+            self.writable(op, v)?,
+        );
+        let (msp, vsp) = (self.writable(op, m_scale)?, self.writable(op, v_scale)?);
+        self.launch(
+            "adamw8bit",
+            blocks * kapel_ops::BLOCK8,
+            Args::new()
+                .slice(pp, n)
+                .slice(mp, n)
+                .slice(vp, n)
+                .slice(msp, blocks)
+                .slice(vsp, blocks)
+                .float(&g)
+                .flat(&table)
+                .f32(step.beta1 as f32)
+                .f32(step.beta2 as f32)
+                .f32((1.0 - step.lr * step.weight_decay) as f32)
+                .f32((step.lr / step.correction1) as f32)
+                .f32(step.correction2 as f32)
+                .f32(step.eps as f32)
+                .f32(step.grad_scale as f32),
+        )
+    }
 }
