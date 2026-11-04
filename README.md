@@ -92,11 +92,21 @@ for NVIDIA cards. On an RTX 3090, Llama 3.2 3B serves about 20 requests a second
 
 Kapel is built in three stages:
 
-1. **the foundation**: tensors, backends, reading models and tokenizers, tooling
-2. **inference**: loading, quantizing and serving models, on the processor and on
-   the card
-3. **training**: pre-training and fine-tuning models, on a single card as well as on
-   several machines of several cards each
+1. **The foundation**: tensors, backends, reading models and tokenizers, tooling.
+   Done.
+2. **Inference**: loading, quantizing and serving models, on the processor and on
+   the card. Done, but for the ARM kernels and the first releases on crates.io and
+   PyPI.
+3. **Training**: pre-training and fine-tuning models, bit-reproducible, on a single
+   card as well as on several machines of several cards each. Done on one card:
+   `kapel train` (AdamW, AdamW in 8 bits, Muon, Adafactor), LoRA and QLoRA, DPO,
+   GRPO, scaling-law sweeps, `kapel export` to the Hub. Several ranks already
+   compute the same bits as one (data parallelism, ZeRO 1 and 2, FSDP); what is
+   left is their speed across cards: NCCL, communication overlapped with
+   computation, Slurm.
+
+*The Kapel Book* (`docs/book`) describes how Kapel works, and *The Kapel Guide*
+(`docs/guide`) how to use it.
 
 ## License
 
