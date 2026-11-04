@@ -134,4 +134,4 @@
 | The Python module | `crates/kapel-python/src/lib.rs`, `crates/kapel-python/kapel.pyi`, `crates/kapel-python/tests/` |
 | Parity references | `tools/parity/*.py`, data in `data/parity/` |
 | Fuzzing | `fuzz/fuzz_targets/`, `fuzz/regressions/` |
-| Rules and plans | `CONTRIBUTING.md`, `SECURITY.md`, `PLAN-*.md` (in French), `CHANGELOG.md` |
+| Rules | `CONTRIBUTING.md`, `SECURITY.md`, `CHANGELOG.md` |

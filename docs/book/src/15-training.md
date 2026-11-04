@@ -2,7 +2,7 @@
 
 Every operation of the catalogue has had a backward pass since chapter 4: `Run::backward` turns the gradient of an output into the gradients of the inputs, and the conformity suite checks it on every backend. This chapter is about putting those derivatives to work. `kapel-train` records a computation on a tape, runs it backwards to get the gradient of a loss with respect to the parameters, and moves the parameters with an optimizer. The decoders of chapter 10 train on it without a second implementation: the same weights, by the same names, through the same operations.
 
-Sections 15.1 to 15.7 are step T0 of the training plan, the differentiation; sections 15.8 to 15.12 are step T1, a training run on one card as fast as llm.c, with everything around it; section 15.13 is step T2, the data. Post-training, step T4, is chapter 16; the tools of experiments come after it.
+Sections 15.1 to 15.7 are the differentiation; sections 15.8 to 15.12 a training run on one card as fast as llm.c, with everything around it; section 15.13 the data. Post-training is chapter 16; the tools of experiments come after it.
 
 ## 15.1 The tape
 
@@ -77,7 +77,7 @@ GPT-2's first checkpoints (`openai-community/gpt2`) name their weights after `GP
 
 ## 15.6 Measured
 
-The validation of step T0 is GPT-2 124M on an RTX 3090, with a batch of 16 × 1024 tokens of wikitext-2: its gradients equal PyTorch's within the tolerance of bf16, and the peak memory is at most 10 % above PyTorch's. The reference is nanoGPT's model (its attention by `scaled_dot_product_attention`), with GPT-2's weights, the model in `f32` and the pass under autocast to bf16, as nanoGPT trains; `transformers`' own GPT-2 runs out of memory at this batch, since it forms the logits whole in bf16 then in f32. `tools/train/gradients.py` runs PyTorch and compares the gradients; the example `gradients` of `kapel-train` runs Kapel.
+The validation of the differentiation is GPT-2 124M on an RTX 3090, with a batch of 16 × 1024 tokens of wikitext-2: its gradients equal PyTorch's within the tolerance of bf16, and the peak memory is at most 10 % above PyTorch's. The reference is nanoGPT's model (its attention by `scaled_dot_product_attention`), with GPT-2's weights, the model in `f32` and the pass under autocast to bf16, as nanoGPT trains; `transformers`' own GPT-2 runs out of memory at this batch, since it forms the logits whole in bf16 then in f32. `tools/train/gradients.py` runs PyTorch and compares the gradients; the example `gradients` of `kapel-train` runs Kapel.
 
 | | PyTorch bf16 | Kapel bf16 | Kapel bf16, checkpointed | Kapel f32 |
 | --- | --- | --- | --- | --- |
@@ -86,7 +86,7 @@ The validation of step T0 is GPT-2 124M on an RTX 3090, with a batch of 16 × 10
 | Peak memory | 13.54 GiB | 6.41 GiB | 2.57 GiB | 10.84 GiB |
 | Forward and backward | 0.28 s | 0.55 s | 0.64 s | 5.75 s |
 
-These are the measures at the end of step T0; section 15.12 has those of step T1. The distance is the norm of the difference of all gradients over the norm of PyTorch's in f32. In bf16, PyTorch's own gradients are 16.6 % from its f32 ones, and the worst tensor for both is the final norm's weight: that is the precision of bf16 on this model, and Kapel's gradients are as close. Kapel's peak memory is less than half of PyTorch's: the activations kept are those of the derivatives only, and the logits are never whole. With every block checkpointed, it is a fifth.
+These are the measures taken when the differentiation was done; section 15.12 has those of the training loop. The distance is the norm of the difference of all gradients over the norm of PyTorch's in f32. In bf16, PyTorch's own gradients are 16.6 % from its f32 ones, and the worst tensor for both is the final norm's weight: that is the precision of bf16 on this model, and Kapel's gradients are as close. Kapel's peak memory is less than half of PyTorch's: the activations kept are those of the derivatives only, and the logits are never whole. With every block checkpointed, it is a fifth.
 
 The example `steps` trains the model from GPT-2's initialization with AdamW at 6 × 10⁻⁴: the loss goes from 11.02 to 7.34 in 30 steps, 0.57 s each.
 
@@ -152,7 +152,7 @@ A group of parameters (`optimizer.groups`) sets, for the names its pattern match
 
 ## 15.10 Mixed precision
 
-The parameters and the optimizer's moments are `f32`, the master weights. Each pass converts the parameters to the computation's type (`training.dtype`, bf16 by default) and computes in it; the conversions' derivatives bring the gradients back to `f32` for the optimizer. The losses are `f32`. 8-bit floats for the products, which the plan asks on Ada and Hopper cards, are left for a card that has them: the RTX 3090 is an Ampere.
+The parameters and the optimizer's moments are `f32`, the master weights. Each pass converts the parameters to the computation's type (`training.dtype`, bf16 by default) and computes in it; the conversions' derivatives bring the gradients back to `f32` for the optimizer. The losses are `f32`. 8-bit floats for the products, which Ada and Hopper cards offer, are left for a card that has them: the RTX 3090 is an Ampere.
 
 **Offload.** With `training.offload = true`, the master weights leave the card, as ZeRO-Offload does (Ren et al., 2021): the trained parameters stay in `f32` in the processor's memory, and the card holds them in the computation's type only (`Parameters::to_mixed`), 2 bytes a parameter, their gradients 2 more. With one pass a step, the gradients stay on the card, where the clipping's norm is computed; then each parameter in turn has its gradient made row-major on the card (the gradient of a weight is a transposed view) and brought down, its AdamW step made by the processor's backend, which reads the bf16 gradient in place, and its new value rounded to bf16 on every core and written back into the card's copy (`trainer/offload.rs`). One gradient at a time is in the processor's memory: 12 bytes a parameter there with AdamW, 6 in 8 bits. With several passes a step, each pass's gradients are added in place to sums in `f32` there, 4 bytes a parameter more, and the norm is computed there. A checkpoint takes the processor's tensors without copying them and is written before the next step; the run's summary takes them over. AdamW only (in 32 or 8 bits), whose step goes parameter by parameter (`AdamW::advance` and `AdamW::update`). In `f32` on the processor, an offloaded run computes the bits of one that is not, with one pass a step or two, killed and resumed too (`an_offloaded_run_computes_the_bits_of_one_that_is_not`).
 
@@ -168,7 +168,7 @@ A checkpoint is a directory `step-NNNNNNNN` in the run's (`checkpoint.rs`): `mod
 
 ## 15.12 As fast as llm.c
 
-The validation of step T1 is GPT-2 124M reaching the target loss of modded-nanogpt's speedrun, 3.28 on FineWeb's validation, in at most 1.2 times llm.c's time with the same settings on the same card. With llm.c's settings, 3.28 takes about 10 billion tokens: some 45 hours on an RTX 3090 for each side, and more disk than the machine had. The validation was therefore cut in two: the time of a step with the same settings, and the losses of a shorter run, both from new weights.
+The validation of training on one card is GPT-2 124M reaching the target loss of modded-nanogpt's speedrun, 3.28 on FineWeb's validation, in at most 1.2 times llm.c's time with the same settings on the same card. With llm.c's settings, 3.28 takes about 10 billion tokens: some 45 hours on an RTX 3090 for each side, and more disk than the machine had. The validation was therefore cut in two: the time of a step with the same settings, and the losses of a shorter run, both from new weights.
 
 For one pass of 16 × 1024 tokens a step, llm.c takes 0.27 s on the RTX 3090. The first version of the loop took 0.80 s, with its clipping and its optimizer. The gap closed in a dozen changes, each measured by the profile of section 15.7 and by `nsys`, in the order they were made:
 
@@ -196,7 +196,7 @@ With llm.c's settings, 32 passes accumulated for a step of 524,288 tokens:
 | MFU | 70 % | 64 % |
 | Peak memory | 12.9 GiB (the card's memory in use, as llm.c reports it) | 7.9 GiB (the allocator's peak, `peak_gib` in `log.jsonl`) |
 
-Kapel takes 1.16 times llm.c's time: within the 1.2 the plan asks. The products are about two thirds of a step and run at 55 to 71 Top/s of the card's 71. The rest is in the layer norm's backward pass, which writes and reads its rows' parts of the weight gradients in `f32`, and in the many small operations around the products.
+Kapel takes 1.16 times llm.c's time: within the target of 1.2. The products are about two thirds of a step and run at 55 to 71 Top/s of the card's 71. The rest is in the layer norm's backward pass, which writes and reads its rows' parts of the weight gradients in `f32`, and in the many small operations around the products.
 
 The losses come from 250 such steps, 131 million tokens, both runs from new weights with the same schedule (25 steps of warmup, then a cosine down to a tenth of 6 × 10⁻⁴), validated every 50 steps on the same 327,680 tokens of FineWeb's validation. llm.c draws its training samples in a shuffled order and Kapel reads them in the files' order, so llm.c was also run with its shuffling turned off, reading the very tokens Kapel reads:
 
@@ -236,7 +236,7 @@ The data of a run is prepared once, then read by every step without the step wai
 | A step of GPT-2 124M waiting for its batch (16 × 1024, prefetched) | 0.003 ms of 316 |
 | The same step with documents and their mask | 317.6 ms, against 315.9 without |
 
-The plan asks that loading take less than 1 % of a step of a 1B model on 8 cards. Eight H100 at 40 % of their bf16 peak (989 Top/s each) train a 1B model, some 6 × 10⁹ operations a token, on about half a million tokens a second; one thread of the loader gives 730 million, and each card's process would have its own. On one card, a step waits 0.003 ms for its batch: a hundred-thousandth of its time.
+The target is that loading take less than 1 % of a step of a 1B model on 8 cards. Eight H100 at 40 % of their bf16 peak (989 Top/s each) train a 1B model, some 6 × 10⁹ operations a token, on about half a million tokens a second; one thread of the loader gives 730 million, and each card's process would have its own. On one card, a step waits 0.003 ms for its batch: a hundred-thousandth of its time.
 
 ## 15.14 Several ranks
 

@@ -1,6 +1,6 @@
 # 16. Post-training: kapel-train
 
-A model that continues text is not yet an assistant that answers. Between the two comes post-training: the model learns the form of a conversation from examples (supervised fine-tuning), then which of two answers is better (DPO), then to find right answers by trying (GRPO). It costs far less computation than pre-training, and Smallem's series (`PLAN-POST-ENTRAINEMENT.md` of Smallem) went through each method on a model of 29 million parameters. This chapter is step T4 of the training plan: the same methods for published models, on the loop of chapter 15, with the adapters that let a single card adjust a model of several billion parameters.
+A model that continues text is not yet an assistant that answers. Between the two comes post-training: the model learns the form of a conversation from examples (supervised fine-tuning), then which of two answers is better (DPO), then to find right answers by trying (GRPO). It costs far less computation than pre-training, and Smallem went through each method on a model of 29 million parameters. This chapter brings the same methods to published models, on the loop of chapter 15, with the adapters that let a single card adjust a model of several billion parameters.
 
 Every method is a run of `kapel train`, its configuration choosing what a step learns from: tokens (`[data]`, pre-training and supervised fine-tuning), pairs of answers (`[dpo]`) or answers the model writes (`[grpo]`). `[lora]` freezes the model and trains adapters beside it, whatever the method. The objectives of DPO and GRPO are in `crates/kapel-train/src/trainer/post.rs`.
 
@@ -124,7 +124,7 @@ Both adapters were then answered greedily on the 1,319 problems of the test spli
 | Fine-tuned by Kapel | 48.3 % | 47.9 % |
 | Fine-tuned by TRL | 47.5 % | 47.2 % |
 
-Kapel is within 1 point of TRL, the plan's target, by either evaluator: 0.8 and 0.7. Greedy answers in bf16 part ways as soon as one token differs: on the first 200 problems, the two evaluators give the same answer to TRL's adapter 127 times, and their accuracies over the whole test differ by 0.3. Both fine-tunings lower the accuracy of the model. GSM8K's answers are short, with its calculator's annotations (`<<48/2=24>>`): they teach the model a reasoning shorter than its own, 138 tokens an answer against 230.
+Kapel is within 1 point of TRL, the target, by either evaluator: 0.8 and 0.7. Greedy answers in bf16 part ways as soon as one token differs: on the first 200 problems, the two evaluators give the same answer to TRL's adapter 127 times, and their accuracies over the whole test differ by 0.3. Both fine-tunings lower the accuracy of the model. GSM8K's answers are short, with its calculator's annotations (`<<48/2=24>>`): they teach the model a reasoning shorter than its own, 138 tokens an answer against 230.
 
 The steps took 6 minutes 55 seconds in Kapel, 881 ms each at 9,300 tokens a second, and 6 minutes 22 in TRL. Kapel pads every row to 512 tokens and TRL each batch to its longest, so Kapel computes more tokens of padding. Kapel's peak was 13.3 GiB, its activations all kept; TRL's 2.5 GiB, recomputing them, its default (`training.checkpoint_activations` does the same in Kapel).
 

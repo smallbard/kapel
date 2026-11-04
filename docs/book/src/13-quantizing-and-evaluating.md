@@ -102,7 +102,7 @@ The scores come from `Scorer` (`crates/kapel-infer/src/score.rs`): `score(contex
 | ARC Challenge, acc / acc\_norm | 0.15 / 0.25 | 0.15 / 0.25 |
 | MMLU, acc | 0.242105 | 0.242105, each of the 57 subjects the same |
 
-The perplexities differ by 0.001 %, the plan's bound being 0.5 %.
+The perplexities differ by 0.001 %, the target being 0.5 %.
 
 ## 13.7 What a quantization costs
 

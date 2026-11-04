@@ -8,7 +8,7 @@ Kapel succeeds Smallem, an educational project that built a language model in Ru
 
 ## The rules
 
-Five rules shape almost every design decision in the code. They are stated in `CONTRIBUTING.md` and in the plan documents, and they come back in every chapter of this book.
+Five rules shape almost every design decision in the code. They are stated in `CONTRIBUTING.md`, and they come back in every chapter of this book.
 
 1. **Every fast backend is checked against the reference.** The reference backend computes each operation in `f64`, as plainly as possible. A new operation comes with its reference definition, its gradient, and a conformity test with a written tolerance (chapter 5).
 2. **Results do not depend on the number of threads.** Work is split according to tensor shapes, never according to the hardware. Two runs give the same bits, and tests check it with 1, 2, 3 and 8 threads (chapter 6).
@@ -18,17 +18,17 @@ Five rules shape almost every design decision in the code. They are stated in `C
 
 The development hardware is a Ryzen 7 7700 (Zen 4, with AVX-512 and its bf16 extension) and an RTX 3090 (Ampere, 24 GB). Several tuning constants in the code are named after it, such as the block sizes `Blocks::ZEN4`.
 
-## Three plans
+## Where it stands
 
-The work is organised in three plans, each a sequence of steps with a goal and a validation criterion. The plan documents at the root of the repository are written in French.
+The work is organised in three parts, each a sequence of steps with a goal and a validation criterion measured against a reference implementation.
 
-| Plan | File | Goal | Steps | State on 24 October 2026 |
-| --- | --- | --- | --- | --- |
-| Foundation | `PLAN-SOCLE.md` | Tensors, backends, model files, tooling | S0–S5 | All six steps done |
-| Inference | `PLAN-INFERENCE.md` | Load, quantize and serve small models on CPU and GPU | I0–I6 | I0 (correct generation), I1 (the CPU, but for ARM), I2 (the card), I3 (serving) I4 (speculative decoding, without several GPUs nor off-card tables) and I5 (quantizing one's own models) done on 23 October 2026; I6 (being used) done but for its first releases |
-| Training | `PLAN-ENTRAINEMENT.md` | Bit-reproducible training up to a few billion parameters, on one card (the steps that need several are set aside for now) | T0–T6 | T0 (differentiation) and T1 (training on one card) done on 24 October 2026 |
+| Part | Goal | State on 4 November 2026 |
+| --- | --- | --- |
+| Foundation | Tensors, backends, model files, tooling | Done |
+| Inference | Load, quantize and serve small models on CPU and GPU | Done, but for the ARM kernels and the first releases |
+| Training | Bit-reproducible training up to a few billion parameters | Done on one card; the speed on several cards is left |
 
-The inference plan targets one sequence at a time on a CPU first. Smallem showed that a small int4 model generates faster on a Ryzen than on an RTX 3090: token-by-token generation waits on memory, and a well-programmed CPU uses nearly all of its bandwidth. Batched generation on a GPU, with a paged cache, came after, then a server that computes the requests of many clients together.
+Inference aimed first at one sequence at a time on a CPU. Smallem showed that a small int4 model generates faster on a Ryzen than on an RTX 3090: token-by-token generation waits on memory, and a well-programmed CPU uses nearly all of its bandwidth. Batched generation on a GPU, with a paged cache, came after, then a server that computes the requests of many clients together.
 
 ## What exists today
 
