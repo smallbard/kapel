@@ -593,7 +593,7 @@ fn random_quantized(rng: &mut Rng, shape: &[usize], dtype: DType) -> Tensor {
     // Where each format keeps its `f16` scales and minimums; Kapel's formats
     // start with an `f32` scale.
     let halves: &[usize] = match dtype {
-        DType::Quantized(Q::Q8_0 | Q::Q4_0 | Q::Q5_0) => &[0],
+        DType::Quantized(Q::Q8_0 | Q::Q4_0 | Q::Q5_0 | Q::Iq4Nl | Q::Iq4Xs | Q::Iq3S) => &[0],
         DType::Quantized(Q::Q4_1 | Q::Q5_1 | Q::Q4K | Q::Q5K) => &[0, 2],
         DType::Quantized(Q::Q2K) => &[80, 82],
         DType::Quantized(Q::Q3K) => &[108],
@@ -893,6 +893,9 @@ fn cases<V: Visitor>(v: &mut V, dtype: DType) {
                 Q::Q4K,
                 Q::Q5K,
                 Q::Q6K,
+                Q::Iq4Nl,
+                Q::Iq4Xs,
+                Q::Iq3S,
             ]
             .map(DType::Quantized),
         );
@@ -921,6 +924,60 @@ fn cases<V: Visitor>(v: &mut V, dtype: DType) {
                 &QuantizedMatmul,
                 format!("[{rows}, 512] · [q4_k [5, 512]; q6_k [3, 512]; q8_0 [2, 512]]ᵀ"),
                 args,
+            );
+        }
+    }
+
+    // Mixtures of experts: the choice of experts (with ties, taken by the
+    // lower position), their probabilities, and the products by them.
+    {
+        use kapel_core::QuantFormat as Q;
+        use kapel_ops::{ExpertMatmul, GatherColumns, TopK};
+        let mut probs = random(rng, &[5, 16], dtype, 0.0, 1.0)
+            .to_f64_vec()
+            .expect("host values");
+        probs[3 * 16 + 2] = 0.5;
+        probs[3 * 16 + 9] = 0.5;
+        probs[3 * 16 + 11] = 0.5;
+        let probs = Tensor::from_slice(&probs, &[5, 16])
+            .and_then(|t| Reference.forward(&Cast { dtype }, &[&t]))
+            .expect("values");
+        for k in [1, 3, 16] {
+            v.visit(
+                &TopK { k },
+                format!("{k} of [5, 16]"),
+                vec![plain(probs.clone())],
+            );
+        }
+        let chosen = indices(rng, &[5, 3], 16);
+        v.visit(
+            &GatherColumns,
+            "[5, 16] at [5, 3]".into(),
+            vec![plain(probs.clone()), plain(chosen)],
+        );
+        let experts = indices(rng, &[5, 3], 4);
+        let op = ExpertMatmul { experts: 4 };
+        for w in [
+            random(rng, &[4 * 7, 64], dtype, -1.0, 1.0),
+            random_quantized(rng, &[4 * 7, 256], DType::Quantized(Q::Q8_0)),
+            random_quantized(rng, &[4 * 7, 256], DType::Quantized(Q::Iq4Xs)),
+            random_quantized(rng, &[4 * 7, 256], DType::Quantized(Q::Iq3S)),
+        ] {
+            let width = w.shape()[1];
+            let format = w.dtype();
+            v.visit(
+                &op,
+                format!("[5, {width}] by 3 of 4 experts of {format} [7, {width}]"),
+                vec![
+                    x(rng, &[5, width]),
+                    plain(w.clone()),
+                    plain(experts.clone()),
+                ],
+            );
+            v.visit(
+                &op,
+                format!("[5, 3, {width}] by 3 of 4 experts of {format} [7, {width}]"),
+                vec![x(rng, &[5, 3, width]), plain(w), plain(experts.clone())],
             );
         }
     }

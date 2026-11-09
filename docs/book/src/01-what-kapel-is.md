@@ -33,7 +33,7 @@ Inference aimed first at one sequence at a time on a CPU. Smallem showed that a 
 ## What exists today
 
 - A tensor type with every common float, integer and quantized type (chapter 3).
-- A catalogue of 23 operations with forward and backward passes, shared input checks, and three backends: reference, CPU and CUDA (chapters 4 to 7).
+- A catalogue of 26 operations with forward and backward passes, shared input checks, and three backends: reference, CPU and CUDA (chapters 4 to 7).
 - Readers for safetensors, GGUF, sharded checkpoints and Hub downloads (chapter 8); models read whole from GGUF files, or quantized at loading (chapter 10).
 - Tokenizers and chat templates that match `transformers` (chapter 9).
 - Model families Llama, Mistral, Qwen 2 and 3, MiMo, Gemma 2, Phi and GPT-2, and Qwen 3.5's mixtures of experts with Gated DeltaNet, checked logit for logit against `transformers` (chapter 10).

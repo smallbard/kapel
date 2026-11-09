@@ -77,6 +77,17 @@ pub enum QuantFormat {
     Q5K,
     /// GGUF Q6_K: 256 elements, 210 bytes.
     Q6K,
+    /// GGUF IQ4_NL: 32 elements, an `f16` scale then 16 bytes of 4-bit
+    /// codes (element `j` in the low nibble of byte `j`, `j + 16` in its high
+    /// nibble), each standing for one of 16 values ([`crate::iq::IQ4NL_VALUES`]).
+    Iq4Nl,
+    /// GGUF IQ4_XS: 256 elements, 136 bytes; the codes of IQ4_NL by groups of
+    /// 32, each with a 6-bit scale.
+    Iq4Xs,
+    /// GGUF IQ3_S: 256 elements, 110 bytes; groups of four magnitudes from a
+    /// grid of 512 ([`crate::iq::IQ3S_GRID`]), a sign per element, and a 4-bit
+    /// scale per 32.
+    Iq3S,
 }
 
 impl DType {
@@ -134,12 +145,15 @@ impl DType {
                 | QuantFormat::Q4_0
                 | QuantFormat::Q4_1
                 | QuantFormat::Q5_0
-                | QuantFormat::Q5_1 => 32,
+                | QuantFormat::Q5_1
+                | QuantFormat::Iq4Nl => 32,
                 QuantFormat::Q2K
                 | QuantFormat::Q3K
                 | QuantFormat::Q4K
                 | QuantFormat::Q5K
-                | QuantFormat::Q6K => 256,
+                | QuantFormat::Q6K
+                | QuantFormat::Iq4Xs
+                | QuantFormat::Iq3S => 256,
             },
             _ => 1,
         }
@@ -165,6 +179,9 @@ impl DType {
                 QuantFormat::Q4K => 144,
                 QuantFormat::Q5K => 176,
                 QuantFormat::Q6K => 210,
+                QuantFormat::Iq4Nl => 18,
+                QuantFormat::Iq4Xs => 136,
+                QuantFormat::Iq3S => 110,
             },
         }
     }
@@ -304,6 +321,9 @@ impl fmt::Display for DType {
             Self::Quantized(QuantFormat::Q4K) => "q4_k",
             Self::Quantized(QuantFormat::Q5K) => "q5_k",
             Self::Quantized(QuantFormat::Q6K) => "q6_k",
+            Self::Quantized(QuantFormat::Iq4Nl) => "iq4_nl",
+            Self::Quantized(QuantFormat::Iq4Xs) => "iq4_xs",
+            Self::Quantized(QuantFormat::Iq3S) => "iq3_s",
         };
         f.write_str(name)
     }
@@ -445,6 +465,53 @@ pub fn dequantize(dtype: DType, bytes: &[u8]) -> Result<Vec<f64>> {
                     let qh = (high[h * 32 + l] >> (2 * s)) & 0x03;
                     let q = i32::from(ql | (qh << 4)) - 32;
                     out.push(d * f64::from(scales[f / 16] as i8) * f64::from(q));
+                }
+            }
+            QuantFormat::Iq4Nl => {
+                let d = half(block, 0);
+                for e in 0..32 {
+                    let byte = block[2 + e % 16];
+                    let code = if e < 16 { byte & 0x0f } else { byte >> 4 };
+                    out.push(d * f64::from(crate::iq::IQ4NL_VALUES[usize::from(code)]));
+                }
+            }
+            QuantFormat::Iq4Xs => {
+                let d = half(block, 0);
+                let high = u16::from_le_bytes([block[2], block[3]]);
+                let (low, codes) = (&block[4..8], &block[8..136]);
+                for e in 0..256 {
+                    let g = e / 32;
+                    let scale = ((low[g / 2] >> (4 * (g % 2))) & 0x0f) as i32
+                        | (((high >> (2 * g)) & 3) as i32) << 4;
+                    let byte = codes[g * 16 + e % 16];
+                    let code = if e % 32 < 16 { byte & 0x0f } else { byte >> 4 };
+                    out.push(
+                        d * f64::from(scale - 32)
+                            * f64::from(crate::iq::IQ4NL_VALUES[usize::from(code)]),
+                    );
+                }
+            }
+            QuantFormat::Iq3S => {
+                let d = half(block, 0);
+                let (codes, high, signs, scales) = (
+                    &block[2..66],
+                    &block[66..74],
+                    &block[74..106],
+                    &block[106..110],
+                );
+                for e in 0..256 {
+                    // Group g of 32: its scale, its 8 indices, its byte of
+                    // high bits, its 4 bytes of signs.
+                    let (g, l, j) = (e / 32, e % 32 / 8, e % 8);
+                    let scale = (scales[g / 2] >> (4 * (g % 2))) & 0x0f;
+                    let db = d * f64::from(1 + 2 * u32::from(scale));
+                    let code = usize::from(codes[g * 8 + 2 * l + j / 4]);
+                    let shift = 8 - 2 * l - j / 4;
+                    let index = code | ((usize::from(high[g]) << shift) & 256);
+                    let magnitude = (crate::iq::IQ3S_GRID[index] >> (8 * (j % 4))) & 0xff;
+                    let negative = (signs[g * 4 + l] >> j) & 1 == 1;
+                    let value = db * f64::from(magnitude);
+                    out.push(if negative { -value } else { value });
                 }
             }
         }

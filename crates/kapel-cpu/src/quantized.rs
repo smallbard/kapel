@@ -55,6 +55,9 @@ pub(crate) fn supported(format: QuantFormat) -> bool {
             | QuantFormat::Q4K
             | QuantFormat::Q5K
             | QuantFormat::Q6K
+            | QuantFormat::Iq4Nl
+            | QuantFormat::Iq4Xs
+            | QuantFormat::Iq3S
     )
 }
 
@@ -242,6 +245,9 @@ pub(crate) fn by_format<const FMA: bool, const R: usize>(
         QuantFormat::Q4K => products::<FMA, R>(args, (256, 144), q4_k),
         QuantFormat::Q5K => products::<FMA, R>(args, (256, 176), q5_k),
         QuantFormat::Q6K => products::<FMA, R>(args, (256, 210), q6_k),
+        QuantFormat::Iq4Nl => products::<FMA, R>(args, (32, 18), iq4_nl),
+        QuantFormat::Iq4Xs => products::<FMA, R>(args, (256, 136), iq4_xs),
+        QuantFormat::Iq3S => products::<FMA, R>(args, (256, 110), iq3_s),
         _ => unreachable!("checked by `supported`"),
     }
     R
@@ -361,6 +367,9 @@ fn decode_body<const FMA: bool>(format: QuantFormat, bytes: &[u8], out: &mut [f3
         QuantFormat::Q4K => each(bytes, out, sizes, q4_k),
         QuantFormat::Q5K => each(bytes, out, sizes, q5_k),
         QuantFormat::Q6K => each(bytes, out, sizes, q6_k),
+        QuantFormat::Iq4Nl => each(bytes, out, sizes, iq4_nl),
+        QuantFormat::Iq4Xs => each(bytes, out, sizes, iq4_xs),
+        QuantFormat::Iq3S => each(bytes, out, sizes, iq3_s),
         _ => unreachable!("checked by `supported`"),
     }
 }
@@ -405,6 +414,74 @@ fn int4(block: &[u8], out: &mut [f32]) {
     for (pair, &byte) in out.as_chunks_mut::<2>().0.iter_mut().zip(&block[4..]) {
         pair[0] = scale * (f32::from(byte & 0x0f) - 8.0);
         pair[1] = scale * (f32::from(byte >> 4) - 8.0);
+    }
+}
+
+/// The 32 values of IQ4_NL: `scale × value[code]`, the values of the
+/// non-linear table. Products of a scale of `f16` and values of 7 bits:
+/// exact in `f32`, as the reference's.
+#[inline(always)]
+fn iq4_nl(block: &[u8], out: &mut [f32]) {
+    let scale = half(block, 0);
+    let codes: &[u8; 16] = block[2..18].try_into().expect("an IQ4_NL block");
+    let (low, high) = out.split_at_mut(16);
+    for ((l, h), &byte) in low.iter_mut().zip(high.iter_mut()).zip(codes) {
+        *l = scale * f32::from(kapel_core::iq::IQ4NL_VALUES[usize::from(byte & 0x0f)]);
+        *h = scale * f32::from(kapel_core::iq::IQ4NL_VALUES[usize::from(byte >> 4)]);
+    }
+}
+
+/// The 256 values of IQ4_XS: IQ4_NL's codes by groups of 32, each group's
+/// scale `d × (s − 32)` of a 6-bit `s`.
+#[inline(always)]
+fn iq4_xs(block: &[u8], out: &mut [f32]) {
+    let d = half(block, 0);
+    let high = u16::from_le_bytes([block[2], block[3]]);
+    for g in 0..8 {
+        let s = i32::from((block[4 + g / 2] >> (4 * (g % 2))) & 0x0f)
+            | i32::from((high >> (2 * g)) & 3) << 4;
+        let scale = d * (s - 32) as f32;
+        let codes: &[u8; 16] = block[8 + g * 16..][..16].try_into().expect("16 bytes");
+        let (low, top) = out[g * 32..][..32].split_at_mut(16);
+        for ((l, h), &byte) in low.iter_mut().zip(top.iter_mut()).zip(codes) {
+            *l = scale * f32::from(kapel_core::iq::IQ4NL_VALUES[usize::from(byte & 0x0f)]);
+            *h = scale * f32::from(kapel_core::iq::IQ4NL_VALUES[usize::from(byte >> 4)]);
+        }
+    }
+}
+
+/// The 256 values of IQ3_S: for each group of 32, its scale `d × (1 + 2s)`,
+/// and for each 4 of its values a 9-bit index into the grid of magnitudes,
+/// each value with its sign.
+#[inline(always)]
+fn iq3_s(block: &[u8], out: &mut [f32]) {
+    let d = half(block, 0);
+    let (codes, high, signs, scales) = (
+        &block[2..66],
+        &block[66..74],
+        &block[74..106],
+        &block[106..110],
+    );
+    for g in 0..8 {
+        let s = (scales[g / 2] >> (4 * (g % 2))) & 0x0f;
+        let db = d * f32::from(1 + 2 * s);
+        for l in 0..4 {
+            let sign = signs[g * 4 + l];
+            for half_group in 0..2 {
+                let code = usize::from(codes[g * 8 + 2 * l + half_group]);
+                let index = code | ((usize::from(high[g]) << (8 - 2 * l - half_group)) & 256);
+                let grid = kapel_core::iq::IQ3S_GRID[index];
+                for j in 0..4 {
+                    let bit = 4 * half_group + j;
+                    let magnitude = db * ((grid >> (8 * j)) & 0xff) as f32;
+                    out[g * 32 + l * 8 + bit] = if (sign >> bit) & 1 == 1 {
+                        -magnitude
+                    } else {
+                        magnitude
+                    };
+                }
+            }
+        }
     }
 }
 
@@ -957,7 +1034,12 @@ mod tests {
             (state >> 33) as u8
         };
         let halves: &[usize] = match format {
-            QuantFormat::Q8_0 | QuantFormat::Q4_0 | QuantFormat::Q5_0 => &[0],
+            QuantFormat::Q8_0
+            | QuantFormat::Q4_0
+            | QuantFormat::Q5_0
+            | QuantFormat::Iq4Nl
+            | QuantFormat::Iq4Xs
+            | QuantFormat::Iq3S => &[0],
             QuantFormat::Q4_1 | QuantFormat::Q5_1 | QuantFormat::Q4K | QuantFormat::Q5K => &[0, 2],
             QuantFormat::Q2K => &[80, 82],
             QuantFormat::Q3K => &[108],
@@ -979,7 +1061,7 @@ mod tests {
         out
     }
 
-    const FORMATS: [QuantFormat; 14] = [
+    const FORMATS: [QuantFormat; 17] = [
         QuantFormat::Int8 { group: 32 },
         QuantFormat::Int8 { group: 40 },
         QuantFormat::Int4 { group: 64 },
@@ -994,6 +1076,9 @@ mod tests {
         QuantFormat::Q4K,
         QuantFormat::Q5K,
         QuantFormat::Q6K,
+        QuantFormat::Iq4Nl,
+        QuantFormat::Iq4Xs,
+        QuantFormat::Iq3S,
     ];
 
     #[test]
@@ -1052,6 +1137,9 @@ mod tests {
                     QuantFormat::Q4K => q4_k(code, out),
                     QuantFormat::Q5K => q5_k(code, out),
                     QuantFormat::Q6K => q6_k(code, out),
+                    QuantFormat::Iq4Nl => iq4_nl(code, out),
+                    QuantFormat::Iq4Xs => iq4_xs(code, out),
+                    QuantFormat::Iq3S => iq3_s(code, out),
                     _ => unreachable!(),
                 }
             }

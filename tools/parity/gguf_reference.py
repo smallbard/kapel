@@ -17,6 +17,7 @@ from safetensors.numpy import save_file
 SCALES = {
     T.Q8_0: [0], T.Q4_0: [0], T.Q5_0: [0], T.Q4_1: [0, 2], T.Q5_1: [0, 2],
     T.Q2_K: [80, 82], T.Q3_K: [108], T.Q4_K: [0, 2], T.Q5_K: [0, 2], T.Q6_K: [208],
+    T.IQ4_NL: [0], T.IQ4_XS: [0], T.IQ3_S: [0],
 }
 
 

@@ -65,6 +65,11 @@ pub struct LinearAttention {
     pub value_dim: usize,
     /// The taps of the causal convolution.
     pub conv: usize,
+    /// Whether the value heads are laid out as llama.cpp lays them, tiled
+    /// (`[k0, k1, …, k0, k1, …]`: value head `h` reads key head `h %
+    /// key_heads`) rather than grouped by key head (`h / (value_heads /
+    /// key_heads)`, as `transformers` does).
+    pub tiled: bool,
 }
 
 impl LinearAttention {
@@ -401,6 +406,7 @@ impl Config {
                 key_dim: usize_field(json, &["linear_key_head_dim"])?,
                 value_dim: usize_field(json, &["linear_value_head_dim"])?,
                 conv: usize_field(json, &["linear_conv_kernel_dim"])?,
+                tiled: false,
             };
             for (name, value, limit) in [
                 ("linear key heads", linear.key_heads, MAX_HEADS),

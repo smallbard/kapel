@@ -22,6 +22,8 @@
 // Kernels index explicitly: the indexing is the memory access each thread makes.
 #![allow(clippy::needless_range_loop, clippy::too_many_arguments)]
 
+mod iq;
+
 use cuda_device::{DisjointSlice, SharedArray, device, kernel, launch_bounds, thread, warp};
 use kapel_cuda_abi::{PAGED_CHUNK, PAGED_HEADS, PAGED_WIDTH, Paged, View, binary, float, half, quant, unary};
 
@@ -2949,6 +2951,9 @@ fn quant_block(format: u32, group: usize) -> (usize, usize) {
         quant::Q4K => (256, 144),
         quant::Q5K => (256, 176),
         quant::Q6K => (256, 210),
+        quant::IQ4_NL => (32, 18),
+        quant::IQ4_XS => (256, 136),
+        quant::IQ3_S => (256, 110),
         _ => (0, 0),
     }
 }
@@ -3054,6 +3059,44 @@ fn decode_8(format: u32, group: usize, row: &[u8], e: usize) -> (f32, f32, [f32;
                 j += 1;
             }
         }
+        quant::IQ4_NL => {
+            a = f16_at(row, base);
+            while j < 8 {
+                let at = off + j;
+                let v = if at < 16 { byte(base + 2 + at) & 0x0f } else { byte(base + 2 + at - 16) >> 4 };
+                q[j] = iq::IQ4NL_VALUES[v as usize] as f32;
+                j += 1;
+            }
+        }
+        quant::IQ4_XS => {
+            // Group g of 32: its 6-bit scale; the codes of IQ4_NL.
+            let g = off / 32;
+            let high = byte(base + 2) as u32 | (byte(base + 3) as u32) << 8;
+            let s = ((byte(base + 4 + g / 2) >> (4 * (g % 2))) & 0x0f) as i32 | (((high >> (2 * g)) & 3) as i32) << 4;
+            a = f16_at(row, base) * (s - 32) as f32;
+            while j < 8 {
+                let at = off % 32 + j;
+                let v = if at < 16 { byte(base + 8 + g * 16 + at) & 0x0f } else { byte(base + 8 + g * 16 + at - 16) >> 4 };
+                q[j] = iq::IQ4NL_VALUES[v as usize] as f32;
+                j += 1;
+            }
+        }
+        quant::IQ3_S => {
+            // Group g of 32, its eighth l: two indices into the grid of
+            // magnitudes, a byte of signs.
+            let (g, l) = (off / 32, off % 32 / 8);
+            let s = (byte(base + 106 + g / 2) >> (4 * (g % 2))) & 0x0f;
+            a = f16_at(row, base) * (1 + 2 * s as u32) as f32;
+            let high = byte(base + 66 + g) as usize;
+            let sign = byte(base + 74 + g * 4 + l);
+            while j < 8 {
+                let code = byte(base + 2 + g * 8 + 2 * l + j / 4) as usize;
+                let index = code | ((high << (8 - 2 * l - j / 4)) & 256);
+                let magnitude = ((iq::IQ3S_GRID[index] >> (8 * (j % 4))) & 0xff) as f32;
+                q[j] = if (sign >> j) & 1 == 1 { -magnitude } else { magnitude };
+                j += 1;
+            }
+        }
         quant::Q6K => {
             let (h, t, m) = (off / 128, off % 128 / 64, off % 64);
             let (s, l) = (off % 128 / 32, off % 32);
@@ -3138,6 +3181,147 @@ pub fn qgemv(format: u32, group: u32, k: u32, w: &[u8], kx: u32, x: &[u8], rows:
                 m += 1;
             }
         }
+    }
+}
+
+/// The key by which `f32::total_cmp` orders `x`: a signed integer that
+/// compares as the floats do, NaN above every number.
+#[inline(always)]
+fn total_key(x: f32) -> i32 {
+    let bits = x.to_bits() as i32;
+    bits ^ (((bits >> 31) as u32) >> 1) as i32
+}
+
+/// `kapel_ops::TopK`: one thread per row of `rows` values of float type `kx`,
+/// which writes the positions of its `k` largest, the largest first and the
+/// lower position first on a tie. Pass `m` takes the largest value that comes
+/// after the last one taken in that order.
+#[kernel]
+#[launch_bounds(256)]
+pub fn top_k(kx: u32, x: &[u8], vx: View, rows: u32, e: u32, k: u32, mut out: DisjointSlice<u32>) {
+    let idx = thread::index_1d();
+    let row = idx.get();
+    let (e, k) = (e as usize, k as usize);
+    if row >= rows as usize || (row + 1) * k > out.len() {
+        return;
+    }
+    let (mut last_key, mut last_at) = (i32::MAX, usize::MAX);
+    let mut first = true;
+    let o = out.as_mut_ptr();
+    for m in 0..k {
+        let (mut best_key, mut best_at) = (i32::MIN, usize::MAX);
+        let mut found = false;
+        for i in 0..e {
+            let key = total_key(read(kx, x, vx.at((row * e + i) as u32) as usize));
+            let after = first || key < last_key || (key == last_key && i > last_at);
+            if after && (!found || key > best_key) {
+                best_key = key;
+                best_at = i;
+                found = true;
+            }
+        }
+        // SAFETY: `row · k + m < out.len()` (checked above), this row's own.
+        unsafe { *o.add(row * k + m) = best_at as u32 };
+        last_key = best_key;
+        last_at = best_at;
+        first = false;
+    }
+}
+
+/// `kapel_ops::GatherColumns`: one thread per output, `out[i] = x[i / k · e +
+/// idx[i]]`, of float types `kx` and `ko`; an index of `e` or more gives NaN.
+#[kernel]
+#[launch_bounds(256)]
+pub fn gather_columns(kx: u32, x: &[u8], vx: View, idx: &[u32], e: u32, k: u32, ko: u32, mut out: DisjointSlice<u8>) {
+    let i = thread::index_1d().get();
+    let (e, k) = (e as usize, k as usize);
+    if i < idx.len() && i < elements(ko, out.len()) && k > 0 {
+        let c = idx[i] as usize;
+        let value = if c < e { read(kx, x, vx.at((i / k * e + c) as u32) as usize) } else { f32::NAN };
+        // SAFETY: in bounds (checked above), this thread's own.
+        unsafe { write(ko, out.as_mut_ptr(), i, value) };
+    }
+}
+
+/// `kapel_ops::ExpertMatmul`: one warp per route `r` (token `r / k`, its
+/// `r % k`-th expert) and row `n` of the expert's weights, `out[r, n] = Σᵢ
+/// x[r'][i] · w[idx[r] · rows + n, i]`, with `r' = r` when each route has its
+/// input (`per_route`), `r / k` otherwise. The weights are of quantized
+/// `format` (`quant`, `group` for Kapel's), decoded eight values at a time as
+/// `qgemv` decodes them, or with `format = u32::MAX` of float type `kw`. The
+/// lanes add their sums by a fixed butterfly. An expert of `experts` or more
+/// gives NaN.
+#[kernel]
+#[launch_bounds(256)]
+pub fn expert_gemv(
+    format: u32,
+    group: u32,
+    kw: u32,
+    w: &[u8],
+    vw: View,
+    kx: u32,
+    x: &[u8],
+    vx: View,
+    idx: &[u32],
+    k: u32,
+    per_route: u32,
+    width: u32,
+    rows: u32,
+    experts: u32,
+    ko: u32,
+    mut out: DisjointSlice<u8>,
+) {
+    let i = thread::index_1d().get();
+    let (warp, lane) = (i / 32, i % 32);
+    let (width, rows, k) = (width as usize, rows as usize, k as usize);
+    let routes = idx.len();
+    if rows == 0 || k == 0 || warp >= routes * rows || warp >= elements(ko, out.len()) {
+        return;
+    }
+    let (r, n) = (warp / rows, warp % rows);
+    let expert = idx[r] as usize;
+    let input = if per_route == 1 { r } else { r / k } * width;
+    let mut total = 0.0f32;
+    let valid = expert < experts as usize;
+    if valid && format == u32::MAX {
+        let base = (expert * rows + n) * width;
+        let mut c = lane;
+        while c < width {
+            let a = read(kw, w, vw.at((base + c) as u32) as usize);
+            total = a.mul_add(read(kx, x, vx.at((input + c) as u32) as usize), total);
+            c += 32;
+        }
+    } else if valid {
+        let (len, bytes) = quant_block(format, group as usize);
+        if len > 0 && width % len == 0 && len % 8 == 0 {
+            let row_bytes = width / len * bytes;
+            let at = (expert * rows + n) * row_bytes;
+            if at + row_bytes <= w.len() {
+                let row = &w[at..at + row_bytes];
+                let mut e = lane * 8;
+                while e < width {
+                    let (a, b, q) = decode_8(format, group as usize, row, e);
+                    let (mut dot, mut sum) = (0.0f32, 0.0f32);
+                    let mut j = 0;
+                    while j < 8 {
+                        let v = read(kx, x, vx.at((input + e + j) as u32) as usize);
+                        dot = q[j].mul_add(v, dot);
+                        sum += v;
+                        j += 1;
+                    }
+                    total = a.mul_add(dot, total);
+                    total = b.mul_add(sum, total);
+                    e += 256;
+                }
+            }
+        }
+    }
+    let sum = warp_sum(total);
+    if lane == 0 {
+        let value = if valid { sum } else { f32::NAN };
+        // SAFETY: `warp < out`'s elements (checked above); only lane 0 of the
+        // warp writes its output.
+        unsafe { write(ko, out.as_mut_ptr(), warp, value) };
     }
 }
 

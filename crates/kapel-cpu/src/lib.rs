@@ -64,6 +64,7 @@ mod attention;
 mod backend;
 mod bytes;
 mod elementwise;
+mod experts;
 pub mod gemm;
 mod index;
 mod io;

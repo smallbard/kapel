@@ -357,3 +357,30 @@ fn blocks_one_at_a_time_give_the_whole_pass() {
     }
     let _ = writeln!(std::io::stderr(), "{checked} models checked block by block");
 }
+
+/// The small mixture of experts written as llama.cpp writes `qwen35moe`
+/// (`tools/parity/moe_gguf.py`: the norms with their 1 added, `−exp(A_log)`,
+/// the value heads tiled, the experts' gates and ups apart) gives the logits
+/// of `transformers`, with a cache too.
+#[test]
+fn a_mixture_of_experts_read_from_gguf_gives_the_logits_of_transformers() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/parity/qwen3_5_moe");
+    let (Ok(gguf), Ok(reference)) = (
+        kapel_hub::Gguf::open(dir.join("model-f32.gguf")),
+        SafeTensors::open(dir.join("reference.safetensors")),
+    ) else {
+        let _ = writeln!(
+            std::io::stderr(),
+            "skipped: data/parity/qwen3_5_moe/model-f32.gguf missing (see tools/parity/README.md)"
+        );
+        return;
+    };
+    let cpu = kapel_cpu::Cpu::new();
+    let model = Model::from_gguf(&gguf).unwrap();
+    assert!(model.config().linear.unwrap().tiled);
+    let relative = worst(&model, &reference, &cpu);
+    assert!(relative < 2e-5, "relative difference {relative:e}");
+    let ids = &texts(&reference)[3];
+    let cached = cached_against_whole(&model, ids, &cpu);
+    assert!(cached < 1e-5, "cached: relative difference {cached:e}");
+}

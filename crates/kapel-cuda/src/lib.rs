@@ -43,6 +43,8 @@ mod attention;
 #[cfg(feature = "cuda")]
 mod device;
 #[cfg(feature = "cuda")]
+mod experts;
+#[cfg(feature = "cuda")]
 mod graph;
 #[cfg(feature = "cuda")]
 mod ops;

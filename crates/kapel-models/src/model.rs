@@ -111,6 +111,11 @@ impl Default for Cache {
     }
 }
 
+/// The rows of a pass up to which the experts of a mixture are chosen and
+/// computed on the device (decoding, recordable); beyond, each expert's rows
+/// are gathered on the host's choice and computed together (prompts).
+pub const DEVICE_ROUTES: usize = 8;
+
 /// The positions a recorded step of a [`Cache`] has room for, beyond the one
 /// it computes, before it is recorded again.
 pub const ROOM: usize = 256;
@@ -1054,10 +1059,10 @@ impl Model {
     ) -> Result<Recorded> {
         // The tables are made by a first pass, as it comes: never while
         // recording.
-        // The experts are chosen on the host, which a recording cannot wait
-        // for.
+        // Beyond `DEVICE_ROUTES` rows, the experts are chosen on the host,
+        // which a recording cannot wait for.
         if !backend.records()
-            || self.config.experts.is_some()
+            || (self.config.experts.is_some() && rows > DEVICE_ROUTES)
             || batch.is_empty()
             || batch.len() > rows
             || !cache.has_tables(self.config.layers)
@@ -1712,6 +1717,17 @@ impl Model {
         };
         let q = unit(&part(0, hk, dk)?, 1.0 / dk as f64)?;
         let k = unit(&part(hk * dk, hk, dk)?, 1.0 / (dk as f64).sqrt())?;
+        // Value heads tiled over the key heads (llama.cpp's layout): each
+        // value head's key head, repeated in that order.
+        let (q, k) = if lin.tiled && hv != hk {
+            let tile = |x: &Tensor| -> Result<Tensor> {
+                let copies: Vec<&Tensor> = (0..hv / hk).map(|_| x).collect();
+                Ok(backend.forward(&Concat { dim: 1 }, &copies)?)
+            };
+            (tile(&q)?, tile(&k)?)
+        } else {
+            (q, k)
+        };
         let v = part(2 * hk * dk, hv, dv)?;
         let beta = f32(&ops.unary(UnaryKind::Sigmoid, &b)?)?;
         // g = −exp(A_log) · softplus(a + dt_bias), in `f32`; softplus(x) =
@@ -1731,10 +1747,14 @@ impl Model {
             )?,
         )?;
         let softplus = ops.binary(BinaryKind::Add, &ops.unary(UnaryKind::Relu, &x)?, &tail)?;
-        let decay = ops.unary(
-            UnaryKind::Neg,
-            &ops.unary(UnaryKind::Exp, &f32(w("A_log")?)?)?,
-        )?;
+        // `−exp(A_log)`, or as llama.cpp stores it.
+        let decay = match self.optional(&format!("{p}.linear_attn.A")) {
+            Some(a) => f32(a)?,
+            None => ops.unary(
+                UnaryKind::Neg,
+                &ops.unary(UnaryKind::Exp, &f32(w("A_log")?)?)?,
+            )?,
+        };
         let g = ops.binary(BinaryKind::Mul, &decay, &softplus)?;
         let o = backend.delta_rule(&mut states.1, &q, &k, &v, &g, &beta, &slots)?;
         let o = if o.dtype() == h.dtype() {
@@ -1778,6 +1798,12 @@ impl Model {
             backend.forward(&Cast { dtype: DType::F32 }, &[&logits])?
         };
         let probs = backend.forward(&kapel_ops::Softmax { dim: 1 }, &[&logits])?;
+        // Few rows (decoding): the experts chosen and multiplied on the
+        // device, the pass recordable.
+        if t <= DEVICE_ROUTES {
+            let routed = self.experts_on_device(ops, h, &probs, p)?;
+            return self.shared_expert(ops, h, p, routed);
+        }
         let probs = backend.download(&probs)?.to_vec::<f32>()?;
         // Each token's experts, then each expert's tokens.
         let mut tokens: Vec<Vec<(u32, f32)>> = vec![Vec::new(); e.count];
@@ -1793,11 +1819,21 @@ impl Model {
                 tokens[i].push((row as u32, weight));
             }
         }
-        let gate_up = w("experts.gate_up_proj")?;
+        // Stacked as `transformers` stacks them, or the gates and the ups
+        // apart, as llama.cpp keeps them.
+        let gate_up = self.optional(&format!("{p}.mlp.experts.gate_up_proj"));
+        let apart = match gate_up {
+            Some(_) => None,
+            None => Some((w("experts.gate_proj")?, w("experts.up_proj")?)),
+        };
         let down = w("experts.down_proj")?;
-        let (two_i, width) = (gate_up.shape()[1], gate_up.shape()[2]);
         let glu = Glu {
             activation: c.activation,
+        };
+        let matrix = |stack: &Tensor, e: usize| -> Result<Tensor> {
+            Ok(stack
+                .narrow(0, e, 1)?
+                .reshape(&[stack.shape()[1], stack.shape()[2]])?)
         };
         let (mut outs, mut index) = (Vec::new(), Vec::new());
         for (expert, routed) in tokens.iter().enumerate() {
@@ -1809,12 +1845,18 @@ impl Model {
             let weights: Vec<f32> = routed.iter().map(|&(_, w)| w).collect();
             let rows_t = backend.upload(&Tensor::from_slice(&rows, &[n])?)?;
             let x = backend.forward(&GatherRows, &[h, &rows_t])?;
-            let wg = gate_up.narrow(0, expert, 1)?.reshape(&[two_i, width])?;
-            let inner = backend.forward(&glu, &[&ops.linear(&x, &wg, None)?])?;
-            let wd = down
-                .narrow(0, expert, 1)?
-                .reshape(&[down.shape()[1], down.shape()[2]])?;
-            let y = ops.linear(&inner, &wd, None)?;
+            let inner = match (gate_up, apart) {
+                (Some(stack), _) => {
+                    backend.forward(&glu, &[&ops.linear(&x, &matrix(stack, expert)?, None)?])?
+                }
+                (None, Some((gates, ups))) => {
+                    let gate = ops.linear(&x, &matrix(gates, expert)?, None)?;
+                    let up = ops.linear(&x, &matrix(ups, expert)?, None)?;
+                    ops.binary(BinaryKind::Mul, &ops.unary(c.activation, &gate)?, &up)?
+                }
+                (None, None) => unreachable!("one or the other"),
+            };
+            let y = ops.linear(&inner, &matrix(down, expert)?, None)?;
             let mut scale = backend.upload(&Tensor::from_slice(&weights, &[n, 1])?)?;
             if scale.dtype() != y.dtype() {
                 scale = backend.forward(&Cast { dtype: y.dtype() }, &[&scale])?;
@@ -1826,7 +1868,83 @@ impl Model {
         let all = backend.forward(&Concat { dim: 0 }, &parts)?;
         let index = backend.upload(&Tensor::from_slice(&index, &[index.len()])?)?;
         let routed = backend.forward(&kapel_ops::ScatterAddRows { rows: t }, &[&all, &index])?;
-        if e.shared_width.is_none() {
+        self.shared_expert(ops, h, p, routed)
+    }
+
+    /// The experts of a few rows chosen and computed on the device, nothing
+    /// read back: `TopK` of the probabilities, their weights by
+    /// `GatherColumns`, renormalized and rounded to the type of the hidden
+    /// states, each row's experts by `ExpertMatmul`, weighted and summed in
+    /// the order of the router's ranks.
+    fn experts_on_device<B: Backend + Transfer>(
+        &self,
+        ops: &Ops<'_, B>,
+        h: &Tensor,
+        probs: &Tensor,
+        p: &str,
+    ) -> Result<Tensor> {
+        use kapel_ops::{ExpertMatmul, GatherColumns, Sum, TopK};
+        let c = &self.config;
+        let backend = ops.0;
+        let e = c.experts.expect("a model with experts");
+        let t = h.shape()[0];
+        let w = |name: &str| self.weight(&format!("{p}.mlp.{name}"));
+        let idx = backend.forward(&TopK { k: e.per_token }, &[probs])?;
+        let chosen = backend.forward(&GatherColumns, &[probs, &idx])?;
+        let total = backend.forward(
+            &Sum {
+                dims: vec![1],
+                keepdim: true,
+            },
+            &[&chosen],
+        )?;
+        let mut weights = ops.binary(BinaryKind::Div, &chosen, &total)?;
+        if weights.dtype() != h.dtype() {
+            weights = backend.forward(&Cast { dtype: h.dtype() }, &[&weights])?;
+        }
+        // The stacks `[E, N, K]` as `[E · N, K]`.
+        let flat = |stack: &Tensor| -> Result<Tensor> {
+            let s = stack.shape();
+            Ok(stack.reshape(&[s[0] * s[1], s[2]])?)
+        };
+        let product = ExpertMatmul { experts: e.count };
+        let inner = match self.optional(&format!("{p}.mlp.experts.gate_up_proj")) {
+            Some(stack) => backend.forward(
+                &Glu {
+                    activation: c.activation,
+                },
+                &[&backend.forward(&product, &[h, &flat(stack)?, &idx])?],
+            )?,
+            None => {
+                let gate =
+                    backend.forward(&product, &[h, &flat(w("experts.gate_proj")?)?, &idx])?;
+                let up = backend.forward(&product, &[h, &flat(w("experts.up_proj")?)?, &idx])?;
+                ops.binary(BinaryKind::Mul, &ops.unary(c.activation, &gate)?, &up)?
+            }
+        };
+        let y = backend.forward(&product, &[&inner, &flat(w("experts.down_proj")?)?, &idx])?;
+        let weighted = ops.binary(BinaryKind::Mul, &y, &weights.reshape(&[t, e.per_token, 1])?)?;
+        Ok(backend.forward(
+            &Sum {
+                dims: vec![1],
+                keepdim: false,
+            },
+            &[&weighted],
+        )?)
+    }
+
+    /// `routed` plus the shared expert, gated by a sigmoid, if the model has
+    /// one.
+    fn shared_expert<B: Backend + Transfer>(
+        &self,
+        ops: &Ops<'_, B>,
+        h: &Tensor,
+        p: &str,
+        routed: Tensor,
+    ) -> Result<Tensor> {
+        let c = &self.config;
+        let w = |name: &str| self.weight(&format!("{p}.mlp.{name}"));
+        if c.experts.is_some_and(|e| e.shared_width.is_none()) {
             return Ok(routed);
         }
         let s = |name: &str| w(&format!("shared_expert.{name}.weight"));
@@ -1834,10 +1952,14 @@ impl Model {
         let up = ops.linear(h, s("up_proj")?, None)?;
         let inner = ops.binary(BinaryKind::Mul, &ops.unary(c.activation, &gate)?, &up)?;
         let shared = ops.linear(&inner, s("down_proj")?, None)?;
-        let open = ops.unary(
-            UnaryKind::Sigmoid,
-            &ops.linear(h, w("shared_expert_gate.weight")?, None)?,
-        )?;
+        // `[1, hidden]`, or `[hidden]` from GGUF.
+        let gate_w = w("shared_expert_gate.weight")?;
+        let gate_w = if gate_w.rank() == 1 {
+            gate_w.reshape(&[1, gate_w.shape()[0]])?
+        } else {
+            gate_w.clone()
+        };
+        let open = ops.unary(UnaryKind::Sigmoid, &ops.linear(h, &gate_w, None)?)?;
         let shared = ops.binary(BinaryKind::Mul, &shared, &open)?;
         ops.binary(BinaryKind::Add, &routed, &shared)
     }

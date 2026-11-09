@@ -35,6 +35,9 @@ pub(crate) fn code(dtype: DType) -> Option<(u32, u32)> {
         QuantFormat::Q4K => (quant::Q4K, 0),
         QuantFormat::Q5K => (quant::Q5K, 0),
         QuantFormat::Q6K => (quant::Q6K, 0),
+        QuantFormat::Iq4Nl => (quant::IQ4_NL, 0),
+        QuantFormat::Iq4Xs => (quant::IQ4_XS, 0),
+        QuantFormat::Iq3S => (quant::IQ3_S, 0),
         _ => return None,
     };
     Some(code)
@@ -42,15 +45,15 @@ pub(crate) fn code(dtype: DType) -> Option<(u32, u32)> {
 
 /// A quantized tensor of this backend as the kernels take it: its code,
 /// group, device address and bytes, from its first block.
-struct Codes {
-    code: u32,
-    group: u32,
-    pointer: u64,
-    bytes: usize,
+pub(crate) struct Codes {
+    pub(crate) code: u32,
+    pub(crate) group: u32,
+    pub(crate) pointer: u64,
+    pub(crate) bytes: usize,
 }
 
 impl Cuda {
-    fn codes(&self, op: &'static str, w: &Tensor) -> Result<Option<Codes>> {
+    pub(crate) fn codes(&self, op: &'static str, w: &Tensor) -> Result<Option<Codes>> {
         let Some((code, group)) = code(w.dtype()) else {
             return Ok(None);
         };

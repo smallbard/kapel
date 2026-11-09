@@ -27,6 +27,7 @@ mod array;
 mod attention;
 pub mod conformity;
 mod elementwise;
+mod experts;
 #[cfg(test)]
 mod golden;
 mod index;
@@ -176,7 +177,10 @@ mod tests {
         kapel_ops::PagedAttention,
         Rope,
         kapel_ops::GatherRows,
-        kapel_ops::ScatterAddRows
+        kapel_ops::ScatterAddRows,
+        kapel_ops::TopK,
+        kapel_ops::GatherColumns,
+        kapel_ops::ExpertMatmul
     );
 
     impl kapel_ops::Write for Typed {

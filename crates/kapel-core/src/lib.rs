@@ -22,6 +22,7 @@ mod device;
 mod dtype;
 mod error;
 mod float;
+pub mod iq;
 mod layout;
 mod scalar;
 mod storage;

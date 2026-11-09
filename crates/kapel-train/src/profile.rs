@@ -10,9 +10,10 @@ use std::time::{Duration, Instant};
 
 use kapel_core::{DType, Result, Tensor};
 use kapel_ops::{
-    Affine, ArgMax, Attention, Binary, Cast, Concat, Contiguous, CrossEntropy, GatherRows, Glu,
-    LayerNorm, LogSoftmax, Matmul, Max, Mean, Operation, PagedAttention, QuantizedMatmul, Record,
-    Recording, RmsNorm, Rope, Run, ScatterAddRows, Softmax, Sum, Transfer, Unary, Write,
+    Affine, ArgMax, Attention, Binary, Cast, Concat, Contiguous, CrossEntropy, ExpertMatmul,
+    GatherColumns, GatherRows, Glu, LayerNorm, LogSoftmax, Matmul, Max, Mean, Operation,
+    PagedAttention, QuantizedMatmul, Record, Recording, RmsNorm, Rope, Run, ScatterAddRows,
+    Softmax, Sum, TopK, Transfer, Unary, Write,
 };
 
 /// The time spent in one kind of call.
@@ -133,6 +134,9 @@ costless!(
     Rope,
     GatherRows,
     ScatterAddRows,
+    TopK,
+    GatherColumns,
+    ExpertMatmul,
 );
 
 type Synchronize = Arc<dyn Fn() + Send + Sync>;
@@ -305,6 +309,9 @@ timed!(
     Rope,
     GatherRows,
     ScatterAddRows,
+    TopK,
+    GatherColumns,
+    ExpertMatmul,
 );
 
 impl<B: Transfer> Transfer for Profiled<B> {

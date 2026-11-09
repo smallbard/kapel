@@ -33,6 +33,9 @@ A quantized type stores whole blocks: a scale (and sometimes a minimum) followed
 | `Q4_1` | 32 | 20 | f16 scale × code + f16 minimum |
 | `Q5_0`, `Q5_1` | 32 | 22, 24 | as Q4, with a fifth bit per element from a u32 |
 | `Q2K` to `Q6K` | 256 | 84 to 210 | super-blocks with 6-bit or 8-bit sub-block scales, as in llama.cpp |
+| `Iq4Nl` | 32 | 18 | f16 scale × one of 16 non-linear values (`kapel_core::iq::IQ4NL_VALUES`) |
+| `Iq4Xs` | 256 | 136 | IQ4_NL's values by groups of 32, each with a 6-bit scale |
+| `Iq3S` | 256 | 110 | per 32, a 4-bit scale; per 4, a 9-bit index into a grid of 512 groups of magnitudes (`kapel_core::iq::IQ3S_GRID`); per element, a sign |
 
 Three functions do all the conversions. `decode(bytes) -> f64` reads one element exactly. `encode(value, out)` writes one: floats round to nearest, ties to even; integers round, then saturate, and NaN becomes 0. The free function `dequantize(dtype, bytes)` expands quantized blocks to `f64`, following llama.cpp's definitions, and `quantize(dtype, values)` goes the other way: Kapel's int8 with the scale `max |x| / 127`, int4 with the scale of least squared error among those that put the largest magnitude at either end of the 16 levels and those between, and GGUF's Q8\_0 and Q4\_0 exactly as llama.cpp's reference quantizes them. `storage_bytes(elements)` returns `BlockMisaligned` unless the count is a whole number of blocks.
 
@@ -88,7 +91,7 @@ Allocating fresh memory for every intermediate tensor would make the operating s
 Cloning a tensor or taking a view clones the `Arc`, never the bytes. Constructors check what the type system cannot: `from_storage` verifies that the layout fits in the storage, and, for quantized types, that the layout is contiguous and starts on a block boundary.
 
 - `from_slice`, `from_bytes` and `zeros` create host tensors.
-- `transpose`, `permute`, `narrow` and `broadcast_to` create views. They refuse quantized tensors, whose blocks cannot be split; `reshape` is allowed because a contiguous reshape keeps blocks whole.
+- `transpose`, `permute`, `narrow` and `broadcast_to` create views. They refuse quantized tensors, whose blocks cannot be split, but for a `narrow` that stays contiguous and starts at a whole block (rows of a matrix, one expert's weights in a stack); `reshape` is allowed because a contiguous reshape keeps blocks whole.
 - `to_vec::<T>()` reads the elements in row-major order. It fails with `DTypeMismatch` if `T` is not the tensor's type, and `WrongDevice` if the bytes are not on the host.
 - `to_f64_vec()` is the reference view of any tensor: every type, quantized or not, read at its exact value.
 - `contiguous()` copies a strided host view into a fresh row-major buffer.

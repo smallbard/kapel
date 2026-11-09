@@ -37,7 +37,9 @@ fn values(cuda: &Cuda, logits: &kapel_core::Tensor) -> Vec<f64> {
 fn replays_give_the_logits_of_steps_as_they_come() {
     let _alone = alone();
     let cuda = Cuda::new(0).unwrap();
-    for name in ["smollm2", "llama", "qwen3"] {
+    // `qwen3_5_moe`: the states of Gated DeltaNet carried by the recording,
+    // the experts chosen on the card.
+    for name in ["smollm2", "llama", "qwen3", "qwen3_5_moe"] {
         let Some(model) = model(name, &cuda) else {
             eprintln!("skipped {name}: data/parity/{name} missing");
             continue;

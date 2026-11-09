@@ -34,7 +34,7 @@ GGUF, the format of llama.cpp, stores metadata and tensors in one file: a magic 
 | Alignment | a power of two, at most 2¹⁶; the data start and every offset use checked arithmetic |
 | Tensor ranges | a tensor of a known type must lie entirely inside the file |
 
-Dimensions are stored fastest first and reversed into Kapel's shape order. The ggml types Kapel reads are F32, F16, BF16, F64, I8, I32, and the quantized Q4\_0, Q4\_1, Q5\_0, Q5\_1, Q8\_0 and Q2\_K to Q6\_K. Other types, such as the IQ formats, are listed but not read: "fails when asked for, not the whole file". Quantized tensors keep their blocks as stored, sharing the mapping. A parity test compares the dequantization of eleven tensors with llama.cpp's own `gguf-py`.
+Dimensions are stored fastest first and reversed into Kapel's shape order. The ggml types Kapel reads are F32, F16, BF16, F64, I8, I32, and the quantized Q4\_0, Q4\_1, Q5\_0, Q5\_1, Q8\_0, Q2\_K to Q6\_K, IQ4\_NL, IQ4\_XS and IQ3\_S. Other types, such as the other IQ formats, are listed but not read: "fails when asked for, not the whole file". Quantized tensors keep their blocks as stored, sharing the mapping. A parity test compares the dequantization of fourteen tensors with llama.cpp's own `gguf-py`.
 
 ## 8.4 Checkpoints and the Hub
 

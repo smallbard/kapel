@@ -183,6 +183,12 @@ pub mod quant {
     pub const Q5K: u32 = 8;
     /// GGUF Q6_K.
     pub const Q6K: u32 = 9;
+    /// GGUF IQ4_NL.
+    pub const IQ4_NL: u32 = 10;
+    /// GGUF IQ4_XS.
+    pub const IQ4_XS: u32 = 11;
+    /// GGUF IQ3_S.
+    pub const IQ3_S: u32 = 12;
 }
 
 /// Codes of the 16-bit float formats of the conversion kernels.

@@ -195,12 +195,28 @@ impl Tensor {
     }
 
     /// Keeps `len` elements of dimension `dim` from `start`, without copying.
+    /// A quantized tensor can be narrowed as long as the view stays
+    /// contiguous and starts at a whole block: rows of a matrix, say, or one
+    /// expert's weights in a stack of them.
     ///
     /// # Errors
     ///
-    /// See [`Layout::narrow`]; [`Error::UnsupportedDType`] for a quantized tensor.
+    /// See [`Layout::narrow`]; [`Error::UnsupportedDType`] for a quantized
+    /// tensor whose view would cut its blocks.
     pub fn narrow(&self, dim: usize, start: usize, len: usize) -> Result<Self> {
-        self.view("narrow", self.layout.narrow(dim, start, len))
+        let layout = self.layout.narrow(dim, start, len);
+        if self.dtype.is_quantized()
+            && let Ok(layout) = &layout
+            && layout.is_contiguous()
+            && layout.offset().is_multiple_of(self.dtype.block_len())
+        {
+            return Ok(Self {
+                storage: Arc::clone(&self.storage),
+                layout: layout.clone(),
+                dtype: self.dtype,
+            });
+        }
+        self.view("narrow", layout)
     }
 
     /// Repeats the tensor to `shape`, without copying.

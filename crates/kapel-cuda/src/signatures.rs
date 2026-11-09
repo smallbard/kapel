@@ -132,6 +132,18 @@ pub(crate) const KERNELS: &[(&str, &[Param])] = &[
         "write_rows_any",
         &[U32, Slice, View, Slice, U32, U32, Slice],
     ),
+    ("top_k", &[U32, Slice, View, U32, U32, U32, Slice]),
+    (
+        "gather_columns",
+        &[U32, Slice, View, Slice, U32, U32, U32, Slice],
+    ),
+    (
+        "expert_gemv",
+        &[
+            U32, U32, U32, Slice, View, U32, Slice, View, Slice, U32, U32, U32, U32, U32, U32,
+            Slice,
+        ],
+    ),
     (
         "causal_conv",
         &[

@@ -76,6 +76,9 @@ fn dtype_of(ggml: u32) -> Option<DType> {
         12 => DType::Quantized(QuantFormat::Q4K),
         13 => DType::Quantized(QuantFormat::Q5K),
         14 => DType::Quantized(QuantFormat::Q6K),
+        20 => DType::Quantized(QuantFormat::Iq4Nl),
+        21 => DType::Quantized(QuantFormat::Iq3S),
+        23 => DType::Quantized(QuantFormat::Iq4Xs),
         24 => DType::I8,
         26 => DType::I32,
         28 => DType::F64,
@@ -840,6 +843,6 @@ mod tests {
             }
             checked += 1;
         }
-        assert_eq!(checked, 11);
+        assert_eq!(checked, 14);
     }
 }

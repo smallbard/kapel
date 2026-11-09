@@ -367,8 +367,21 @@ changelog says how.
   2e-5, and within 6e-6 on the card.
 - `KvCache` keeps the states of linear attention, a slot per sequence; a cache
   that holds them shares no pages and refuses a sequence it has shortened.
+- GGUF: Qwen 3.5's mixtures of experts (`qwen35moe`), llama.cpp's conversion
+  followed (norms with their 1 added, `−exp(A_log)`, value heads tiled,
+  experts' gates and ups apart); `tools/parity/moe_gguf.py` writes the small
+  model so, which gives the logits of `transformers`.
+- Quantized formats IQ4_NL, IQ4_XS and IQ3_S (`kapel_core::iq` holds ggml's
+  tables), read from GGUF as `gguf-py` dequantizes them, multiplied on the
+  processor and on the card.
+- `TopK`, `GatherColumns` and `ExpertMatmul`: the experts of a mixture chosen
+  and computed on the device; decoding passes of a model with experts are
+  recorded, with the bits of their steps.
 
 ### Changed
+
+- `Tensor::narrow` accepts a quantized tensor when the view stays contiguous
+  and starts at a whole block.
 
 - `kapel-cuda`: GPT-2 124M trains at 1.16 times llm.c's time on an RTX 3090,
   from 2.3 times: the gradient of a weight (`xᵀ · g`) has a kernel of its own;

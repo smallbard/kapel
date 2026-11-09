@@ -1,6 +1,6 @@
 # 4. The operation catalogue: kapel-ops
 
-`kapel-ops` is the contract of the whole library. It lists the twenty-three operations a transformer needs, to run and to train, gives each an exact mathematical definition, and checks every call in one place, so that every backend accepts and rejects the same calls with the same errors. It computes nothing itself.
+`kapel-ops` is the contract of the whole library. It lists the twenty-six operations a transformer needs, to run and to train, gives each an exact mathematical definition, and checks every call in one place, so that every backend accepts and rejects the same calls with the same errors. It computes nothing itself.
 
 ## 4.1 The traits
 
@@ -37,7 +37,7 @@ The rule is that every `forward` starts with `op.infer(inputs)?` and every `back
 - `Recurrent` carries the states of linear attention from one token to the next, written in place like the caches (section 4.3): `causal_conv` and `delta_rule`.
 - `Record` records a pass once and replays it. `record` takes a closure that queues the pass and returns a `Recording`, whose `replay` runs it again on the current contents of the tensors it read and rewrites its `output`. A backend that computes each operation when it is called answers `records() == false` and `record` gives `None`: the pass is simply run there. On the card, a recording is a CUDA graph (chapter 7).
 
-`Backend` is the supertrait of `Write`, `Recurrent`, `Record`, `Update` and all twenty-three `Run` implementations, with a blanket implementation, so any type that implements them all is a backend:
+`Backend` is the supertrait of `Write`, `Recurrent`, `Record`, `Update` and all twenty-six `Run` implementations, with a blanket implementation, so any type that implements them all is a backend:
 
 ```rust
 let y = backend.forward(&Matmul, &[&x, &w.transpose(0, 1)?])?;   // y = x · wᵀ, w read in place
@@ -71,6 +71,9 @@ The shared checks are small private functions: `arity`, `float`, `indices` (the 
 | `Rope` | x \[…, D\], positions | rotary embeddings with five scalings | x |
 | `GatherRows` | src \[R, …\], idx | y\[i\] = src\[idx\[i\]\]; out-of-range index is an error; a quantized table gives its rows in f32 | src, unless quantized |
 | `ScatterAddRows` | src, idx → \[rows, …\] | adjoint of gather; repeated rows are summed | src |
+| `TopK { k }` | x \[…, E\] → u32 \[…, k\] | the positions of the k largest, the largest first, the lower position on a tie | none |
+| `GatherColumns` | x \[…, E\], idx \[…, k\] → \[…, k\] | `y[…, j] = x[…, idx[…, j]]`: the probabilities of the chosen experts | none |
+| `ExpertMatmul { experts }` | x \[T, K\] or \[T, k, K\], w \[E·N, K\], idx \[T, k\] → \[T, k, N\] | each token by its experts' weights, float or quantized, rows `idx · N ..` of the stack | none |
 
 Normalization weights and the attention mask may be in any float type, not necessarily that of the main input: a model with bf16 weights can normalize f32 activations, and the weight gradients come back in the weights' own type.
 

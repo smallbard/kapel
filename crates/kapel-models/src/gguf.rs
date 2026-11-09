@@ -55,6 +55,36 @@ const BLOCK_NAMES: [(&str, &str); 14] = [
     ("post_ffw_norm", "post_feedforward_layernorm"),
 ];
 
+/// llama.cpp's names of the weights of Qwen 3.5's layers of Gated DeltaNet
+/// and of its experts (`qwen35moe`), and those of `transformers` (after
+/// `model.layers.{i}.`). `linear_attn.A` is not `transformers`' `A_log`:
+/// llama.cpp stores `−exp(A_log)`.
+const QWEN35_NAMES: [(&str, &str); 17] = [
+    ("attn_qkv.weight", "linear_attn.in_proj_qkv.weight"),
+    ("attn_gate.weight", "linear_attn.in_proj_z.weight"),
+    ("ssm_conv1d.weight", "linear_attn.conv1d.weight"),
+    ("ssm_dt.bias", "linear_attn.dt_bias"),
+    ("ssm_a", "linear_attn.A"),
+    ("ssm_alpha.weight", "linear_attn.in_proj_a.weight"),
+    ("ssm_beta.weight", "linear_attn.in_proj_b.weight"),
+    ("ssm_norm.weight", "linear_attn.norm.weight"),
+    ("ssm_out.weight", "linear_attn.out_proj.weight"),
+    ("ffn_gate_inp.weight", "mlp.gate.weight"),
+    ("ffn_gate_exps.weight", "mlp.experts.gate_proj"),
+    ("ffn_up_exps.weight", "mlp.experts.up_proj"),
+    ("ffn_down_exps.weight", "mlp.experts.down_proj"),
+    ("ffn_gate_inp_shexp.weight", "mlp.shared_expert_gate.weight"),
+    (
+        "ffn_gate_shexp.weight",
+        "mlp.shared_expert.gate_proj.weight",
+    ),
+    ("ffn_up_shexp.weight", "mlp.shared_expert.up_proj.weight"),
+    (
+        "ffn_down_shexp.weight",
+        "mlp.shared_expert.down_proj.weight",
+    ),
+];
+
 /// The `transformers` name of a GGUF tensor, if the model uses it.
 fn hf_name(name: &str) -> Option<String> {
     match name {
@@ -66,6 +96,9 @@ fn hf_name(name: &str) -> Option<String> {
     let rest = name.strip_prefix("blk.")?;
     let (layer, rest) = rest.split_once('.')?;
     let layer: usize = layer.parse().ok()?;
+    if let Some((_, hf)) = QWEN35_NAMES.iter().find(|(gguf, _)| *gguf == rest) {
+        return Some(format!("model.layers.{layer}.{hf}"));
+    }
     let (base, kind) = rest.rsplit_once('.')?;
     let (_, hf) = BLOCK_NAMES.iter().find(|(gguf, _)| *gguf == base)?;
     Some(format!("model.layers.{layer}.{hf}.{kind}"))
@@ -162,7 +195,8 @@ impl Model {
     /// Reads a model from a GGUF file: its configuration from the metadata,
     /// its weights mapped in place, quantized or not.
     ///
-    /// Llama (with Mistral), Qwen 2 and Qwen 3 are read.
+    /// Llama (with Mistral), Qwen 2, Qwen 3 and Qwen 3.5's mixtures of
+    /// experts (`qwen35moe`) are read.
     ///
     /// # Errors
     ///
@@ -179,6 +213,7 @@ impl Model {
         };
         let model_type = match arch.as_str() {
             "llama" | "qwen2" | "qwen3" => arch.clone(),
+            "qwen35moe" => "qwen3_5_moe".to_string(),
             other => {
                 return Err(ModelError::Config(format!(
                     "GGUF architecture {other:?} is not supported"
@@ -203,6 +238,11 @@ impl Model {
             Err(_) => hidden / heads.max(1),
         };
         let theta = meta.number("rope.freq_base").unwrap_or(10_000.0);
+        let feed_forward = match meta.count("feed_forward_length") {
+            Ok(n) => n,
+            Err(_) if model_type == "qwen3_5_moe" => meta.count("expert_feed_forward_length")?,
+            Err(e) => return Err(e),
+        };
         let mut config = json!({
             "model_type": model_type,
             "vocab_size": vocab,
@@ -211,7 +251,7 @@ impl Model {
             "num_attention_heads": heads,
             "num_key_value_heads": meta.count("attention.head_count_kv").unwrap_or(heads),
             "head_dim": head_dim,
-            "intermediate_size": meta.count("feed_forward_length")?,
+            "intermediate_size": feed_forward,
             "hidden_act": "silu",
             "rms_norm_eps": meta.number("attention.layer_norm_rms_epsilon").unwrap_or(1e-5),
             "rope_theta": theta,
@@ -229,12 +269,60 @@ impl Model {
                 .unwrap_or(8192.0);
             config["rope_scaling"] = llama3_scaling(&factors, theta, rotary, original)?;
         }
+        if model_type == "qwen3_5_moe" {
+            qwen35_config(&meta, &mut config, head_dim)?;
+        }
         let mut parsed = Config::from_json(&config)?;
         if parsed.model_type == "llama" {
             parsed.rope_layout = RopeLayout::Interleaved;
         }
+        if parsed.model_type == "qwen3_5_moe" {
+            // llama.cpp stores the norms centred on zero with their 1 added
+            // (`1 + w`), and lays the value heads of linear attention out
+            // tiled.
+            parsed.norm = crate::config::Norm::Rms { offset: 0.0 };
+            if let Some(linear) = parsed.linear.as_mut() {
+                linear.tiled = true;
+            }
+        }
         Ok(Self::from_parts(parsed, config, weights))
     }
+}
+
+/// The fields of Qwen 3.5's configuration (`qwen35moe`) that GGUF keeps
+/// apart: its layers of Gated DeltaNet, its experts, its partial RoPE.
+fn qwen35_config(meta: &Metadata<'_>, config: &mut Value, head_dim: u64) -> Result<()> {
+    let layers = meta.count("block_count")?;
+    let interval = meta.count("full_attention_interval")?.max(1);
+    let types: Vec<&str> = (0..layers)
+        .map(|i| {
+            if (i + 1) % interval == 0 {
+                "full_attention"
+            } else {
+                "linear_attention"
+            }
+        })
+        .collect();
+    let value_heads = meta.count("ssm.time_step_rank")?;
+    let rotary = meta.count("rope.dimension_count")?;
+    let fields = json!({
+        "layer_types": types,
+        "linear_num_key_heads": meta.count("ssm.group_count")?,
+        "linear_num_value_heads": value_heads,
+        "linear_key_head_dim": meta.count("ssm.state_size")?,
+        "linear_value_head_dim": meta.count("ssm.inner_size")? / value_heads.max(1),
+        "linear_conv_kernel_dim": meta.count("ssm.conv_kernel")?,
+        "num_experts": meta.count("expert_count")?,
+        "num_experts_per_tok": meta.count("expert_used_count")?,
+        "moe_intermediate_size": meta.count("expert_feed_forward_length")?,
+        "shared_expert_intermediate_size": meta.count("expert_shared_feed_forward_length")?,
+        "partial_rotary_factor": rotary as f64 / head_dim.max(1) as f64,
+        "attn_output_gate": true,
+    });
+    for (k, v) in fields.as_object().expect("an object") {
+        config[k] = v.clone();
+    }
+    Ok(())
 }
 
 /// The GGUF name of a weight of `transformers`, if llama.cpp has one.

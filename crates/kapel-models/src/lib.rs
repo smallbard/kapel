@@ -51,7 +51,9 @@ pub use config::{
     MAX_INTERMEDIATE, MAX_LAYERS, MAX_VOCAB, Mixer, Norm,
 };
 pub use gguf::GgufModel;
-pub use model::{Cache, Model, Observer, ROOM, Recorded, RecordedStep, Site, quantize_matrix};
+pub use model::{
+    Cache, DEVICE_ROUTES, Model, Observer, ROOM, Recorded, RecordedStep, Site, quantize_matrix,
+};
 
 /// What can go wrong with a model.
 #[derive(Debug)]

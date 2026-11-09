@@ -15,6 +15,7 @@
 mod attention;
 mod copy;
 mod elementwise;
+mod experts;
 mod index;
 mod loss;
 mod matmul;
@@ -32,6 +33,7 @@ use std::fmt;
 pub use attention::{Attention, documents_mask, is_documents};
 pub use copy::{Concat, Contiguous};
 pub use elementwise::{Affine, Binary, BinaryKind, Cast, Glu, Unary, UnaryKind};
+pub use experts::{ExpertMatmul, GatherColumns, TopK};
 pub use index::{GatherRows, ScatterAddRows};
 use kapel_core::{DType, Error, Result, Tensor};
 pub use loss::CrossEntropy;
@@ -186,6 +188,9 @@ pub trait Backend:
     + Run<Rope>
     + Run<GatherRows>
     + Run<ScatterAddRows>
+    + Run<TopK>
+    + Run<GatherColumns>
+    + Run<ExpertMatmul>
 {
 }
 
@@ -217,6 +222,9 @@ impl<B> Backend for B where
         + Run<Rope>
         + Run<GatherRows>
         + Run<ScatterAddRows>
+        + Run<TopK>
+        + Run<GatherColumns>
+        + Run<ExpertMatmul>
 {
 }
 
