@@ -146,7 +146,9 @@ The chunk length depends on the shape alone, never on the data: positions are cu
 
 Paged kernels read each query's keys apart, which is cheap for a token but grows as the square of a long prompt. A sequence with at least `PREFILL_QUERIES` = 384 consecutive queries is therefore handled by FlashAttention 2: its keys are gathered from the pages into a contiguous tensor, attention runs causally from the first query's position, and the result is placed into the output rows. A prompt of 4096 tokens of Llama 3.2 3B takes 0.76 s this way, against 1.5 s through the paged kernels.
 
-**Linear attention.** `causal_conv` takes one thread per channel, which goes through the rows of the pass in order, its column of the state its own. `delta_rule` takes one thread per value head and column `j` of its states: the delta rule never mixes columns, so each thread keeps its column `S[:, j]` (at most 256 keys) in its own memory while the rows are of the same sequence, and writes it back when the sequence changes. A prompt therefore reads and writes its states once, whatever its length; its rows go one after the other, which a chunked form, with products by tiles, would compute faster.
+**Linear attention.** `causal_conv` takes one thread per channel, which goes through the rows of the pass in order, its column of the state its own. `delta_rule` takes one block of 8 warps per value head and 32 columns of its states: warp `w` keeps rows `32w .. 32w + 32` of the columns in its registers, lane `l` column `l`, while the rows are of the same sequence, so that every load and store of a row of the state is one contiguous piece; the sums over a column add each warp's rows in order, then the warps' through shared memory in order. The delta rule never mixes columns: a prompt reads and writes its states once, whatever its length, but its rows go one after the other, which a chunked form, with products by tiles, would compute faster.
+
+**Experts and small products.** `top_k` takes one warp per row: each lane reads its values once and, at each of the `k` passes, offers its largest not yet taken to a butterfly. `gather_columns` takes one thread per output. `expert_gemv` takes one block of 8 warps per route (a token and one of its experts) and 8 rows of the expert's weights, the block's input first read once into shared memory in `f32`, one empty place after every 8 so that lanes reading 8 consecutive elements read different banks. IQ4_XS and IQ3_S have paths of their own, a lane a 32nd of each block of 256; the other formats are decoded as `qgemv` decodes them, and float weights read through their view. For Q8_0 weights and 16-bit activations, `bytes_of_rows` first rounds each row of activations to bytes by blocks of 32, as llama.cpp does, and `expert_gemv_bytes` multiplies four bytes at a time (`dp4a`): one and a half times faster (example `experts`); for IQ3_S and IQ4_XS it gains nothing, and they keep their activations. Products of at most 8 rows by float weights of at most 512 rows, without a bias (a router, the gates of linear attention), go to `gemv_float`, one block of 256 threads per output, which the tiles computed with a block or two: each output is one block's whatever the number of rows, so a row's bits do not depend on the others. The experts the card chose are never read back: an index out of range there gives NaN rather than an error, while indices uploaded from the host are checked.
 
 ## 7.8 Recorded passes
 
@@ -168,8 +170,6 @@ Products by quantized weights read the codes on the card (`quantized.rs`). For a
 
 For more rows, the prompt, pieces of at most 32 MiB of weights are dequantized into the activations' type by `dequantize` and multiplied by the tiled product. Rows of quantized embedding tables are dequantized on the card by `dequantize_rows`. Q2_K and Q3_K have no kernels and go through the host. IQ4_NL, IQ4_XS and IQ3_S, the non-linear formats of llama.cpp, go through the generic kernels: their eight values share a scale, and `q` comes from a table, the 512 groups of IQ3_S's grid a global array of the PTX.
 
-**Experts.** `top_k` takes one thread per row, which makes `k` passes over its values, each taking the largest after the last one taken in the order of the operation. `gather_columns` takes one thread per output. `expert_gemv` takes one warp per route (a token and one of its experts) and row of the expert's weights, decoded as `qgemv` decodes them or read as floats. The experts the card chose are never read back: an index out of range there gives NaN rather than an error, while indices uploaded from the host are checked.
-
 The backward pass, `g · W` for the gradient of the activations (QLoRA, section 16.2), dequantizes the weights stacked, all at once, into the gradient's type, and computes one tiled product; it went through the host until then. A `Cast` from a quantized type decodes it by the same `dequantize`.
 
 ## 7.10 Performance
@@ -190,10 +190,20 @@ Speculative decoding (chapter 11) takes Qwen3 8B in bf16 from 49.9 to 85.6 token
 
 Llama 3.2 1B decodes at 425 tokens per second in Q4_K_M, 412 in Q8_0 and 272 in bf16; Llama 3.2 3B at 166 in int8, 179 in int4 and 204 in Q4_0. Q4_0, the format `kapel quantize` writes by default (chapter 13), went through the generic kernel at 28 tokens per second until the tracked measures (chapter 19) showed it.
 
+Qwen3.6-35B-A3B in UD-IQ4\_XS (Unsloth's GGUF: experts in IQ3\_S and IQ4\_XS, the rest in Q8\_0), against llama.cpp on the same file and card (`llama-bench -p 512 -n 128`, `llama-perplexity -c 512 --chunks 8`):
+
+| Measure | Kapel | llama.cpp |
+| --- | --- | --- |
+| decoding | 93 tokens/s | 161 |
+| prompt of 512 tokens | 398 tokens/s | 4493 |
+| wikitext-2 perplexity, 8 chunks | 6.30 | 6.30 ± 0.34 |
+
+Decoding started at 21.6 tokens per second; Nsight Systems showed where it went, and the kernels above were written from it (`top_k`, `delta_rule`, `gemv_float`, the paths of `expert_gemv`, the router's softmax over the chosen logits only). What is left: the products by experts reach 200 GB/s, reading their weights byte by byte; the dense products in Q8\_0 64 % of the bandwidth; and some 3 ms a token go to the small kernels around Gated DeltaNet. A prompt chooses its experts on the host and runs the delta rule row by row.
+
 The limits are known. At one sequence, products alone reach 92 % of the bandwidth, but the small kernels between them (norms, RoPE, cache writes, attention) take the rest of the time. Quantized weights with 9 to a few hundred rows of activations are dequantized at every pass. 4-bit formats are limited by the instructions that decode them, not by bandwidth, and `qgemv` with 2 to 8 rows is slower than it should be.
 
 ## 7.11 Testing on the card
 
 The GPU tests run the conformity suite in `f32`, `bf16` and `f16`, plus targeted tests: every one of the 65,536 bf16 and f16 bit patterns converted exactly as the host converts them; attention over many tiles with windows, masks, softcaps and grouped heads, run twice to check identical bits; extreme masks; norms with bf16 weights; one backend per device; refused 32-bit overflows. The conformity suite also covers paged attention, row writes and `ArgMax`, with caches in every float type. These tests call `Cuda::poison_buffers(true)`, which fills every new buffer with NaN, so that an output left partly unwritten fails instead of passing by luck. A parity test runs whole models on the card and compares their logits with `transformers`: within 2e-5 in `f32`, and in `bf16` within twice the CPU's own `bf16` error. Others check that a batch of sequences gives the logits of each one alone, that fused projections change nothing, and that quantized models predict on the card as on the processor.
 
-Two examples measure the products of decoding: `examples/decode.rs` for bf16, against a plain copy, and `examples/quantized.rs` for each quantized format, both reporting the bandwidth reached on the weights.
+Three examples measure the products of decoding: `examples/decode.rs` for bf16, against a plain copy, `examples/quantized.rs` for each quantized format, and `examples/experts.rs` for the products by experts at the shapes of Qwen3.6-35B-A3B and Qwen3.8-Flash-Next, all reporting the bandwidth reached on the weights.

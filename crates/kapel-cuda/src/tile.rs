@@ -15,7 +15,15 @@ use cutile::tile_kernel::{CompileOptions, TileKernel};
 use kapel_core::{DType, Error, Layout, Result, Tensor};
 use kapel_ops::{Matmul, Operation};
 
-use crate::device::{Cuda, CudaStorage};
+use crate::device::{Args, Cuda, CudaStorage, float_code, small};
+
+/// The most rows of a product [`Cuda::small_product`] computes.
+pub(crate) const SMALL_ROWS: usize = 8;
+
+/// The most columns of a product [`Cuda::small_product`] computes: the
+/// small projections of a decoder (a router, the gates of linear attention),
+/// not its large ones, which the tiles compute well.
+pub(crate) const SMALL_COLUMNS: usize = 512;
 
 #[cutile::module]
 mod kernels {
@@ -258,6 +266,9 @@ impl Cuda {
         }
         let rank = shape.len();
         let (m, n, k) = (shape[rank - 2], shape[rank - 1], a.shape()[a.rank() - 1]);
+        if let Some(y) = self.small_product(a, b, bias, shape)? {
+            return Ok(y);
+        }
         let layout = Layout::contiguous(shape)?;
         let numel = layout.numel();
         let storage = self.alloc(numel * dtype.block_bytes(), k == 0)?;
@@ -322,6 +333,70 @@ impl Cuda {
             }
         }
         Tensor::from_storage(Arc::new(storage), layout, dtype)
+    }
+
+    /// `a · b` by `gemv_float` when it is a small product of decoding: at
+    /// most [`SMALL_ROWS`] rows of `a` by the transpose of a row-major weight
+    /// `[N, K]` with at most [`SMALL_COLUMNS`] rows, without a bias, which
+    /// the tiles compute with a block or two; `None` otherwise. Each output
+    /// is one warp's, whatever the number of rows: the bits of a row do not
+    /// depend on the others.
+    fn small_product(
+        &self,
+        a: &Tensor,
+        b: &Tensor,
+        bias: Option<&Tensor>,
+        shape: &[usize],
+    ) -> Result<Option<Tensor>> {
+        let op = Matmul::NAME;
+        let (ra, rank) = (a.rank(), shape.len());
+        let (n, k) = (shape[rank - 1], a.shape()[ra - 1]);
+        let rows: usize = shape[..rank - 1].iter().product();
+        let weight_like = b.rank() == 2 && b.layout().strides() == [1, k] && b.shape() == [k, n];
+        if bias.is_some()
+            || !weight_like
+            || rows == 0
+            || rows > SMALL_ROWS
+            || n == 0
+            || n > SMALL_COLUMNS
+            || k == 0
+            || a.shape()[..ra - 1].iter().product::<usize>() != rows
+        {
+            return Ok(None);
+        }
+        let dtype = a.dtype();
+        let x = if a.is_contiguous() && a.layout().offset() == 0 {
+            a.clone()
+        } else {
+            self.materialize(op, a, a.layout())?
+        };
+        let xa = self.float_arg(op, &x, x.layout())?;
+        // The weights row-major, from their first element.
+        let w = b.transpose(0, 1)?;
+        if !w.is_contiguous() {
+            return Ok(None);
+        }
+        let wa = self.float_arg(op, &w, w.layout())?;
+        let w_size = w.dtype().block_bytes();
+        let w_start = wa.base + (w.layout().offset() * w_size) as u64;
+        let w_bytes = n * k * w_size;
+        let y = self.output_as(shape, dtype, false, |out, count| {
+            self.launch(
+                "gemv_float",
+                rows * n * 256,
+                Args::new()
+                    .u32(wa.code)
+                    .slice(w_start, w_bytes)
+                    .u32(xa.code)
+                    .slice(xa.base, xa.bytes)
+                    .u32(small(op, rows)?)
+                    .u32(small(op, k)?)
+                    .u32(small(op, n)?)
+                    .u32(float_code(op, dtype)?)
+                    .slice(out, dtype.storage_bytes(count)?),
+            )
+        })?;
+        Ok(Some(y))
     }
 
     /// The backend's stream, as the tile runtime sees it.

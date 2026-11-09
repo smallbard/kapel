@@ -28,6 +28,11 @@ const LLAMA3: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{
 /// The splitting pattern of Qwen 2 and 3 (`qwen2`): digits one by one.
 const QWEN2: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
+/// The splitting pattern of Qwen 3.5 (`qwen35`): Qwen 2's, the combining
+/// marks kept with the letters they follow (`\p{M}`), as its
+/// `tokenizer.json` writes it.
+const QWEN35: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
 /// The kinds of `tokenizer.ggml.token_type`.
 const NORMAL: i64 = 1;
 const CONTROL: i64 = 3;
@@ -92,6 +97,7 @@ pub(crate) fn vocabulary(gguf: &Gguf) -> Result<Vocabulary> {
     let (pattern, normalizer, ignore_merges, bos_default) = match pre {
         "llama-bpe" | "llama3" => (LLAMA3, Value::Null, true, true),
         "qwen2" => (QWEN2, json!({"type": "NFC"}), false, false),
+        "qwen35" => (QWEN35, json!({"type": "NFC"}), false, false),
         other => {
             return Err(unsupported(format!(
                 "GGUF pre-tokenizer {other:?} is not supported"

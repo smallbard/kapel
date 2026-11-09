@@ -50,7 +50,7 @@ The shared checks are small private functions: `arity`, `float`, `indices` (the 
 
 | Operation | Inputs → output | Definition and rules | Gradient to |
 | --- | --- | --- | --- |
-| `Unary` | x → same shape | Neg, Exp, Log, Sqrt, Rsqrt, Square, Abs, Sigmoid, Tanh, Relu, Silu, GeluTanh, GeluErf | x |
+| `Unary` | x → same shape | Neg, Exp, Log, Sqrt, Rsqrt, Square, Abs, Sigmoid, Tanh, Relu, Silu, GeluTanh, GeluErf, Softplus (`max(x, 0) + ln(1 + e^(−\|x\|))`) | x |
 | `Binary` | a, b → broadcast shape | Add, Sub, Mul, Div, Max, Min; a broadcast input's gradient is summed over the repeated dimensions | a, b |
 | `Affine` | x → same | scale · x + bias | x |
 | `Glu` | x \[…, 2n\] → \[…, n\] | f(x\[…, :n\]) · x\[…, n:\], the gate first: SwiGLU with SiLU, GeGLU with GELU | x |
@@ -108,7 +108,7 @@ The scores, the softcap, the grouped heads and the default scale are those of `A
 Gated DeltaNet (Yang, Kautz and Hatamizadeh, 2024), which three layers of Qwen 3.5 in four use instead of attention, keeps no keys nor values: each sequence has a state of fixed size, carried from one token to the next. `Recurrent` holds its two operations. Both read a table of states `[N, ...]`, one slot per sequence, and `slots [R]` gives the slot of each row of the pass: the rows of several sequences, each sequence's in the order of its positions, every row reading what its sequence's previous row left.
 
 - `causal_conv(state, x, weight, slots)` is a depthwise causal convolution of `K` taps over `x [R, C]`. `state [N, K − 1, C]` keeps the last inputs of each sequence. For each row in order, the window is the kept inputs and the row's own, `y[r, c] = Σⱼ weight[c, j] · w[j][c]`, and the window less its oldest input becomes the state, in the state's type.
-- `delta_rule(state, q, k, v, g, beta, slots)` is the gated delta rule. Each value head of each sequence keeps a matrix `S [Dk, Dv]` in `f32`, in `state [N, H, Dk, Dv]`; value head `h` reads key head `h / (H / Hk)`. For each row in order: `S ← exp(g) · S`, then `S ← S + k ((v − Sᵀk) · β)ᵀ`, and the output is `Sᵀq`. The caller normalizes and scales `q` and `k`.
+- `delta_rule(state, q, k, v, g, beta, slots)` is the gated delta rule. Each value head of each sequence keeps a matrix `S [Dk, Dv]` in `f32`, in `state [N, H, Dk, Dv]`; value head `h` reads key head `h / (H / Hk)` when the value heads are grouped by key head, as `transformers` lays them out, and `h % Hk` when they are tiled over them, as llama.cpp does (`HeadLayout`). For each row in order: `S ← exp(g) · S`, then `S ← S + k ((v − Sᵀk) · β)ᵀ`, and the output is `Sᵀq`. The caller normalizes and scales `q` and `k`.
 
 `check_conv`, `check_delta` and `check_slots` hold the checks; the conformity suite runs both operations on rows of three interleaved sequences and compares the outputs and the states the backend leaves with the reference's (chapter 5).
 

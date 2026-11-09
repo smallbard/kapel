@@ -46,6 +46,7 @@ fn unary_code(op: &'static str, kind: UnaryKind) -> Result<u32> {
         UnaryKind::Silu => unary::SILU,
         UnaryKind::GeluTanh => unary::GELU_TANH,
         UnaryKind::GeluErf => unary::GELU_ERF,
+        UnaryKind::Softplus => unary::SOFTPLUS,
         kind => {
             return Err(Error::InvalidArgument {
                 op,
@@ -2502,6 +2503,7 @@ impl kapel_ops::Recurrent for Cuda {
         g: &Tensor,
         beta: &Tensor,
         slots: &Tensor,
+        layout: kapel_ops::HeadLayout,
     ) -> Result<Tensor> {
         let op = kapel_ops::DELTA_RULE;
         let (shape, dtype) = kapel_ops::check_delta(state, q, k, v, g, beta, slots)?;
@@ -2524,7 +2526,7 @@ impl kapel_ops::Recurrent for Cuda {
             let out_bytes = dtype.storage_bytes(count)?;
             self.launch(
                 "delta_rule",
-                h * dv,
+                h * dv.div_ceil(32) * 256,
                 Args::new()
                     .float(&qa)
                     .float(&ka)
@@ -2536,6 +2538,7 @@ impl kapel_ops::Recurrent for Cuda {
                     .u32(small(op, hk)?)
                     .u32(small(op, dk)?)
                     .u32(small(op, dv)?)
+                    .u32(u32::from(layout == kapel_ops::HeadLayout::Tiled))
                     .slice(pointer, bytes / 4)
                     .u32(ko)
                     .slice(out, out_bytes),

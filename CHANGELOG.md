@@ -377,11 +377,24 @@ changelog says how.
 - `TopK`, `GatherColumns` and `ExpertMatmul`: the experts of a mixture chosen
   and computed on the device; decoding passes of a model with experts are
   recorded, with the bits of their steps.
+- `UnaryKind::Softplus`; `HeadLayout` for the delta rule (value heads grouped
+  as `transformers` lays them out, or tiled as llama.cpp does).
+- GGUF: the pre-tokenizer `qwen35`.
+- The card: `gemv_float` for the small products of decoding, a warp per row
+  for `top_k`, the delta rule by blocks of 32 columns, dedicated paths for
+  IQ4_XS and IQ3_S in the products by experts, and Q8_0 experts by
+  activations in bytes (`dp4a`); example `experts` of kapel-cuda.
+  Qwen3.6-35B-A3B in UD-IQ4_XS on an RTX 3090: 93 tokens/s decoding (161 for
+  llama.cpp), a wikitext-2 perplexity of 6.30 as llama.cpp's.
 
 ### Changed
 
 - `Tensor::narrow` accepts a quantized tensor when the view stays contiguous
   and starts at a whole block.
+- `Scorer` starts again from an empty cache, rather than shortening it, for a
+  model with linear attention.
+- `Model::load` computes `A = −exp(A_log)` of linear attention once, and
+  `Model::cast` keeps it and `dt_bias` in `f32`.
 
 - `kapel-cuda`: GPT-2 124M trains at 1.16 times llm.c's time on an RTX 3090,
   from 2.3 times: the gradient of a weight (`xᵀ · g`) has a kernel of its own;

@@ -127,6 +127,8 @@ pub mod unary {
     pub const GELU_TANH: u32 = 11;
     /// GELU, exact.
     pub const GELU_ERF: u32 = 12;
+    /// `ln(1 + eˣ)`
+    pub const SOFTPLUS: u32 = 13;
 }
 
 /// Codes of the `binary` kernels.

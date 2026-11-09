@@ -73,3 +73,7 @@ required-features = ["cuda"]
 [[example]]
 name = "quantized"
 required-features = ["cuda"]
+
+[[example]]
+name = "experts"
+required-features = ["cuda"]

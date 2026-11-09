@@ -141,6 +141,51 @@ fn recurrent_failures<B: Backend + Transfer>(backend: &B, dtype: DType) -> Vec<F
             message,
         }));
     }
+    // Small heads, and heads wide enough for a card to share a column
+    // between several warps and the columns between several blocks.
+    for (dk, dv) in [(8, 6), (64, 40)] {
+        let (h, hk) = (4, 2);
+        let q = random(&mut rng, &[6, hk, dk], dtype, -0.5, 0.5);
+        let k = random(&mut rng, &[6, hk, dk], dtype, -0.5, 0.5);
+        let v = random(&mut rng, &[6, h, dv], dtype, -1.0, 1.0);
+        let g = random(&mut rng, &[6, h], dtype, -1.0, 0.0);
+        let beta = random(&mut rng, &[6, h], dtype, 0.0, 1.0);
+        let delta0 = random(&mut rng, &[3, h, dk, dv], DType::F32, -0.5, 0.5);
+        for layout in [kapel_ops::HeadLayout::Grouped, kapel_ops::HeadLayout::Tiled] {
+            let case =
+                format!("6 rows of 3 sequences, {h} heads reading {hk} {layout:?}, {dk} × {dv}");
+            let outcome = (|| -> Result<Vec<String>> {
+                let mut rs = table(&Reference, &delta0, DType::F32)?;
+                let want = Reference.delta_rule(&mut rs, &q, &k, &v, &g, &beta, &slots, layout)?;
+                let mut bs = table(backend, &delta0, DType::F32)?;
+                let up = |t: &Tensor| backend.upload(t);
+                let got = backend.delta_rule(
+                    &mut bs,
+                    &up(&q)?,
+                    &up(&k)?,
+                    &up(&v)?,
+                    &up(&g)?,
+                    &up(&beta)?,
+                    &up(&slots)?,
+                    layout,
+                )?;
+                let mut problems = Vec::new();
+                let got = backend.download(&got)?;
+                if got.dtype() != dtype {
+                    problems.push(format!("type {}, expected {dtype}", got.dtype()));
+                }
+                compare("output", &want, &got, tol, &mut problems)?;
+                compare("state", &rs, &backend.download(&bs)?, tol, &mut problems)?;
+                Ok(problems)
+            })();
+            let problems = outcome.unwrap_or_else(|e| vec![e.to_string()]);
+            failures.extend(problems.into_iter().map(|message| Failure {
+                op: DELTA_RULE,
+                case: case.clone(),
+                message,
+            }));
+        }
+    }
     let (h, hk, dk, dv) = (4, 2, 8, 6);
     let q = random(&mut rng, &[6, hk, dk], dtype, -0.5, 0.5);
     let k = random(&mut rng, &[6, hk, dk], dtype, -0.5, 0.5);
@@ -148,36 +193,6 @@ fn recurrent_failures<B: Backend + Transfer>(backend: &B, dtype: DType) -> Vec<F
     let g = random(&mut rng, &[6, h], dtype, -1.0, 0.0);
     let beta = random(&mut rng, &[6, h], dtype, 0.0, 1.0);
     let delta0 = random(&mut rng, &[3, h, dk, dv], DType::F32, -0.5, 0.5);
-    let case = format!("6 rows of 3 sequences, {h} heads reading {hk}, {dk} × {dv}");
-    let outcome = (|| -> Result<Vec<String>> {
-        let mut rs = table(&Reference, &delta0, DType::F32)?;
-        let want = Reference.delta_rule(&mut rs, &q, &k, &v, &g, &beta, &slots)?;
-        let mut bs = table(backend, &delta0, DType::F32)?;
-        let up = |t: &Tensor| backend.upload(t);
-        let got = backend.delta_rule(
-            &mut bs,
-            &up(&q)?,
-            &up(&k)?,
-            &up(&v)?,
-            &up(&g)?,
-            &up(&beta)?,
-            &up(&slots)?,
-        )?;
-        let mut problems = Vec::new();
-        let got = backend.download(&got)?;
-        if got.dtype() != dtype {
-            problems.push(format!("type {}, expected {dtype}", got.dtype()));
-        }
-        compare("output", &want, &got, tol, &mut problems)?;
-        compare("state", &rs, &backend.download(&bs)?, tol, &mut problems)?;
-        Ok(problems)
-    })();
-    let problems = outcome.unwrap_or_else(|e| vec![e.to_string()]);
-    failures.extend(problems.into_iter().map(|message| Failure {
-        op: DELTA_RULE,
-        case: case.clone(),
-        message,
-    }));
     // Calls to refuse.
     let beyond = Tensor::from_slice(&[2u32, 3, 0, 2, 1, 0], &[6]).expect("sizes agree");
     let refused: [(&'static str, &str, Result<Tensor>); 3] = [
@@ -209,6 +224,7 @@ fn recurrent_failures<B: Backend + Transfer>(backend: &B, dtype: DType) -> Vec<F
                     &up(&g)?,
                     &up(&beta)?,
                     &up(&beyond)?,
+                    kapel_ops::HeadLayout::Grouped,
                 )
             })(),
         ),
@@ -227,6 +243,7 @@ fn recurrent_failures<B: Backend + Transfer>(backend: &B, dtype: DType) -> Vec<F
                     &up(&g)?,
                     &up(&beta)?,
                     &up(&slots)?,
+                    kapel_ops::HeadLayout::Grouped,
                 )
             })(),
         ),
@@ -663,6 +680,7 @@ fn cases<V: Visitor>(v: &mut V, dtype: DType) {
         U::Silu,
         U::GeluTanh,
         U::GeluErf,
+        U::Softplus,
     ] {
         v.visit(
             &Unary { kind },

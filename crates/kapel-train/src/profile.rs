@@ -394,10 +394,14 @@ impl<B: kapel_ops::Recurrent> kapel_ops::Recurrent for Profiled<B> {
         g: &Tensor,
         beta: &Tensor,
         slots: &Tensor,
+        layout: kapel_ops::HeadLayout,
     ) -> Result<Tensor> {
         self.time(
             || "delta_rule".into(),
-            || self.inner.delta_rule(state, q, k, v, g, beta, slots),
+            || {
+                self.inner
+                    .delta_rule(state, q, k, v, g, beta, slots, layout)
+            },
         )
     }
 }

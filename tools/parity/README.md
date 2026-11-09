@@ -60,6 +60,13 @@ the experts stacked), with Qwen3.6-35B-A3B's tokenizer, in `data/parity/qwen3_5_
 last text, 230 tokens, is longer than the chunks of 64 positions in which `transformers`
 computes the delta rule. The model's logits are checked with the others.
 
+The same model as llama.cpp writes it is `model-f32.gguf` there, which the test
+`a_mixture_of_experts_read_from_gguf_gives_the_logits_of_transformers` reads:
+llama.cpp's converter (`convert_hf_to_gguf.py data/parity/qwen3_5_moe --no-mtp
+--outtype f32 --outfile data/parity/qwen3_5_moe/model-f32.gguf`), or, without
+llama.cpp, `moe_gguf.py`, which reproduces its changes to the weights; both give
+the same logits.
+
 ## MiMo's multi-token layer
 
 `multi_token_reference.py` builds a small MiMo with random weights (Qwen 2 with a

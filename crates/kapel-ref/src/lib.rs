@@ -217,8 +217,9 @@ mod tests {
             g: &Tensor,
             beta: &Tensor,
             slots: &Tensor,
+            layout: kapel_ops::HeadLayout,
         ) -> Result<Tensor> {
-            Reference.delta_rule(state, q, k, v, g, beta, slots)
+            Reference.delta_rule(state, q, k, v, g, beta, slots, layout)
         }
     }
 

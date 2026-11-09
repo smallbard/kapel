@@ -133,6 +133,17 @@ pub(crate) const KERNELS: &[(&str, &[Param])] = &[
         &[U32, Slice, View, Slice, U32, U32, Slice],
     ),
     ("top_k", &[U32, Slice, View, U32, U32, U32, Slice]),
+    ("bytes_of_rows", &[U32, Slice, U32, Slice, Slice]),
+    (
+        "expert_gemv_bytes",
+        &[
+            U32, Slice, Slice, Slice, Slice, U32, U32, U32, U32, U32, U32, Slice,
+        ],
+    ),
+    (
+        "gemv_float",
+        &[U32, Slice, U32, Slice, U32, U32, U32, U32, Slice],
+    ),
     (
         "gather_columns",
         &[U32, Slice, View, Slice, U32, U32, U32, Slice],
@@ -140,8 +151,7 @@ pub(crate) const KERNELS: &[(&str, &[Param])] = &[
     (
         "expert_gemv",
         &[
-            U32, U32, U32, Slice, View, U32, Slice, View, Slice, U32, U32, U32, U32, U32, U32,
-            Slice,
+            U32, U32, U32, Slice, View, U32, Slice, Slice, U32, U32, U32, U32, U32, U32, Slice,
         ],
     ),
     (
@@ -154,7 +164,7 @@ pub(crate) const KERNELS: &[(&str, &[Param])] = &[
         "delta_rule",
         &[
             U32, Slice, View, U32, Slice, View, U32, Slice, View, U32, Slice, View, U32, Slice,
-            View, Slice, U32, U32, U32, U32, Slice, U32, Slice,
+            View, Slice, U32, U32, U32, U32, U32, Slice, U32, Slice,
         ],
     ),
     (

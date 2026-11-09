@@ -24,7 +24,7 @@
 
 mod iq;
 
-use cuda_device::{DisjointSlice, SharedArray, device, kernel, launch_bounds, thread, warp};
+use cuda_device::{DisjointSlice, SharedArray, device, dotprod, kernel, launch_bounds, thread, warp};
 use kapel_cuda_abi::{PAGED_CHUNK, PAGED_HEADS, PAGED_WIDTH, Paged, View, binary, float, half, quant, unary};
 
 /// The exact error function, as `kapel_ops::special::erf` computes it: its
@@ -97,6 +97,7 @@ fn unary_value(op: u32, x: f32) -> f32 {
             }
         }
         unary::SILU => x * sigmoid(x),
+        unary::SOFTPLUS => (if x > 0.0 { x } else { 0.0 }) + (-x.abs()).exp().ln_1p(),
         unary::GELU_TANH => {
             let c = 0.797_884_6f32;
             0.5 * x * (1.0 + (c * (x + 0.044_715 * x * x * x)).tanh())
@@ -156,6 +157,7 @@ fn unary_slope(op: u32, x: f32) -> f32 {
             let phi = (-0.5 * x * x).exp() / (2.0 * core::f64::consts::PI).sqrt();
             (0.5 * (1.0 + erf(x / core::f64::consts::SQRT_2)) + x * phi) as f32
         }
+        unary::SOFTPLUS => sigmoid(x),
         _ => f32::NAN,
     }
 }
@@ -1657,13 +1659,17 @@ pub fn causal_conv(
 }
 
 /// The gated delta rule over the rows of a pass
-/// (`kapel_ops::Recurrent::delta_rule`): one thread per value head `h` and
-/// column `j` of its states `[dk, dv]`, which goes through the rows in order.
-/// The column of the row's sequence (its slot of `state`, `f32`) is kept in
-/// the thread's memory while the rows are of that sequence. For each row:
-/// the column decays by `exp(g)`, `u = Σᵢ S[i, j] k[i]`, `δ = (v[j] − u) β`,
-/// `S[i, j] += k[i] δ`, and the output is `Σᵢ S[i, j] q[i]`, sums over `i`
-/// in order. Each thread reads and writes its column and its outputs alone.
+/// (`kapel_ops::Recurrent::delta_rule`): one block of 8 warps per value head
+/// `h` (which reads key head `h % hk` when `tiled`, `h / (heads / hk)`
+/// otherwise) and 32 columns `j0 .. j0 + 32` of its states `[dk, dv]`, which
+/// goes through the rows in order. Warp `w` keeps rows `32w .. 32w + 32` of
+/// the columns of the row's sequence (its slot of `state`, `f32`), lane `l`
+/// column `j0 + l`, while the rows are of that sequence: each load and store
+/// of a row of the state is one contiguous piece. For each row: the columns
+/// decay by `exp(g)`, `u = Σᵢ S[i, j] k[i]`, `δ = (v[j] − u) β`, `S[i, j] +=
+/// k[i] δ`, and the output is `Σᵢ S[i, j] q[i]`: each warp sums its rows in
+/// order, then the warps' sums are added in order. Each block reads and
+/// writes its columns and its outputs alone.
 #[kernel]
 #[launch_bounds(256)]
 pub fn delta_rule(
@@ -1687,68 +1693,126 @@ pub fn delta_rule(
     key_heads: u32,
     dk: u32,
     dv: u32,
+    tiled: u32,
     mut state: DisjointSlice<f32>,
     ko: u32,
     mut out: DisjointSlice<u8>,
 ) {
-    let idx = thread::index_1d();
-    let i = idx.get();
+    static mut KEYS: SharedArray<f32, DELTA_KEYS> = SharedArray::UNINIT;
+    static mut QUERIES: SharedArray<f32, DELTA_KEYS> = SharedArray::UNINIT;
+    static mut PARTS: SharedArray<f32, 256> = SharedArray::UNINIT;
+    let t = thread::threadIdx_x() as usize;
+    let block = thread::blockIdx_x() as usize;
+    let (warp_id, lane) = (t / 32, t % 32);
     let (h, hk, dk, dv) = (heads as usize, key_heads as usize, dk as usize, dv as usize);
-    if i >= h * dv || dk == 0 || dk > DELTA_KEYS || hk == 0 || h % hk != 0 {
+    let tiles = dv.div_ceil(32);
+    // The same for the whole block: every thread reaches the barriers.
+    if block >= h * tiles || dk == 0 || dk > DELTA_KEYS || hk == 0 || h % hk != 0 {
         return;
     }
-    let (head, j) = (i / dv, i % dv);
-    let kh = head / (h / hk);
+    let (head, j) = (block / tiles, block % tiles * 32 + lane);
+    let kh = if tiled == 1 { head % hk } else { head / (h / hk) };
+    let first_row = warp_id * 32;
+    let mine = j < dv;
     let room = elements(ko, out.len());
     let base = state.as_mut_ptr();
-    let mut column = [0.0f32; DELTA_KEYS];
+    let mut column = [0.0f32; 32];
     let mut current = usize::MAX;
+    let at = |s: usize, row: usize| ((s * h + head) * dk + row) * dv + j;
     for r in 0..slots.len() {
         let s = slots[r] as usize;
-        let at = |row: usize| ((s * h + head) * dk + row) * dv + j;
+        // The row's keys and queries, shared by the block.
+        thread::sync_threads();
+        let keys = (r * hk + kh) * dk;
+        let mut i = t;
+        while i < dk {
+            // SAFETY: `i < dk ≤ DELTA_KEYS`; read after the barrier below.
+            unsafe {
+                KEYS[i] = read(kk, k, vk.at((keys + i) as u32) as usize);
+                QUERIES[i] = read(kq, q, vq.at((keys + i) as u32) as usize);
+            }
+            i += 256;
+        }
+        thread::sync_threads();
         if s != current {
-            if current != usize::MAX {
-                let back = |row: usize| ((current * h + head) * dk + row) * dv + j;
-                for row in 0..dk {
-                    // SAFETY: in bounds (checked when it was read), this
-                    // thread's column.
-                    unsafe { *base.add(back(row)) = column[row] };
+            if current != usize::MAX && mine {
+                for p in 0..32 {
+                    let row = first_row + p;
+                    if row < dk {
+                        // SAFETY: in bounds (checked when it was read), this
+                        // thread's element.
+                        unsafe { *base.add(at(current, row)) = column[p] };
+                    }
                 }
             }
-            if at(dk - 1) >= state.len() {
+            if ((s * h + head) * dk + dk - 1) * dv + dv - 1 >= state.len() {
                 return;
             }
-            for row in 0..dk {
-                // SAFETY: in bounds (checked above), this thread's column.
-                column[row] = unsafe { *base.add(at(row)) };
+            for p in 0..32 {
+                let row = first_row + p;
+                column[p] = if mine && row < dk {
+                    // SAFETY: in bounds (checked above).
+                    unsafe { *base.add(at(s, row)) }
+                } else {
+                    0.0
+                };
             }
             current = s;
         }
         let decay = read(kg, g, vg.at((r * h + head) as u32) as usize).exp();
         let b = read(kb, beta, vb.at((r * h + head) as u32) as usize);
-        let keys = (r * hk + kh) * dk;
         let mut u = 0.0f32;
-        for row in 0..dk {
-            column[row] *= decay;
-            u += column[row] * read(kk, k, vk.at((keys + row) as u32) as usize);
+        for p in 0..32 {
+            let row = first_row + p;
+            if row < dk {
+                column[p] *= decay;
+                // SAFETY: written before the barrier.
+                u = column[p].mul_add(unsafe { KEYS[row] }, u);
+            }
         }
-        let delta = (read(kv, v, vv.at(((r * h + head) * dv + j) as u32) as usize) - u) * b;
+        // SAFETY: one slot per thread, read after the barrier.
+        unsafe { PARTS[t] = u };
+        thread::sync_threads();
+        let mut total = 0.0f32;
+        for w in 0..8 {
+            // SAFETY: written before the barrier.
+            total += unsafe { PARTS[w * 32 + lane] };
+        }
+        let value = if mine { read(kv, v, vv.at(((r * h + head) * dv + j) as u32) as usize) } else { 0.0 };
+        let delta = (value - total) * b;
         let mut o = 0.0f32;
-        for row in 0..dk {
-            column[row] += read(kk, k, vk.at((keys + row) as u32) as usize) * delta;
-            o += column[row] * read(kq, q, vq.at((keys + row) as u32) as usize);
+        for p in 0..32 {
+            let row = first_row + p;
+            if row < dk {
+                // SAFETY: written before the barrier.
+                let (key, query) = unsafe { (KEYS[row], QUERIES[row]) };
+                column[p] = key.mul_add(delta, column[p]);
+                o = column[p].mul_add(query, o);
+            }
         }
-        if (r * h + head) * dv + j < room {
-            // SAFETY: in bounds (checked above), this thread's element.
-            unsafe { write(ko, out.as_mut_ptr(), (r * h + head) * dv + j, o) };
+        thread::sync_threads();
+        // SAFETY: one slot per thread, read after the barrier.
+        unsafe { PARTS[t] = o };
+        thread::sync_threads();
+        if warp_id == 0 && mine && (r * h + head) * dv + j < room {
+            let mut sum = 0.0f32;
+            for w in 0..8 {
+                // SAFETY: written before the barrier.
+                sum += unsafe { PARTS[w * 32 + lane] };
+            }
+            // SAFETY: in bounds (checked above); only warp 0's lane `j - j0`
+            // writes this output.
+            unsafe { write(ko, out.as_mut_ptr(), (r * h + head) * dv + j, sum) };
         }
     }
-    if current != usize::MAX {
-        for row in 0..dk {
-            let back = ((current * h + head) * dk + row) * dv + j;
-            // SAFETY: in bounds (checked when it was read), this thread's
-            // column.
-            unsafe { *base.add(back) = column[row] };
+    if current != usize::MAX && mine {
+        for p in 0..32 {
+            let row = first_row + p;
+            if row < dk {
+                // SAFETY: in bounds (checked when it was read), this thread's
+                // element.
+                unsafe { *base.add(at(current, row)) = column[p] };
+            }
         }
     }
 }
@@ -3192,39 +3256,69 @@ fn total_key(x: f32) -> i32 {
     bits ^ (((bits >> 31) as u32) >> 1) as i32
 }
 
-/// `kapel_ops::TopK`: one thread per row of `rows` values of float type `kx`,
-/// which writes the positions of its `k` largest, the largest first and the
-/// lower position first on a tie. Pass `m` takes the largest value that comes
-/// after the last one taken in that order.
+/// The most values a lane of `top_k` keeps: rows of up to 32 · 32.
+const TOP_K_HELD: usize = 32;
+
+/// `kapel_ops::TopK`: one warp per row of `rows` values of float type `kx`,
+/// whose lane 0 writes the positions of its `k` largest, the largest first
+/// and the lower position first on a tie. Lane `l` reads positions `l, l +
+/// 32, …` once (rows of up to `32 · TOP_K_HELD`); each pass, each lane offers
+/// its largest not yet taken, the lanes' offers are compared by a fixed
+/// butterfly, and the winning lane marks it taken.
 #[kernel]
 #[launch_bounds(256)]
 pub fn top_k(kx: u32, x: &[u8], vx: View, rows: u32, e: u32, k: u32, mut out: DisjointSlice<u32>) {
-    let idx = thread::index_1d();
-    let row = idx.get();
+    let i = thread::index_1d().get();
+    let (row, lane) = (i / 32, i % 32);
     let (e, k) = (e as usize, k as usize);
-    if row >= rows as usize || (row + 1) * k > out.len() {
+    // The same for the whole warp: whole warps go on or stop.
+    if row >= rows as usize || (row + 1) * k > out.len() || e > 32 * TOP_K_HELD {
         return;
     }
-    let (mut last_key, mut last_at) = (i32::MAX, usize::MAX);
-    let mut first = true;
+    let mut keys = [i32::MIN; TOP_K_HELD];
+    let mut taken = [true; TOP_K_HELD];
+    let mut c = lane;
+    let mut p = 0;
+    while c < e {
+        keys[p] = total_key(read(kx, x, vx.at((row * e + c) as u32) as usize));
+        taken[p] = false;
+        c += 32;
+        p += 1;
+    }
     let o = out.as_mut_ptr();
     for m in 0..k {
-        let (mut best_key, mut best_at) = (i32::MIN, usize::MAX);
-        let mut found = false;
-        for i in 0..e {
-            let key = total_key(read(kx, x, vx.at((row * e + i) as u32) as usize));
-            let after = first || key < last_key || (key == last_key && i > last_at);
-            if after && (!found || key > best_key) {
-                best_key = key;
-                best_at = i;
-                found = true;
+        // This lane's best not yet taken: the largest key, then the lowest
+        // position (the lowest `p`, since positions grow with it).
+        let (mut best_key, mut best_at) = (i32::MIN, u32::MAX);
+        let mut best_p = TOP_K_HELD;
+        for q in 0..TOP_K_HELD {
+            if !taken[q] && (best_at == u32::MAX || keys[q] > best_key) {
+                best_key = keys[q];
+                best_at = (lane + 32 * q) as u32;
+                best_p = q;
             }
         }
-        // SAFETY: `row · k + m < out.len()` (checked above), this row's own.
-        unsafe { *o.add(row * k + m) = best_at as u32 };
-        last_key = best_key;
-        last_at = best_at;
-        first = false;
+        let (mut win_key, mut win_at) = (best_key, best_at);
+        let mut step = 16;
+        while step > 0 {
+            let other_key = warp::shuffle_xor(win_key as u32, step) as i32;
+            let other_at = warp::shuffle_xor(win_at, step);
+            let better = other_at != u32::MAX
+                && (win_at == u32::MAX || other_key > win_key || (other_key == win_key && other_at < win_at));
+            if better {
+                win_key = other_key;
+                win_at = other_at;
+            }
+            step /= 2;
+        }
+        if win_at == best_at && best_p < TOP_K_HELD {
+            taken[best_p] = true;
+        }
+        if lane == 0 {
+            // SAFETY: `row · k + m < out.len()` (checked above); only lane 0
+            // of the row's warp writes.
+            unsafe { *o.add(row * k + m) = win_at };
+        }
     }
 }
 
@@ -3243,25 +3337,178 @@ pub fn gather_columns(kx: u32, x: &[u8], vx: View, idx: &[u32], e: u32, k: u32, 
     }
 }
 
-/// `kapel_ops::ExpertMatmul`: one warp per route `r` (token `r / k`, its
-/// `r % k`-th expert) and row `n` of the expert's weights, `out[r, n] = Σᵢ
-/// x[r'][i] · w[idx[r] · rows + n, i]`, with `r' = r` when each route has its
-/// input (`per_route`), `r / k` otherwise. The weights are of quantized
-/// `format` (`quant`, `group` for Kapel's), decoded eight values at a time as
-/// `qgemv` decodes them, or with `format = u32::MAX` of float type `kw`. The
-/// lanes add their sums by a fixed butterfly. An expert of `experts` or more
-/// gives NaN.
+/// The widest input `expert_gemv` keeps in shared memory.
+pub const EXPERT_WIDTH: usize = 4096;
+
+/// Where element `i` of the input of `expert_gemv` is kept in shared
+/// memory: one place left empty after every 8, so that the lanes of a warp,
+/// which read 8 consecutive elements each, read from different banks.
+#[inline(always)]
+fn padded(i: usize) -> usize {
+    i + i / 8
+}
+
+/// The input of `expert_gemv` at `i`, from shared memory.
+#[inline(always)]
+fn expert_input(i: usize) -> f32 {
+    // SAFETY: the callers read below the width, which the block wrote into
+    // the array before its barrier; `padded(i) < EXPERT_WIDTH · 9 / 8`.
+    unsafe { EXPERT_INPUT[padded(i)] }
+}
+
+/// The input of a block of `expert_gemv`, in `f32`, padded.
+static mut EXPERT_INPUT: SharedArray<f32, { EXPERT_WIDTH * 9 / 8 }> = SharedArray::UNINIT;
+
+/// Lane `lane`'s part of the dot product of block `blk` of an IQ4_XS row at
+/// `row` and the shared input: its code bytes `4l .. 4l + 4`, of group `g =
+/// 4l / 16`, their low nibbles elements `32g + 4l % 16 + 0..4`, their high
+/// ones 16 further.
+///
+/// # Safety
+///
+/// The 136 bytes of block `blk` of the row are readable.
+#[inline(always)]
+unsafe fn iq4xs_block(row: *const u8, blk: usize, lane: usize) -> f32 {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let base = row.add(blk * 136);
+        let b = 4 * lane;
+        let g = b / 16;
+        let d = widen(half::F16, *base as u16 | (*base.add(1) as u16) << 8);
+        let high = *base.add(2) as u32 | (*base.add(3) as u32) << 8;
+        let low = *base.add(4 + g / 2);
+        let codes = [*base.add(8 + b), *base.add(9 + b), *base.add(10 + b), *base.add(11 + b)];
+        let sc = ((low >> (4 * (g % 2))) & 0x0f) as i32 | (((high >> (2 * g)) & 3) as i32) << 4;
+        let first = blk * 256 + g * 32 + b % 16;
+        let mut dot = 0.0f32;
+        let mut j = 0;
+        while j < 4 {
+            let code = codes[j];
+            dot = (iq::IQ4NL_VALUES[(code & 0x0f) as usize] as f32).mul_add(expert_input(first + j), dot);
+            dot = (iq::IQ4NL_VALUES[(code >> 4) as usize] as f32).mul_add(expert_input(first + 16 + j), dot);
+            j += 1;
+        }
+        d * (sc - 32) as f32 * dot
+    }
+}
+
+/// Lane `lane`'s part of the dot product of block `blk` of an IQ3_S row at
+/// `row` and the shared input: eighth `l % 4` of group `g = l / 4`.
+///
+/// # Safety
+///
+/// The 110 bytes of block `blk` of the row are readable.
+#[inline(always)]
+unsafe fn iq3s_block(row: *const u8, blk: usize, lane: usize) -> f32 {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let base = row.add(blk * 110);
+        let (g, l) = (lane / 4, lane % 4);
+        let d = widen(half::F16, *base as u16 | (*base.add(1) as u16) << 8);
+        let sc = (*base.add(106 + g / 2) >> (4 * (g % 2))) & 0x0f;
+        let qh = *base.add(66 + g) as usize;
+        let sign = *base.add(74 + g * 4 + l);
+        let c0 = *base.add(2 + g * 8 + 2 * l) as usize;
+        let c1 = *base.add(3 + g * 8 + 2 * l) as usize;
+        let g0 = iq::IQ3S_GRID[c0 | ((qh << (8 - 2 * l)) & 256)];
+        let g1 = iq::IQ3S_GRID[c1 | ((qh << (7 - 2 * l)) & 256)];
+        let first = blk * 256 + g * 32 + l * 8;
+        let mut dot = 0.0f32;
+        let mut j = 0;
+        while j < 4 {
+            let a = ((g0 >> (8 * j)) & 0xff) as f32;
+            let b = ((g1 >> (8 * j)) & 0xff) as f32;
+            let a = if (sign >> j) & 1 == 1 { -a } else { a };
+            let b = if (sign >> (j + 4)) & 1 == 1 { -b } else { b };
+            dot = a.mul_add(expert_input(first + j), dot);
+            dot = b.mul_add(expert_input(first + 4 + j), dot);
+            j += 1;
+        }
+        d * (1 + 2 * sc as u32) as f32 * dot
+    }
+}
+
+/// `kapel_ops::ExpertMatmul`'s input in bytes, for 16-bit activations: one
+/// warp per block of 32 of the rows of `x` (`rows · width`, row-major, of
+/// float type `kx`), lane `l` its element `l`: the codes `round(x / d)` with
+/// `d = max |x| / 127`, packed four to a word into `codes`, and the scales
+/// `d` into `scales`, as llama.cpp rounds the activations of its products.
 #[kernel]
 #[launch_bounds(256)]
-pub fn expert_gemv(
+pub fn bytes_of_rows(kx: u32, x: &[u8], blocks: u32, mut codes: DisjointSlice<u32>, mut scales: DisjointSlice<f32>) {
+    let i = thread::index_1d().get();
+    let (b, lane) = (i / 32, i % 32);
+    // The same for the whole warp.
+    if b >= blocks as usize || (b + 1) * 8 > codes.len() || b >= scales.len() {
+        return;
+    }
+    let v = read(kx, x, b * 32 + lane);
+    let largest = warp_max(v.abs());
+    let d = largest / 127.0;
+    let q = if d > 0.0 { (v / d).round() as i32 } else { 0 };
+    // Lane 4m gathers the codes of lanes 4m .. 4m + 4.
+    let code = (q as u32) & 0xff;
+    let c1 = warp::shuffle_xor(code, 1);
+    let pair = if lane % 2 == 0 { code | c1 << 8 } else { c1 | code << 8 };
+    let other = warp::shuffle_xor(pair, 2);
+    if lane % 4 == 0 {
+        // SAFETY: `8b + lane / 4 < codes.len()` (checked above); this lane's
+        // word alone.
+        unsafe { *codes.as_mut_ptr().add(b * 8 + lane / 4) = pair | other << 16 };
+    }
+    if lane == 0 {
+        // SAFETY: `b < scales.len()` (checked above), this warp's alone.
+        unsafe { *scales.as_mut_ptr().add(b) = d };
+    }
+}
+
+/// Four bytes, the first in the low byte.
+#[inline(always)]
+fn pack4(a: u32, b: u32, c: u32, d: u32) -> u32 {
+    (a & 0xff) | (b & 0xff) << 8 | (c & 0xff) << 16 | (d & 0xff) << 24
+}
+
+/// Lane `lane`'s part of the dot product of a Q8_0 row at `row` (`blocks`
+/// blocks of 32) and the input in bytes: elements `8l, 8l + 256, …`.
+///
+/// # Safety
+///
+/// The `blocks · 34` bytes of the row are readable.
+#[inline(always)]
+unsafe fn q8_0_bytes(row: *const u8, blocks: usize, lane: usize, codes: &[u32], scales: &[f32]) -> f32 {
+    let mut total = 0.0f32;
+    let mut e = lane * 8;
+    while e < blocks * 32 {
+        // SAFETY: the caller's contract; `e / 32 < blocks`.
+        unsafe {
+            let base = row.add(e / 32 * 34);
+            let d = widen(half::F16, *base as u16 | (*base.add(1) as u16) << 8);
+            let c = base.add(2 + e % 32);
+            let w0 = pack4(*c as u32, *c.add(1) as u32, *c.add(2) as u32, *c.add(3) as u32);
+            let w1 = pack4(*c.add(4) as u32, *c.add(5) as u32, *c.add(6) as u32, *c.add(7) as u32);
+            let dot = dotprod::dp4a_s32(w0, codes[e / 4], dotprod::dp4a_s32(w1, codes[e / 4 + 1], 0));
+            total = (d * scales[e / 32]).mul_add(dot as f32, total);
+        }
+        e += 256;
+    }
+    total
+}
+
+/// `kapel_ops::ExpertMatmul` for 16-bit activations rounded to bytes
+/// (`bytes_of_rows`: `codes` and `scales`, a row per input) and weights in
+/// Q8_0 (`format`), multiplied four at a time (`dp4a`), as llama.cpp
+/// multiplies them: one warp per route `r` (token `r / k`, its `r % k`-th
+/// expert) and row `n` of the expert's weights, `out[r, n] = Σᵢ x[r'][i] ·
+/// w[idx[r] · rows + n, i]`, with `r' = r` when each route has its input
+/// (`per_route`), `r / k` otherwise. The lanes add their sums by a fixed
+/// butterfly. An expert of `experts` or more gives NaN.
+#[kernel]
+#[launch_bounds(256)]
+pub fn expert_gemv_bytes(
     format: u32,
-    group: u32,
-    kw: u32,
     w: &[u8],
-    vw: View,
-    kx: u32,
-    x: &[u8],
-    vx: View,
+    codes: &[u32],
+    scales: &[f32],
     idx: &[u32],
     k: u32,
     per_route: u32,
@@ -3272,23 +3519,131 @@ pub fn expert_gemv(
     mut out: DisjointSlice<u8>,
 ) {
     let i = thread::index_1d().get();
-    let (warp, lane) = (i / 32, i % 32);
+    let (warp_id, lane) = (i / 32, i % 32);
     let (width, rows, k) = (width as usize, rows as usize, k as usize);
     let routes = idx.len();
-    if rows == 0 || k == 0 || warp >= routes * rows || warp >= elements(ko, out.len()) {
+    // The same for the whole warp.
+    if rows == 0 || k == 0 || width % 256 != 0 || warp_id >= routes * rows || warp_id >= elements(ko, out.len()) {
         return;
     }
-    let (r, n) = (warp / rows, warp % rows);
+    let (r, n) = (warp_id / rows, warp_id % rows);
     let expert = idx[r] as usize;
     let input = if per_route == 1 { r } else { r / k } * width;
+    let valid = expert < experts as usize
+        && codes.len() * 4 >= input + width
+        && scales.len() * 32 >= input + width;
     let mut total = 0.0f32;
+    if valid {
+        let blocks = width / 32;
+        let at = (expert * rows + n) * blocks * 34;
+        if format == quant::Q8_0 && at + blocks * 34 <= w.len() {
+            // SAFETY: the row's `blocks · 34` bytes are in `w` (checked
+            // above).
+            let row = unsafe { w.as_ptr().add(at) };
+            let (c, sc) = (&codes[input / 4..], &scales[input / 32..]);
+            // SAFETY: as above.
+            total = unsafe { q8_0_bytes(row, blocks, lane, c, sc) };
+        }
+    }
+    let sum = warp_sum(total);
+    if lane == 0 {
+        let value = if valid { sum } else { f32::NAN };
+        // SAFETY: `warp_id` is below `out`'s elements (checked above); only
+        // lane 0 of the warp writes it.
+        unsafe { write(ko, out.as_mut_ptr(), warp_id, value) };
+    }
+}
+
+/// `kapel_ops::ExpertMatmul`: one block of 8 warps per route `r` (token `r /
+/// k`, its `r % k`-th expert) and 8 rows of the expert's weights, one warp a
+/// row: `out[r, n] = Σᵢ x[r'][i] · w[idx[r] · rows + n, i]`, with `r' = r`
+/// when each route has its input (`per_route`), `r / k` otherwise. The block
+/// first reads its input, row-major from `x`, once into shared memory in
+/// `f32`. IQ4_XS and IQ3_S have paths of their own, a lane a 32nd of each
+/// block of 256, two blocks at a time; the other quantized formats (`quant`,
+/// `group` for Kapel's) are decoded eight values at a time as `qgemv`
+/// decodes them, and float weights (`format = u32::MAX`, type `kw`) are read
+/// through their view. The lanes add their sums by a fixed butterfly. An
+/// expert of `experts` or more gives NaN.
+#[kernel]
+#[launch_bounds(256)]
+pub fn expert_gemv(
+    format: u32,
+    group: u32,
+    kw: u32,
+    w: &[u8],
+    vw: View,
+    kx: u32,
+    x: &[u8],
+    idx: &[u32],
+    k: u32,
+    per_route: u32,
+    width: u32,
+    rows: u32,
+    experts: u32,
+    ko: u32,
+    mut out: DisjointSlice<u8>,
+) {
+    let t = thread::threadIdx_x() as usize;
+    let block = thread::blockIdx_x() as usize;
+    let (warp_id, lane) = (t / 32, t % 32);
+    let (width, rows, k) = (width as usize, rows as usize, k as usize);
+    let routes = idx.len();
+    let groups = rows.div_ceil(8);
+    // The same for the whole block: every thread reaches the barrier.
+    if rows == 0 || k == 0 || width > EXPERT_WIDTH || groups == 0 || block >= routes * groups {
+        return;
+    }
+    let (r, n) = (block / groups, block % groups * 8 + warp_id);
+    let expert = idx[r] as usize;
+    let input = if per_route == 1 { r } else { r / k } * width;
+    let mut c = t;
+    while c < width {
+        // SAFETY: `padded(c) < EXPERT_WIDTH · 9 / 8`; each thread writes its
+        // own elements, read only after the barrier.
+        unsafe { EXPERT_INPUT[padded(c)] = read(kx, x, input + c) };
+        c += 256;
+    }
+    thread::sync_threads();
+    if n >= rows || r * rows + n >= elements(ko, out.len()) {
+        return;
+    }
     let valid = expert < experts as usize;
-    if valid && format == u32::MAX {
+    let mut total = 0.0f32;
+    if valid && (format == quant::IQ4_XS || format == quant::IQ3_S) && width % 256 == 0 {
+        let bytes = if format == quant::IQ4_XS { 136 } else { 110 };
+        let blocks = width / 256;
+        let at = (expert * rows + n) * blocks * bytes;
+        if at + blocks * bytes <= w.len() {
+            // SAFETY: the row's `blocks · bytes` bytes are in `w` (checked
+            // above).
+            let row = unsafe { w.as_ptr().add(at) };
+            let mut blk = 0;
+            while blk + 1 < blocks {
+                // SAFETY: blocks `blk` and `blk + 1` of the row exist.
+                let (a, b) = unsafe {
+                    if format == quant::IQ4_XS {
+                        (iq4xs_block(row, blk, lane), iq4xs_block(row, blk + 1, lane))
+                    } else {
+                        (iq3s_block(row, blk, lane), iq3s_block(row, blk + 1, lane))
+                    }
+                };
+                total += a + b;
+                blk += 2;
+            }
+            if blk < blocks {
+                // SAFETY: block `blk` of the row exists.
+                total += unsafe {
+                    if format == quant::IQ4_XS { iq4xs_block(row, blk, lane) } else { iq3s_block(row, blk, lane) }
+                };
+            }
+        }
+    } else if valid && format == u32::MAX {
         let base = (expert * rows + n) * width;
         let mut c = lane;
         while c < width {
             let a = read(kw, w, vw.at((base + c) as u32) as usize);
-            total = a.mul_add(read(kx, x, vx.at((input + c) as u32) as usize), total);
+            total = a.mul_add(expert_input(c), total);
             c += 32;
         }
     } else if valid {
@@ -3304,7 +3659,7 @@ pub fn expert_gemv(
                     let (mut dot, mut sum) = (0.0f32, 0.0f32);
                     let mut j = 0;
                     while j < 8 {
-                        let v = read(kx, x, vx.at((input + e + j) as u32) as usize);
+                        let v = expert_input(e + j);
                         dot = q[j].mul_add(v, dot);
                         sum += v;
                         j += 1;
@@ -3319,9 +3674,66 @@ pub fn expert_gemv(
     let sum = warp_sum(total);
     if lane == 0 {
         let value = if valid { sum } else { f32::NAN };
-        // SAFETY: `warp < out`'s elements (checked above); only lane 0 of the
-        // warp writes its output.
-        unsafe { write(ko, out.as_mut_ptr(), warp, value) };
+        // SAFETY: `r · rows + n` is below `out`'s elements (checked above);
+        // only lane 0 of the row's warp writes it.
+        unsafe { write(ko, out.as_mut_ptr(), r * rows + n, value) };
+    }
+}
+
+/// `out[m, n] = Σᵢ x[m, i] · w[n, i]` for a few rows of `x` (row-major, of
+/// float type `kx`) and float weights `w` `[rows, width]` of type `kw`,
+/// row-major from the start of the slice: the small products of decoding (a
+/// router, a gate). One block of 256 threads per output: thread `t` adds
+/// elements `8t .. 8t + 8`, then 2048 further; the threads' sums are added
+/// by a fixed butterfly in each warp, then the warps' in order.
+#[kernel]
+#[launch_bounds(256)]
+pub fn gemv_float(kw: u32, w: &[u8], kx: u32, x: &[u8], m: u32, width: u32, rows: u32, ko: u32, mut out: DisjointSlice<u8>) {
+    static mut SUMS: SharedArray<f32, 8> = SharedArray::UNINIT;
+    let t = thread::threadIdx_x() as usize;
+    let block = thread::blockIdx_x() as usize;
+    let (warp_id, lane) = (t / 32, t % 32);
+    let (width, rows, m) = (width as usize, rows as usize, m as usize);
+    // The same for the whole block: every thread reaches the barrier.
+    if rows == 0 || block >= m * rows || block >= elements(ko, out.len()) {
+        return;
+    }
+    let (r, n) = (block / rows, block % rows);
+    let (xs, ws) = (r * width, n * width);
+    let (mut t0, mut t1) = (0.0f32, 0.0f32);
+    let mut c = t * 8;
+    while c + 8 <= width {
+        let mut j = 0;
+        while j < 8 {
+            t0 = read(kw, w, ws + c + j).mul_add(read(kx, x, xs + c + j), t0);
+            t1 = read(kw, w, ws + c + j + 1).mul_add(read(kx, x, xs + c + j + 1), t1);
+            j += 2;
+        }
+        c += 2048;
+    }
+    // The last elements, when the width is not a multiple of 8.
+    let mut c = width / 8 * 8 + t;
+    while c < width {
+        t0 = read(kw, w, ws + c).mul_add(read(kx, x, xs + c), t0);
+        c += 256;
+    }
+    let sum = warp_sum(t0 + t1);
+    if lane == 0 {
+        // SAFETY: one slot per warp, written before the barrier.
+        unsafe { SUMS[warp_id] = sum };
+    }
+    thread::sync_threads();
+    if t == 0 {
+        let mut total = 0.0f32;
+        let mut i = 0;
+        while i < 8 {
+            // SAFETY: written before the barrier.
+            total += unsafe { SUMS[i] };
+            i += 1;
+        }
+        // SAFETY: `block` is below `out`'s elements (checked above); only
+        // thread 0 writes it.
+        unsafe { write(ko, out.as_mut_ptr(), block, total) };
     }
 }
 

@@ -41,14 +41,16 @@ pub trait Recurrent {
     /// The gated delta rule over the rows of a pass, each sequence's state
     /// `S [Dk, Dv]` per value head kept in `state [N, H, Dk, Dv]`, in `f32`.
     /// For each row `r` in order, with `s = slots[r]`, and each value head
-    /// `h`, which reads key head `h / (H / Hk)`:
+    /// `h`, which reads key head `key(h)`:
     ///
     /// - `S ← exp(g[r, h]) · S`;
     /// - `u = Sᵀ k`, `δ = (v[r, h] − u) · beta[r, h]`, `S ← S + k δᵀ`;
     /// - `o[r, h] = Sᵀ q`,
     ///
-    /// with `q = q[r, h / (H / Hk)]` and `k = k[r, h / (H / Hk)]`, which the
-    /// caller has normalized and scaled. `q, k [R, Hk, Dk]`, `v [R, H, Dv]`,
+    /// with `q = q[r, key(h)]` and `k = k[r, key(h)]`, which the caller has
+    /// normalized and scaled; `key(h)` is `h / (H / Hk)` for value heads
+    /// grouped by key head, `h % Hk` for value heads tiled over the key heads
+    /// ([`HeadLayout`]). `q, k [R, Hk, Dk]`, `v [R, H, Dv]`,
     /// `g, beta [R, H]`: any float types, computed in `f32` at least, the
     /// output `o [R, H, Dv]` in the type of `v`. See [`check_delta`].
     ///
@@ -66,7 +68,31 @@ pub trait Recurrent {
         g: &Tensor,
         beta: &Tensor,
         slots: &Tensor,
+        layout: HeadLayout,
     ) -> Result<Tensor>;
+}
+
+/// How the value heads of linear attention read the key heads, when there
+/// are more of them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum HeadLayout {
+    /// Grouped by key head, as `transformers` lays them out: value head `h`
+    /// reads key head `h / (H / Hk)`.
+    #[default]
+    Grouped,
+    /// Tiled over the key heads, as llama.cpp lays them out: value head `h`
+    /// reads key head `h % Hk`.
+    Tiled,
+}
+
+impl HeadLayout {
+    /// The key head that value head `h` of `heads` reads, of `key_heads`.
+    pub fn key(self, h: usize, heads: usize, key_heads: usize) -> usize {
+        match self {
+            Self::Grouped => h / (heads / key_heads),
+            Self::Tiled => h % key_heads,
+        }
+    }
 }
 
 /// The name of [`Recurrent::causal_conv`] in errors.

@@ -83,6 +83,7 @@ impl Recurrent for Reference {
         g: &Tensor,
         beta: &Tensor,
         slots: &Tensor,
+        layout: kapel_ops::HeadLayout,
     ) -> Result<Tensor> {
         let (shape, dtype) = check_delta(state, q, k, v, g, beta, slots)?;
         let slots = index_values(DELTA_RULE, slots)?;
@@ -90,7 +91,6 @@ impl Recurrent for Reference {
         check_slots(DELTA_RULE, &slots, n)?;
         let (hk, dk) = (q.shape()[1], q.shape()[2]);
         let (h, dv) = (v.shape()[1], v.shape()[2]);
-        let group = h / hk;
         let (q, k, v, g, beta) = (
             Array::of(q)?,
             Array::of(k)?,
@@ -103,7 +103,7 @@ impl Recurrent for Reference {
         let mut u = vec![0.0; dv];
         for (r, &s) in slots.iter().enumerate() {
             for head in 0..h {
-                let kh = head / group;
+                let kh = layout.key(head, h, hk);
                 let qr = &q.data[(r * hk + kh) * dk..][..dk];
                 let kr = &k.data[(r * hk + kh) * dk..][..dk];
                 let vr = &v.data[(r * h + head) * dv..][..dv];

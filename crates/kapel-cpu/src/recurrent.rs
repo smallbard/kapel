@@ -113,13 +113,13 @@ impl Recurrent for Cpu {
         g: &Tensor,
         beta: &Tensor,
         slots: &Tensor,
+        layout: kapel_ops::HeadLayout,
     ) -> Result<Tensor> {
         let (shape, dtype) = check_delta(state, q, k, v, g, beta, slots)?;
         let n = state.shape()[0];
         let slots = io::indices(DELTA_RULE, slots, n)?;
         let (hk, dk) = (q.shape()[1], q.shape()[2]);
         let (h, dv) = (v.shape()[1], v.shape()[2]);
-        let group = h / hk;
         let (q, k, v, g, beta) = (
             io::contiguous(DELTA_RULE, q)?,
             io::contiguous(DELTA_RULE, k)?,
@@ -134,7 +134,7 @@ impl Recurrent for Cpu {
             let (ts, os) = (SharedMut::new(table), SharedMut::new(&mut out));
             let (q, k, v, g, beta, slots) = (&q, &k, &v, &g, &beta, &slots);
             self.pool.run(h, |head| {
-                let kh = head / group;
+                let kh = layout.key(head, h, hk);
                 let mut u = vec![0.0f32; dv];
                 for (r, &s) in slots.iter().enumerate() {
                     let qr = &q[(r * hk + kh) * dk..][..dk];

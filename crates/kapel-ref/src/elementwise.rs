@@ -58,6 +58,7 @@ fn unary(kind: UnaryKind, x: f64) -> Result<(f64, f64)> {
             let dt = (1.0 - t * t) * c * (1.0 + 3.0 * 0.044_715 * x * x);
             (0.5 * x * (1.0 + t), 0.5 * (1.0 + t) + 0.5 * x * dt)
         }
+        UnaryKind::Softplus => (x.max(0.0) + (-x.abs()).exp().ln_1p(), sigmoid(x)),
         _ => return Err(unsupported(Unary::NAME, format!("{kind:?}"))),
     })
 }

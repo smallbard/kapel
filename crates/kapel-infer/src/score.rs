@@ -68,13 +68,23 @@ impl<'p, B: Backend + Transfer> Scorer<'p, B> {
         // is computed again even when the cache holds it, its logits being
         // gone.
         let first = context.len() - 1;
-        let shared = self
+        let mut shared = self
             .held
             .iter()
             .zip(&input)
             .take_while(|(a, b)| a == b)
             .count()
             .min(first);
+        // The states of linear attention cannot be brought back to an
+        // earlier position: such a model starts again from nothing.
+        if shared < self.held.len() && self.pipeline.model().config().linear.is_some() {
+            self.cache = self
+                .pipeline
+                .cache_dtype()
+                .map_or_else(Cache::new, Cache::with_dtype);
+            self.held.clear();
+            shared = 0;
+        }
         self.cache.truncate(shared);
         self.held.truncate(shared);
         let model = self.pipeline.model();

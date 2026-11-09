@@ -36,6 +36,9 @@ pub enum UnaryKind {
     /// The exact GELU (BERT, and `"gelu"` in `transformers`): `x · Φ(x)`, with
     /// `Φ` the standard normal distribution function ([`crate::special::erf`]).
     GeluErf,
+    /// `ln(1 + eˣ)`, computed as `max(x, 0) + ln(1 + e^(−|x|))` so that it
+    /// does not overflow; its derivative is `sigmoid(x)`.
+    Softplus,
 }
 
 /// `y = f(x)` for each element `x`.

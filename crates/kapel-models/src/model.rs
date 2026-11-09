@@ -302,6 +302,7 @@ impl Model {
             weights = gpt2_names(weights);
         }
         weights = decoder_names(weights);
+        linear_constants(&mut weights)?;
         Ok(Self {
             config,
             raw_config,
@@ -377,12 +378,14 @@ impl Model {
     ///
     /// If the backend cannot convert a weight.
     pub fn cast<B: Backend>(&self, backend: &B, dtype: DType) -> Result<Self> {
-        self.map(|w| {
-            Ok(if w.dtype().is_float() && w.dtype() != dtype {
-                backend.forward(&Cast { dtype }, &[w])?
-            } else {
-                w.clone()
-            })
+        self.map_named(|name, w| {
+            Ok(
+                if w.dtype().is_float() && w.dtype() != dtype && !kept_in_f32(name) {
+                    backend.forward(&Cast { dtype }, &[w])?
+                } else {
+                    w.clone()
+                },
+            )
         })
     }
 
@@ -1696,10 +1699,28 @@ impl Model {
                 backend.forward(&Cast { dtype: DType::F32 }, &[x])?
             })
         };
-        let part = |start: usize, heads: usize, width: usize| -> Result<Tensor> {
-            Ok(
-                f32(&ops.contiguous(&mixed.narrow(1, start, heads * width)?)?)?
-                    .reshape(&[t, heads, width])?,
+        // The heads of the queries, keys and values as views: `[T, C]` as
+        // `[T, C / Dk, Dk]`, when the value heads are as wide as the keys;
+        // copies otherwise. The queries and keys in `f32`, the values as
+        // they are (the delta rule reads them in `f32`).
+        let (q, k, v) = if dv == dk && channels.is_multiple_of(dk) {
+            let all = mixed.reshape(&[t, channels / dk, dk])?;
+            let wide = f32(&all.narrow(1, 0, 2 * hk)?)?;
+            (
+                wide.narrow(1, 0, hk)?,
+                wide.narrow(1, hk, hk)?,
+                all.narrow(1, 2 * hk, hv)?,
+            )
+        } else {
+            let part = |start: usize, heads: usize, width: usize| -> Result<Tensor> {
+                Ok(ops
+                    .contiguous(&mixed.narrow(1, start, heads * width)?)?
+                    .reshape(&[t, heads, width])?)
+            };
+            (
+                f32(&part(0, hk, dk)?)?,
+                f32(&part(hk * dk, hk, dk)?)?,
+                part(2 * hk * dk, hv, dv)?,
             )
         };
         // Queries and keys of unit norm (as the FLA library computes it:
@@ -1715,39 +1736,21 @@ impl Model {
             )?;
             ops.affine(&n, scale)
         };
-        let q = unit(&part(0, hk, dk)?, 1.0 / dk as f64)?;
-        let k = unit(&part(hk * dk, hk, dk)?, 1.0 / (dk as f64).sqrt())?;
-        // Value heads tiled over the key heads (llama.cpp's layout): each
-        // value head's key head, repeated in that order.
-        let (q, k) = if lin.tiled && hv != hk {
-            let tile = |x: &Tensor| -> Result<Tensor> {
-                let copies: Vec<&Tensor> = (0..hv / hk).map(|_| x).collect();
-                Ok(backend.forward(&Concat { dim: 1 }, &copies)?)
-            };
-            (tile(&q)?, tile(&k)?)
+        let q = unit(&q, 1.0 / dk as f64)?;
+        let k = unit(&k, 1.0 / (dk as f64).sqrt())?;
+        let layout = if lin.tiled {
+            kapel_ops::HeadLayout::Tiled
         } else {
-            (q, k)
+            kapel_ops::HeadLayout::Grouped
         };
-        let v = part(2 * hk * dk, hv, dv)?;
-        let beta = f32(&ops.unary(UnaryKind::Sigmoid, &b)?)?;
-        // g = −exp(A_log) · softplus(a + dt_bias), in `f32`; softplus(x) =
-        // max(x, 0) + log(1 + exp(−|x|)).
+        // In the type of the hidden states, as `transformers` computes it;
+        // the delta rule reads it in `f32`.
+        let beta = ops.unary(UnaryKind::Sigmoid, &b)?;
+        // g = −exp(A_log) · softplus(a + dt_bias), in `f32`: `A = −exp(A_log)`
+        // and `dt_bias` are kept in `f32` from the loading (`Model::load`,
+        // `Model::cast`).
         let x = ops.binary(BinaryKind::Add, &f32(&a)?, &f32(w("dt_bias")?)?)?;
-        let tail = ops.unary(
-            UnaryKind::Log,
-            &backend.forward(
-                &Affine {
-                    scale: 1.0,
-                    bias: 1.0,
-                },
-                &[&ops.unary(
-                    UnaryKind::Exp,
-                    &ops.unary(UnaryKind::Neg, &ops.unary(UnaryKind::Abs, &x)?)?,
-                )?],
-            )?,
-        )?;
-        let softplus = ops.binary(BinaryKind::Add, &ops.unary(UnaryKind::Relu, &x)?, &tail)?;
-        // `−exp(A_log)`, or as llama.cpp stores it.
+        let softplus = ops.unary(UnaryKind::Softplus, &x)?;
         let decay = match self.optional(&format!("{p}.linear_attn.A")) {
             Some(a) => f32(a)?,
             None => ops.unary(
@@ -1756,7 +1759,7 @@ impl Model {
             )?,
         };
         let g = ops.binary(BinaryKind::Mul, &decay, &softplus)?;
-        let o = backend.delta_rule(&mut states.1, &q, &k, &v, &g, &beta, &slots)?;
+        let o = backend.delta_rule(&mut states.1, &q, &k, &v, &g, &beta, &slots, layout)?;
         let o = if o.dtype() == h.dtype() {
             o
         } else {
@@ -1797,13 +1800,13 @@ impl Model {
         } else {
             backend.forward(&Cast { dtype: DType::F32 }, &[&logits])?
         };
-        let probs = backend.forward(&kapel_ops::Softmax { dim: 1 }, &[&logits])?;
         // Few rows (decoding): the experts chosen and multiplied on the
         // device, the pass recordable.
         if t <= DEVICE_ROUTES {
-            let routed = self.experts_on_device(ops, h, &probs, p)?;
+            let routed = self.experts_on_device(ops, h, &logits, p)?;
             return self.shared_expert(ops, h, p, routed);
         }
+        let probs = backend.forward(&kapel_ops::Softmax { dim: 1 }, &[&logits])?;
         let probs = backend.download(&probs)?.to_vec::<f32>()?;
         // Each token's experts, then each expert's tokens.
         let mut tokens: Vec<Vec<(u32, f32)>> = vec![Vec::new(); e.count];
@@ -1872,33 +1875,28 @@ impl Model {
     }
 
     /// The experts of a few rows chosen and computed on the device, nothing
-    /// read back: `TopK` of the probabilities, their weights by
-    /// `GatherColumns`, renormalized and rounded to the type of the hidden
-    /// states, each row's experts by `ExpertMatmul`, weighted and summed in
-    /// the order of the router's ranks.
+    /// read back: `TopK` of the router's logits (the order of their
+    /// probabilities), their weights the softmax of the chosen logits (the
+    /// chosen probabilities renormalized, without the softmax over every
+    /// expert) by `GatherColumns`, rounded to the type of the hidden states,
+    /// each row's experts by `ExpertMatmul`, weighted and summed in the order
+    /// of the router's ranks.
     fn experts_on_device<B: Backend + Transfer>(
         &self,
         ops: &Ops<'_, B>,
         h: &Tensor,
-        probs: &Tensor,
+        logits: &Tensor,
         p: &str,
     ) -> Result<Tensor> {
-        use kapel_ops::{ExpertMatmul, GatherColumns, Sum, TopK};
+        use kapel_ops::{ExpertMatmul, GatherColumns, TopK};
         let c = &self.config;
         let backend = ops.0;
         let e = c.experts.expect("a model with experts");
         let t = h.shape()[0];
         let w = |name: &str| self.weight(&format!("{p}.mlp.{name}"));
-        let idx = backend.forward(&TopK { k: e.per_token }, &[probs])?;
-        let chosen = backend.forward(&GatherColumns, &[probs, &idx])?;
-        let total = backend.forward(
-            &Sum {
-                dims: vec![1],
-                keepdim: true,
-            },
-            &[&chosen],
-        )?;
-        let mut weights = ops.binary(BinaryKind::Div, &chosen, &total)?;
+        let idx = backend.forward(&TopK { k: e.per_token }, &[logits])?;
+        let chosen = backend.forward(&GatherColumns, &[logits, &idx])?;
+        let mut weights = backend.forward(&kapel_ops::Softmax { dim: 1 }, &[&chosen])?;
         if weights.dtype() != h.dtype() {
             weights = backend.forward(&Cast { dtype: h.dtype() }, &[&weights])?;
         }
@@ -1925,7 +1923,7 @@ impl Model {
         let y = backend.forward(&product, &[&inner, &flat(w("experts.down_proj")?)?, &idx])?;
         let weighted = ops.binary(BinaryKind::Mul, &y, &weights.reshape(&[t, e.per_token, 1])?)?;
         Ok(backend.forward(
-            &Sum {
+            &kapel_ops::Sum {
                 dims: vec![1],
                 keepdim: false,
             },
@@ -1981,6 +1979,38 @@ fn gpt2_names(weights: BTreeMap<String, Tensor>) -> BTreeMap<String, Tensor> {
             }
         })
         .collect()
+}
+
+/// The weights of linear attention that are constants of a pass, in `f32`:
+/// each layer's `A = −exp(A_log)` (`linear_attn.A`, as llama.cpp stores
+/// it), computed once rather than at every token. [`Model::cast`] keeps
+/// them, and `dt_bias`, in `f32`.
+fn linear_constants(weights: &mut BTreeMap<String, Tensor>) -> Result<()> {
+    let logs: Vec<String> = weights
+        .keys()
+        .filter(|n| n.ends_with(".linear_attn.A_log"))
+        .cloned()
+        .collect();
+    for name in logs {
+        let a = name.replace(".A_log", ".A");
+        if weights.contains_key(&a) {
+            continue;
+        }
+        let values: Vec<f32> = weights[&name]
+            .to_f64_vec()?
+            .into_iter()
+            .map(|v| -(v as f32).exp())
+            .collect();
+        let shape = weights[&name].shape().to_vec();
+        weights.insert(a, Tensor::from_slice(&values, &shape)?);
+    }
+    Ok(())
+}
+
+/// Whether the weight `name` stays in `f32` whatever the type a model is
+/// cast to: the constants of linear attention, which enter a pass in `f32`.
+fn kept_in_f32(name: &str) -> bool {
+    name.ends_with(".linear_attn.A") || name.ends_with(".linear_attn.dt_bias")
 }
 
 /// The weights of a model that also sees images under the names of its

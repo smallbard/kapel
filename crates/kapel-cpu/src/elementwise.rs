@@ -28,7 +28,8 @@ fn check_unary(kind: UnaryKind) -> Result<()> {
         | UnaryKind::Relu
         | UnaryKind::Silu
         | UnaryKind::GeluTanh
-        | UnaryKind::GeluErf => Ok(()),
+        | UnaryKind::GeluErf
+        | UnaryKind::Softplus => Ok(()),
         kind => Err(Error::InvalidArgument {
             op: Unary::NAME,
             message: format!("the CPU backend does not implement {kind:?}"),
@@ -74,6 +75,7 @@ fn unary_value(kind: UnaryKind, x: f32) -> f32 {
             0.5 * x * (1.0 + (c * (x + 0.044_715 * x * x * x)).tanh())
         }
         UnaryKind::GeluErf => (f64::from(x) * kapel_ops::special::normal_cdf(f64::from(x))) as f32,
+        UnaryKind::Softplus => x.max(0.0) + (-x.abs()).exp().ln_1p(),
         _ => unreachable!("refused by `check_unary`"),
     }
 }
@@ -115,6 +117,7 @@ fn unary_derivative(kind: UnaryKind, x: f32) -> f32 {
             let phi = (-0.5 * x * x).exp() / (2.0 * std::f64::consts::PI).sqrt();
             (kapel_ops::special::normal_cdf(x) + x * phi) as f32
         }
+        UnaryKind::Softplus => sigmoid(x),
         _ => unreachable!("refused by `check_unary`"),
     }
 }
