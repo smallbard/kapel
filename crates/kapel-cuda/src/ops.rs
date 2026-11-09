@@ -2435,6 +2435,115 @@ impl Cuda {
     }
 }
 
+impl Cuda {
+    /// The device address of a state written in place, its copy on the host
+    /// forgotten.
+    fn state(&self, op: &'static str, t: &mut Tensor) -> Result<(u64, usize)> {
+        let storage = t
+            .storage_mut()
+            .and_then(|s| s.as_any_mut())
+            .and_then(|any| any.downcast_mut::<CudaStorage>())
+            .ok_or_else(|| Error::InvalidArgument {
+                op,
+                message: "the state is not a storage of this backend".into(),
+            })?;
+        storage.written();
+        Ok((storage.pointer(), kapel_core::Storage::len(&*storage)))
+    }
+}
+
+impl kapel_ops::Recurrent for Cuda {
+    /// One thread per channel, the rows in order.
+    fn causal_conv(
+        &self,
+        state: &mut Tensor,
+        x: &Tensor,
+        weight: &Tensor,
+        slots: &Tensor,
+    ) -> Result<Tensor> {
+        let op = kapel_ops::CAUSAL_CONV;
+        let (shape, dtype) = kapel_ops::check_conv(state, x, weight, slots)?;
+        let n = state.shape()[0];
+        let rows = self.indices(op, slots, n)?;
+        let (c, taps) = (weight.shape()[0], weight.shape()[1]);
+        let ks = float_code(op, state.dtype())?;
+        let ko = float_code(op, dtype)?;
+        let xa = self.float_arg(op, x, x.layout())?;
+        let wa = self.float_arg(op, weight, weight.layout())?;
+        let (list, _keep) = self.row_list(op, slots, &rows)?;
+        let (pointer, bytes) = self.state(op, state)?;
+        self.output_as(&shape, dtype, false, |out, count| {
+            let out_bytes = dtype.storage_bytes(count)?;
+            self.launch(
+                "causal_conv",
+                c,
+                Args::new()
+                    .float(&xa)
+                    .float(&wa)
+                    .slice(list, rows.len())
+                    .u32(small(op, c)?)
+                    .u32(small(op, taps)?)
+                    .u32(ks)
+                    .slice(pointer, bytes)
+                    .u32(ko)
+                    .slice(out, out_bytes),
+            )
+        })
+    }
+
+    /// One thread per value head and column of its states, the rows in
+    /// order.
+    fn delta_rule(
+        &self,
+        state: &mut Tensor,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        g: &Tensor,
+        beta: &Tensor,
+        slots: &Tensor,
+    ) -> Result<Tensor> {
+        let op = kapel_ops::DELTA_RULE;
+        let (shape, dtype) = kapel_ops::check_delta(state, q, k, v, g, beta, slots)?;
+        let n = state.shape()[0];
+        let rows = self.indices(op, slots, n)?;
+        let (hk, dk) = (q.shape()[1], q.shape()[2]);
+        let (h, dv) = (v.shape()[1], v.shape()[2]);
+        if dk > 256 {
+            return Err(Error::InvalidArgument {
+                op,
+                message: format!("key heads of {dk}: at most 256 on the device"),
+            });
+        }
+        let ko = float_code(op, dtype)?;
+        let arg = |t: &Tensor| self.float_arg(op, t, t.layout());
+        let (qa, ka, va, ga, ba) = (arg(q)?, arg(k)?, arg(v)?, arg(g)?, arg(beta)?);
+        let (list, _keep) = self.row_list(op, slots, &rows)?;
+        let (pointer, bytes) = self.state(op, state)?;
+        self.output_as(&shape, dtype, false, |out, count| {
+            let out_bytes = dtype.storage_bytes(count)?;
+            self.launch(
+                "delta_rule",
+                h * dv,
+                Args::new()
+                    .float(&qa)
+                    .float(&ka)
+                    .float(&va)
+                    .float(&ga)
+                    .float(&ba)
+                    .slice(list, rows.len())
+                    .u32(small(op, h)?)
+                    .u32(small(op, hk)?)
+                    .u32(small(op, dk)?)
+                    .u32(small(op, dv)?)
+                    .slice(pointer, bytes / 4)
+                    .u32(ko)
+                    .slice(out, out_bytes),
+            )
+        })
+    }
+}
+
 impl kapel_ops::Update for Cuda {
     /// One thread per element, the gradient read in its type through its
     /// view.

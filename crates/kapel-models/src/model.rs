@@ -12,7 +12,7 @@ use kapel_ops::{
 
 use crate::ModelError;
 use crate::cache::{KvCache, PAGE, SequenceId, Step};
-use crate::config::{Block, Config, Norm};
+use crate::config::{Block, Config, Mixer, Norm};
 
 /// A model: its configuration and its weights, by their names in the checkpoint.
 /// A clone shares the weights.
@@ -123,6 +123,7 @@ struct Inputs {
     lines: Tensor,
     pages: Tensor,
     rows: Tensor,
+    slots: Tensor,
 }
 
 /// A decoding pass recorded once ([`Model::record_step`]) and replayed for
@@ -295,6 +296,7 @@ impl Model {
         if config.block == Block::Gpt2 {
             weights = gpt2_names(weights);
         }
+        weights = decoder_names(weights);
         Ok(Self {
             config,
             raw_config,
@@ -675,7 +677,7 @@ impl Model {
     /// returns stops the pass.
     ///
     /// Blocks of Llama's kind only (Llama, Mistral, Qwen, Gemma), not
-    /// [fused](Model::fused).
+    /// [fused](Model::fused): neither experts nor linear attention.
     ///
     /// # Errors
     ///
@@ -689,9 +691,12 @@ impl Model {
         observe: &mut Observer<'_>,
     ) -> Result<Tensor> {
         let c = &self.config;
-        if !matches!(c.block, Block::Sequential | Block::Sandwich) {
+        if !matches!(c.block, Block::Sequential | Block::Sandwich)
+            || c.experts.is_some()
+            || c.linear.is_some()
+        {
             return Err(ModelError::Config(
-                "Model::block computes blocks of Llama's kind only".into(),
+                "Model::block computes blocks of Llama's kind only: an attention and an MLP".into(),
             ));
         }
         if layer >= c.layers {
@@ -1049,7 +1054,10 @@ impl Model {
     ) -> Result<Recorded> {
         // The tables are made by a first pass, as it comes: never while
         // recording.
+        // The experts are chosen on the host, which a recording cannot wait
+        // for.
         if !backend.records()
+            || self.config.experts.is_some()
             || batch.is_empty()
             || batch.len() > rows
             || !cache.has_tables(self.config.layers)
@@ -1103,21 +1111,26 @@ impl Model {
             lines: upload(&plan.lines, &[rows])?,
             pages: upload(&plan.pages, &[rows, widest])?,
             rows: upload(&plan.rows, &[rows, 2])?,
+            slots: upload(&plan.slots, &[rows])?,
         };
         let lines_needed = cache.lines();
-        let identity = cache.identity();
-        let step = || Step {
+        // The sequences the first pass starts have their states zeroed; the
+        // recording, of the next tokens, starts none.
+        let fresh = plan.fresh.clone();
+        let step = |fresh: Vec<u32>| Step {
             positions: inputs.positions.clone(),
             lines: inputs.lines.clone(),
             pages: inputs.pages.clone(),
             rows: inputs.rows.clone(),
+            slots: inputs.slots.clone(),
+            fresh,
             lines_needed,
         };
         // This token as it comes: what the recording needs is then made (the
         // backend's tables for these shapes, its compiled kernels), and the
         // recording, which runs nothing, need not be replayed for it.
         let logits = {
-            let step = step();
+            let step = step(fresh);
             self.run(
                 backend,
                 &inputs.ids,
@@ -1127,8 +1140,9 @@ impl Model {
             )?
         };
         let logits = logits.narrow(0, 0, batch.len())?;
+        let identity = cache.identity();
         let recording = backend.record(&mut || {
-            let step = step();
+            let step = step(Vec::new());
             let logits = self.run(
                 backend,
                 &inputs.ids,
@@ -1191,10 +1205,13 @@ impl Model {
         batch: &[(SequenceId, u32)],
     ) -> Result<Option<Tensor>> {
         let counts: Vec<(SequenceId, usize)> = batch.iter().map(|&(id, _)| (id, 1)).collect();
+        // A sequence that starts here would need its states zeroed, which a
+        // recording does not do.
         if batch.is_empty()
             || batch.len() > recorded.rows
             || cache.identity() != recorded.identity
             || !cache.fits(&counts, recorded.widest)
+            || batch.iter().any(|&(id, _)| cache.is_empty(id))
         {
             return Ok(None);
         }
@@ -1220,6 +1237,7 @@ impl Model {
             &host(&plan.pages, &[rows, recorded.widest])?,
         )?;
         backend.copy_from_host(&mut inputs.rows, &host(&plan.rows, &[rows, 2])?)?;
+        backend.copy_from_host(&mut inputs.slots, &host(&plan.slots, &[rows])?)?;
         recorded.recording.replay()?;
         Ok(Some(recorded.recording.output().narrow(
             0,
@@ -1374,7 +1392,10 @@ impl Model {
         let backend = ops.0;
         let h = self.norm(ops, x, &format!("{p}.input_layernorm"))?;
         ops.see(Site::Attention, &h)?;
-        let mut a = self.attention(ops, &h, positions, paged, layer, p, window)?;
+        let mut a = match c.mixers.get(layer) {
+            Some(Mixer::GatedDeltaNet) => self.delta_net(ops, &h, paged, layer, p)?,
+            _ => self.attention(ops, &h, positions, paged, layer, p, window)?,
+        };
         if c.block == Block::Sandwich {
             a = self.norm(ops, &a, &format!("{p}.post_attention_layernorm"))?;
         }
@@ -1385,6 +1406,10 @@ impl Model {
             "post_attention_layernorm"
         };
         let h = self.norm(ops, &x, &format!("{p}.{before}"))?;
+        if c.experts.is_some() {
+            let m = self.experts(ops, &h, p)?;
+            return ops.binary(BinaryKind::Add, &x, &m);
+        }
         ops.see(Site::Mlp, &h)?;
         let bias = |name: &str| {
             if c.mlp_bias {
@@ -1474,7 +1499,8 @@ impl Model {
                 // Stacked by `Model::fused`: one product, its columns cut.
                 Some(w) => {
                     let qkv = ops.linear(h, w, bias(&format!("{p}.self_attn.qkv_proj.bias")))?;
-                    let (wq, wk) = (hq * d, hkv * d);
+                    let gated = if c.attention_gate { 2 } else { 1 };
+                    let (wq, wk) = (gated * hq * d, hkv * d);
                     (
                         qkv.narrow(1, 0, wq)?,
                         qkv.narrow(1, wq, wk)?,
@@ -1483,6 +1509,25 @@ impl Model {
                 }
                 None => (linear("q_proj")?, linear("k_proj")?, linear("v_proj")?),
             }
+        };
+        // With a gate, each query head is followed by its gate: [T, H·2D] →
+        // [T, H, 2D], the queries and the gates cut apart.
+        let (q, gate) = if c.attention_gate {
+            let both = ops.contiguous(&q)?.reshape(&[t, hq, 2 * d])?;
+            let gate = ops
+                .contiguous(&both.narrow(2, d, d)?)?
+                .reshape(&[t, hq * d])?;
+            (
+                ops.contiguous(&both.narrow(2, 0, d)?)?
+                    .reshape(&[t, hq * d])?,
+                Some(gate),
+            )
+        } else {
+            (q, None)
+        };
+        let offset = match c.norm {
+            Norm::Rms { offset } => offset,
+            Norm::Layer => 0.0,
         };
         // [T, H·D] → [T, H, D], a view when it can be one.
         let heads = |x: Tensor, n: usize, norm: Option<&str>| -> Result<Tensor> {
@@ -1495,7 +1540,7 @@ impl Model {
                 x = ops.0.forward(
                     &RmsNorm {
                         eps: c.eps,
-                        weight_offset: 0.0,
+                        weight_offset: offset,
                     },
                     &[&x, w],
                 )?;
@@ -1565,6 +1610,12 @@ impl Model {
             } else {
                 "o_proj"
             };
+            let y = match &gate {
+                Some(gate) => {
+                    ops.binary(BinaryKind::Mul, &y, &ops.unary(UnaryKind::Sigmoid, gate)?)?
+                }
+                None => y,
+            };
             ops.see(Site::Output, &y)?;
             let bias = if c.out_bias {
                 self.optional(&format!("{p}.self_attn.{out}.bias"))
@@ -1577,6 +1628,218 @@ impl Model {
                 bias,
             )?
         })
+    }
+
+    /// A layer of Gated DeltaNet: `[T, hidden]` to `[T, hidden]`, after the
+    /// states of `paged` (zero states without a cache), which it carries to
+    /// its tokens.
+    fn delta_net<B: Backend + Transfer>(
+        &self,
+        ops: &Ops<'_, B>,
+        h: &Tensor,
+        paged: &mut Option<(&mut KvCache, &Step)>,
+        layer: usize,
+        p: &str,
+    ) -> Result<Tensor> {
+        let c = &self.config;
+        let backend = ops.0;
+        let lin = c.linear.ok_or_else(|| {
+            ModelError::Config(format!("layer {layer} is linear, without its sizes"))
+        })?;
+        let t = h.shape()[0];
+        let (hk, hv, dk, dv) = (lin.key_heads, lin.value_heads, lin.key_dim, lin.value_dim);
+        let channels = lin.channels();
+        let w = |name: &str| self.weight(&format!("{p}.linear_attn.{name}"));
+        let qkv = ops.linear(h, w("in_proj_qkv.weight")?, None)?;
+        let z = ops.linear(h, w("in_proj_z.weight")?, None)?;
+        let b = ops.linear(h, w("in_proj_b.weight")?, None)?;
+        let a = ops.linear(h, w("in_proj_a.weight")?, None)?;
+        // `[C, 1, K]` in the checkpoint.
+        let conv_w = w("conv1d.weight")?.reshape(&[channels, lin.conv])?;
+        let conv_shape = [lin.conv - 1, channels];
+        let delta_shape = [hv, dk, dv];
+        let mut own;
+        let (states, slots) = match paged {
+            Some((cache, step)) => (
+                cache.states(
+                    backend,
+                    layer,
+                    (&conv_shape, qkv.dtype()),
+                    &delta_shape,
+                    &step.fresh,
+                )?,
+                step.slots.clone(),
+            ),
+            None => {
+                own = (
+                    backend.zeros(&[1, conv_shape[0], conv_shape[1]], qkv.dtype())?,
+                    backend.zeros(&[1, hv, dk, dv], DType::F32)?,
+                );
+                let zeros = vec![0u32; t];
+                (
+                    &mut own,
+                    backend.upload(&Tensor::from_slice(&zeros, &[t])?)?,
+                )
+            }
+        };
+        let mixed = backend.causal_conv(&mut states.0, &qkv, &conv_w, &slots)?;
+        let mixed = ops.unary(UnaryKind::Silu, &mixed)?;
+        let f32 = |x: &Tensor| -> Result<Tensor> {
+            Ok(if x.dtype() == DType::F32 {
+                x.clone()
+            } else {
+                backend.forward(&Cast { dtype: DType::F32 }, &[x])?
+            })
+        };
+        let part = |start: usize, heads: usize, width: usize| -> Result<Tensor> {
+            Ok(
+                f32(&ops.contiguous(&mixed.narrow(1, start, heads * width)?)?)?
+                    .reshape(&[t, heads, width])?,
+            )
+        };
+        // Queries and keys of unit norm (as the FLA library computes it:
+        // `x / √(Σx² + 10⁻⁶)`, an RMS norm of `ε / D` over `√D`), the queries
+        // scaled by `1 / √D` too.
+        let unit = |x: &Tensor, scale: f64| -> Result<Tensor> {
+            let n = backend.forward(
+                &RmsNorm {
+                    eps: 1e-6 / dk as f64,
+                    weight_offset: 0.0,
+                },
+                &[x],
+            )?;
+            ops.affine(&n, scale)
+        };
+        let q = unit(&part(0, hk, dk)?, 1.0 / dk as f64)?;
+        let k = unit(&part(hk * dk, hk, dk)?, 1.0 / (dk as f64).sqrt())?;
+        let v = part(2 * hk * dk, hv, dv)?;
+        let beta = f32(&ops.unary(UnaryKind::Sigmoid, &b)?)?;
+        // g = −exp(A_log) · softplus(a + dt_bias), in `f32`; softplus(x) =
+        // max(x, 0) + log(1 + exp(−|x|)).
+        let x = ops.binary(BinaryKind::Add, &f32(&a)?, &f32(w("dt_bias")?)?)?;
+        let tail = ops.unary(
+            UnaryKind::Log,
+            &backend.forward(
+                &Affine {
+                    scale: 1.0,
+                    bias: 1.0,
+                },
+                &[&ops.unary(
+                    UnaryKind::Exp,
+                    &ops.unary(UnaryKind::Neg, &ops.unary(UnaryKind::Abs, &x)?)?,
+                )?],
+            )?,
+        )?;
+        let softplus = ops.binary(BinaryKind::Add, &ops.unary(UnaryKind::Relu, &x)?, &tail)?;
+        let decay = ops.unary(
+            UnaryKind::Neg,
+            &ops.unary(UnaryKind::Exp, &f32(w("A_log")?)?)?,
+        )?;
+        let g = ops.binary(BinaryKind::Mul, &decay, &softplus)?;
+        let o = backend.delta_rule(&mut states.1, &q, &k, &v, &g, &beta, &slots)?;
+        let o = if o.dtype() == h.dtype() {
+            o
+        } else {
+            backend.forward(&Cast { dtype: h.dtype() }, &[&o])?
+        };
+        // The gated norm, per value head: `norm(o) · w · silu(z)`.
+        let o = backend.forward(
+            &RmsNorm {
+                eps: c.eps,
+                weight_offset: 0.0,
+            },
+            &[&o, w("norm.weight")?],
+        )?;
+        let z = ops.contiguous(&z)?.reshape(&[t, hv, dv])?;
+        let o = ops.binary(BinaryKind::Mul, &o, &ops.unary(UnaryKind::Silu, &z)?)?;
+        ops.linear(&o.reshape(&[t, hv * dv])?, w("out_proj.weight")?, None)
+    }
+
+    /// A mixture of experts: `[T, hidden]` to `[T, hidden]`. The router's
+    /// softmax over the experts, in `f32`, chooses each token's experts, the
+    /// largest probabilities (the first expert on a tie), their weights
+    /// renormalized to sum to 1; each expert computes its tokens, weighted;
+    /// the shared expert, gated by a sigmoid, is added.
+    fn experts<B: Backend + Transfer>(
+        &self,
+        ops: &Ops<'_, B>,
+        h: &Tensor,
+        p: &str,
+    ) -> Result<Tensor> {
+        let c = &self.config;
+        let backend = ops.0;
+        let e = c.experts.expect("a model with experts");
+        let t = h.shape()[0];
+        let w = |name: &str| self.weight(&format!("{p}.mlp.{name}"));
+        let logits = ops.linear(h, w("gate.weight")?, None)?;
+        let logits = if logits.dtype() == DType::F32 {
+            logits
+        } else {
+            backend.forward(&Cast { dtype: DType::F32 }, &[&logits])?
+        };
+        let probs = backend.forward(&kapel_ops::Softmax { dim: 1 }, &[&logits])?;
+        let probs = backend.download(&probs)?.to_vec::<f32>()?;
+        // Each token's experts, then each expert's tokens.
+        let mut tokens: Vec<Vec<(u32, f32)>> = vec![Vec::new(); e.count];
+        for (row, p) in probs.chunks_exact(e.count).enumerate() {
+            let mut order: Vec<usize> = (0..e.count).collect();
+            order.sort_by(|&i, &j| p[j].total_cmp(&p[i]).then(i.cmp(&j)));
+            let chosen = &order[..e.per_token];
+            let total: f32 = chosen.iter().map(|&i| p[i]).sum();
+            for &i in chosen {
+                // The weight in the type of the hidden states, as
+                // `transformers` gives it.
+                let weight = rounded(h.dtype(), f64::from(p[i] / total))? as f32;
+                tokens[i].push((row as u32, weight));
+            }
+        }
+        let gate_up = w("experts.gate_up_proj")?;
+        let down = w("experts.down_proj")?;
+        let (two_i, width) = (gate_up.shape()[1], gate_up.shape()[2]);
+        let glu = Glu {
+            activation: c.activation,
+        };
+        let (mut outs, mut index) = (Vec::new(), Vec::new());
+        for (expert, routed) in tokens.iter().enumerate() {
+            if routed.is_empty() {
+                continue;
+            }
+            let n = routed.len();
+            let rows: Vec<u32> = routed.iter().map(|&(r, _)| r).collect();
+            let weights: Vec<f32> = routed.iter().map(|&(_, w)| w).collect();
+            let rows_t = backend.upload(&Tensor::from_slice(&rows, &[n])?)?;
+            let x = backend.forward(&GatherRows, &[h, &rows_t])?;
+            let wg = gate_up.narrow(0, expert, 1)?.reshape(&[two_i, width])?;
+            let inner = backend.forward(&glu, &[&ops.linear(&x, &wg, None)?])?;
+            let wd = down
+                .narrow(0, expert, 1)?
+                .reshape(&[down.shape()[1], down.shape()[2]])?;
+            let y = ops.linear(&inner, &wd, None)?;
+            let mut scale = backend.upload(&Tensor::from_slice(&weights, &[n, 1])?)?;
+            if scale.dtype() != y.dtype() {
+                scale = backend.forward(&Cast { dtype: y.dtype() }, &[&scale])?;
+            }
+            outs.push(ops.binary(BinaryKind::Mul, &y, &scale)?);
+            index.extend(rows);
+        }
+        let parts: Vec<&Tensor> = outs.iter().collect();
+        let all = backend.forward(&Concat { dim: 0 }, &parts)?;
+        let index = backend.upload(&Tensor::from_slice(&index, &[index.len()])?)?;
+        let routed = backend.forward(&kapel_ops::ScatterAddRows { rows: t }, &[&all, &index])?;
+        if e.shared_width.is_none() {
+            return Ok(routed);
+        }
+        let s = |name: &str| w(&format!("shared_expert.{name}.weight"));
+        let gate = ops.linear(h, s("gate_proj")?, None)?;
+        let up = ops.linear(h, s("up_proj")?, None)?;
+        let inner = ops.binary(BinaryKind::Mul, &ops.unary(c.activation, &gate)?, &up)?;
+        let shared = ops.linear(&inner, s("down_proj")?, None)?;
+        let open = ops.unary(
+            UnaryKind::Sigmoid,
+            &ops.linear(h, w("shared_expert_gate.weight")?, None)?,
+        )?;
+        let shared = ops.binary(BinaryKind::Mul, &shared, &open)?;
+        ops.binary(BinaryKind::Add, &routed, &shared)
     }
 }
 
@@ -1595,6 +1858,27 @@ fn gpt2_names(weights: BTreeMap<String, Tensor>) -> BTreeMap<String, Tensor> {
                 (format!("transformer.{name}"), w)
             }
         })
+        .collect()
+}
+
+/// The weights of a model that also sees images under the names of its
+/// decoder alone: `model.language_model.X` as `model.X` (Qwen 3.5's
+/// checkpoints).
+fn decoder_names(weights: BTreeMap<String, Tensor>) -> BTreeMap<String, Tensor> {
+    if !weights
+        .keys()
+        .any(|n| n.starts_with("model.language_model."))
+    {
+        return weights;
+    }
+    weights
+        .into_iter()
+        .map(
+            |(name, w)| match name.strip_prefix("model.language_model.") {
+                Some(rest) => (format!("model.{rest}"), w),
+                None => (name, w),
+            },
+        )
         .collect()
 }
 

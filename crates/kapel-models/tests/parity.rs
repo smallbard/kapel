@@ -317,7 +317,11 @@ fn blocks_one_at_a_time_give_the_whole_pass() {
     let mut checked = 0;
     for (name, model, reference) in models() {
         let c = model.config();
-        if !matches!(c.block, Block::Sequential | Block::Sandwich) || c.multi_token_layers > 0 {
+        if !matches!(c.block, Block::Sequential | Block::Sandwich)
+            || c.multi_token_layers > 0
+            || c.experts.is_some()
+            || c.linear.is_some()
+        {
             continue;
         }
         let ids = &texts(&reference)[0];

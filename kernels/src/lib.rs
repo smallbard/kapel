@@ -1588,6 +1588,169 @@ pub fn write_rows_any(kr: u32, rows: &[u8], vr: View, index: &[u32], width: u32,
     }
 }
 
+/// The widest key head of [`delta_rule`]: a thread keeps one column of a
+/// state, `[dk]`, in its own memory.
+pub const DELTA_KEYS: usize = 256;
+
+/// A depthwise causal convolution over the rows of a pass
+/// (`kapel_ops::Recurrent::causal_conv`): one thread per channel, which goes
+/// through the rows in order, each reading the `taps − 1` last inputs its
+/// sequence's slot of `state` keeps (of type `ks`) and its own input, then
+/// shifting them. The rows read their sequence's slot from `slots`. The
+/// channel's sum is in `f32`, the taps in order; the outputs are of type
+/// `ko`. Each thread reads and writes its channel's column of `state` and of
+/// `out` alone.
+#[kernel]
+#[launch_bounds(256)]
+pub fn causal_conv(
+    kx: u32,
+    x: &[u8],
+    vx: View,
+    kw: u32,
+    w: &[u8],
+    vw: View,
+    slots: &[u32],
+    channels: u32,
+    taps: u32,
+    ks: u32,
+    mut state: DisjointSlice<u8>,
+    ko: u32,
+    mut out: DisjointSlice<u8>,
+) {
+    let idx = thread::index_1d();
+    let ch = idx.get();
+    let c = channels as usize;
+    let taps = taps as usize;
+    if ch >= c || taps == 0 {
+        return;
+    }
+    let kept = taps - 1;
+    let held = elements(ks, state.len());
+    let room = elements(ko, out.len());
+    let base = state.as_mut_ptr();
+    // SAFETY: the bytes of the state, read through `read` at this thread's
+    // own elements only, which no other thread writes.
+    let table = unsafe { core::slice::from_raw_parts(base as *const u8, state.len()) };
+    for r in 0..slots.len() {
+        let first = slots[r] as usize * kept * c + ch;
+        if kept > 0 && first + (kept - 1) * c >= held {
+            return;
+        }
+        let mut sum = 0.0f32;
+        for j in 0..kept {
+            sum += read(kw, w, vw.at((ch * taps + j) as u32) as usize) * read(ks, table, first + j * c);
+        }
+        let input = read(kx, x, vx.at((r * c + ch) as u32) as usize);
+        sum += read(kw, w, vw.at((ch * taps + kept) as u32) as usize) * input;
+        if r * c + ch < room {
+            // SAFETY: in bounds (checked above), this thread's element.
+            unsafe { write(ko, out.as_mut_ptr(), r * c + ch, sum) };
+        }
+        for j in 0..kept {
+            let next = if j + 1 < kept { read(ks, table, first + (j + 1) * c) } else { input };
+            // SAFETY: in bounds (checked above), this thread's channel.
+            unsafe { write(ks, base, first + j * c, next) };
+        }
+    }
+}
+
+/// The gated delta rule over the rows of a pass
+/// (`kapel_ops::Recurrent::delta_rule`): one thread per value head `h` and
+/// column `j` of its states `[dk, dv]`, which goes through the rows in order.
+/// The column of the row's sequence (its slot of `state`, `f32`) is kept in
+/// the thread's memory while the rows are of that sequence. For each row:
+/// the column decays by `exp(g)`, `u = Σᵢ S[i, j] k[i]`, `δ = (v[j] − u) β`,
+/// `S[i, j] += k[i] δ`, and the output is `Σᵢ S[i, j] q[i]`, sums over `i`
+/// in order. Each thread reads and writes its column and its outputs alone.
+#[kernel]
+#[launch_bounds(256)]
+pub fn delta_rule(
+    kq: u32,
+    q: &[u8],
+    vq: View,
+    kk: u32,
+    k: &[u8],
+    vk: View,
+    kv: u32,
+    v: &[u8],
+    vv: View,
+    kg: u32,
+    g: &[u8],
+    vg: View,
+    kb: u32,
+    beta: &[u8],
+    vb: View,
+    slots: &[u32],
+    heads: u32,
+    key_heads: u32,
+    dk: u32,
+    dv: u32,
+    mut state: DisjointSlice<f32>,
+    ko: u32,
+    mut out: DisjointSlice<u8>,
+) {
+    let idx = thread::index_1d();
+    let i = idx.get();
+    let (h, hk, dk, dv) = (heads as usize, key_heads as usize, dk as usize, dv as usize);
+    if i >= h * dv || dk == 0 || dk > DELTA_KEYS || hk == 0 || h % hk != 0 {
+        return;
+    }
+    let (head, j) = (i / dv, i % dv);
+    let kh = head / (h / hk);
+    let room = elements(ko, out.len());
+    let base = state.as_mut_ptr();
+    let mut column = [0.0f32; DELTA_KEYS];
+    let mut current = usize::MAX;
+    for r in 0..slots.len() {
+        let s = slots[r] as usize;
+        let at = |row: usize| ((s * h + head) * dk + row) * dv + j;
+        if s != current {
+            if current != usize::MAX {
+                let back = |row: usize| ((current * h + head) * dk + row) * dv + j;
+                for row in 0..dk {
+                    // SAFETY: in bounds (checked when it was read), this
+                    // thread's column.
+                    unsafe { *base.add(back(row)) = column[row] };
+                }
+            }
+            if at(dk - 1) >= state.len() {
+                return;
+            }
+            for row in 0..dk {
+                // SAFETY: in bounds (checked above), this thread's column.
+                column[row] = unsafe { *base.add(at(row)) };
+            }
+            current = s;
+        }
+        let decay = read(kg, g, vg.at((r * h + head) as u32) as usize).exp();
+        let b = read(kb, beta, vb.at((r * h + head) as u32) as usize);
+        let keys = (r * hk + kh) * dk;
+        let mut u = 0.0f32;
+        for row in 0..dk {
+            column[row] *= decay;
+            u += column[row] * read(kk, k, vk.at((keys + row) as u32) as usize);
+        }
+        let delta = (read(kv, v, vv.at(((r * h + head) * dv + j) as u32) as usize) - u) * b;
+        let mut o = 0.0f32;
+        for row in 0..dk {
+            column[row] += read(kk, k, vk.at((keys + row) as u32) as usize) * delta;
+            o += column[row] * read(kq, q, vq.at((keys + row) as u32) as usize);
+        }
+        if (r * h + head) * dv + j < room {
+            // SAFETY: in bounds (checked above), this thread's element.
+            unsafe { write(ko, out.as_mut_ptr(), (r * h + head) * dv + j, o) };
+        }
+    }
+    if current != usize::MAX {
+        for row in 0..dk {
+            let back = ((current * h + head) * dk + row) * dv + j;
+            // SAFETY: in bounds (checked when it was read), this thread's
+            // column.
+            unsafe { *base.add(back) = column[row] };
+        }
+    }
+}
+
 /// The maximum of `v` over the 32 lanes of the warp, on every lane.
 #[inline(always)]
 fn warp_max(v: f32) -> f32 {

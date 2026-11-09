@@ -364,6 +364,37 @@ impl<B: kapel_ops::Update> kapel_ops::Update for Profiled<B> {
     }
 }
 
+impl<B: kapel_ops::Recurrent> kapel_ops::Recurrent for Profiled<B> {
+    fn causal_conv(
+        &self,
+        state: &mut Tensor,
+        x: &Tensor,
+        weight: &Tensor,
+        slots: &Tensor,
+    ) -> Result<Tensor> {
+        self.time(
+            || "causal_conv".into(),
+            || self.inner.causal_conv(state, x, weight, slots),
+        )
+    }
+
+    fn delta_rule(
+        &self,
+        state: &mut Tensor,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        g: &Tensor,
+        beta: &Tensor,
+        slots: &Tensor,
+    ) -> Result<Tensor> {
+        self.time(
+            || "delta_rule".into(),
+            || self.inner.delta_rule(state, q, k, v, g, beta, slots),
+        )
+    }
+}
+
 impl<B: Record> Record for Profiled<B> {
     fn records(&self) -> bool {
         false

@@ -77,6 +77,7 @@ mod norm;
 mod paged;
 pub mod pool;
 mod quantized;
+mod recurrent;
 mod reduce;
 mod rope;
 mod update;

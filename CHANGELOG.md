@@ -353,6 +353,20 @@ changelog says how.
   heads and of the MLP, `enter` and `reduce` on the tape), the loss and the
   gradients of the whole model.
 - `kapel_hub::safetensors::to_bytes`: a safetensors image in memory.
+- `kapel_ops::Recurrent`: the states of linear attention written in place,
+  `causal_conv` (a depthwise causal convolution, the last inputs of each
+  sequence kept) and `delta_rule` (the gated delta rule, a matrix per value
+  head), rows of several sequences in one call; on the reference, the
+  processor and the card, in the conformity suite.
+- Qwen 3.5's mixtures of experts (`model_type` `qwen3_5_moe`, Qwen3.6-35B-A3B):
+  layers of Gated DeltaNet (`Mixer::GatedDeltaNet`, `Config::linear`), the
+  attention's output gated, norms centred on zero, the experts and their
+  shared expert (`Config::experts`), the sizes under `text_config` and the
+  weights under `model.language_model.`. A small model with random weights
+  (`tools/parity/moe_reference.py`) gives the logits of `transformers` within
+  2e-5, and within 6e-6 on the card.
+- `KvCache` keeps the states of linear attention, a slot per sequence; a cache
+  that holds them shares no pages and refuses a sequence it has shortened.
 
 ### Changed
 

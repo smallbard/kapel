@@ -98,5 +98,6 @@ The foundation is complete. The first inference step, correct generation, landed
 | The tools of experiments | done (chapter 17): budgets of operations, `kapel sweep` and `kapel fit`, the laws of Chinchilla, logs for TensorBoard and Weights & Biases, the operations of each call in the profiler |
 | Being used | done (chapters 15, 16 and 19): a guide to training, recipes with their expected results and costs, `kapel export` for the Hub, the recipes measured in CI |
 | Larger and faster on one card | done (chapters 15 and 16): AdamW in 8 bits, fine-tuning and DPO without padding, the optimizer's state in the processor's memory |
+| Mixtures of experts larger than the card | begun (chapters 4, 7 and 10): Gated DeltaNet and its states in the cache, Qwen 3.5's gated attention and experts, checked against `transformers` on the processor and the card; left: the routing on the card and its recording, GGUF and its smaller formats, the experts kept in the processor's memory and computed there, Qwen3.8-Flash-Next's hyper-connections, sparse attention and table of n-grams |
 
 The targets are concrete: on the CPU, 90 % of llama.cpp's speed; on the GPU, 70 % of vLLM's; for training, nanoGPT, torchtitan and TRL. Each step has its validation criterion, measured against them, and each adds a chapter's worth of material to this book.

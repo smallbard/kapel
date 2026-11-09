@@ -40,6 +40,54 @@ pub enum Norm {
     Layer,
 }
 
+/// What mixes the positions in a layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mixer {
+    /// Softmax attention over the keys and values of the cache.
+    Attention,
+    /// Gated DeltaNet (Yang, Kautz and Hatamizadeh, 2024): a causal
+    /// convolution, then the gated delta rule over a state per head, read
+    /// by the queries ([`LinearAttention`]).
+    GatedDeltaNet,
+}
+
+/// The sizes of the layers of Gated DeltaNet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LinearAttention {
+    /// The query and key heads.
+    pub key_heads: usize,
+    /// The value heads, a multiple of the key heads: value head `h` reads
+    /// key head `h / (value_heads / key_heads)`.
+    pub value_heads: usize,
+    /// The width of a query or key head.
+    pub key_dim: usize,
+    /// The width of a value head.
+    pub value_dim: usize,
+    /// The taps of the causal convolution.
+    pub conv: usize,
+}
+
+impl LinearAttention {
+    /// The channels of the convolution: queries, keys and values.
+    pub fn channels(&self) -> usize {
+        2 * self.key_heads * self.key_dim + self.value_heads * self.value_dim
+    }
+}
+
+/// A mixture of experts in place of the MLP.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Experts {
+    /// The experts of a layer.
+    pub count: usize,
+    /// The experts each token is routed to.
+    pub per_token: usize,
+    /// The inner width of an expert.
+    pub width: usize,
+    /// The inner width of the shared expert, which every token goes
+    /// through, gated by a sigmoid; `None` for none.
+    pub shared_width: Option<usize>,
+}
+
 /// Everything the forward pass needs to know about an architecture.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
@@ -101,6 +149,15 @@ pub struct Config {
     pub max_positions: Option<usize>,
     /// The multi-token prediction layers (`num_nextn_predict_layers`: MiMo).
     pub multi_token_layers: usize,
+    /// For each layer, what mixes its positions.
+    pub mixers: Vec<Mixer>,
+    /// The sizes of its layers of Gated DeltaNet, if it has any.
+    pub linear: Option<LinearAttention>,
+    /// The mixture of experts that replaces the MLP, if any.
+    pub experts: Option<Experts>,
+    /// Whether the attention's output is gated, `o · σ(gate)` before the
+    /// output projection, the gate from the query projection (Qwen 3.5).
+    pub attention_gate: bool,
 }
 
 // Bounds far above any model, so that a hostile file cannot make Kapel allocate
@@ -118,6 +175,8 @@ pub const MAX_HIDDEN: usize = 1 << 20;
 pub const MAX_HEAD_DIM: usize = 1 << 14;
 /// The widest MLP a configuration may have.
 pub const MAX_INTERMEDIATE: usize = 1 << 24;
+/// The most experts a layer may have (models have up to a few hundred).
+pub const MAX_EXPERTS: usize = 1 << 16;
 /// The largest vocabulary a configuration may have (token ids are `u32`;
 /// models have up to a few hundred thousand).
 pub const MAX_VOCAB: usize = 1 << 24;
@@ -203,12 +262,23 @@ impl Config {
             .and_then(Value::as_str)
             .ok_or_else(|| ModelError::Config("no model_type".into()))?
             .to_string();
+        // Models that also see images keep the sizes of their decoder apart.
+        let json = match model_type.as_str() {
+            "qwen3_5_moe" => field(json, &["text_config"]).unwrap_or(json),
+            _ => json,
+        };
+        let model_type = match model_type.as_str() {
+            "qwen3_5_moe_text" => "qwen3_5_moe".to_string(),
+            _ => model_type,
+        };
         let (block, norm) = match model_type.as_str() {
             // MiMo is Qwen 2 with a multi-token prediction layer.
             "llama" | "mistral" | "qwen2" | "qwen3" | "mimo" => {
                 (Block::Sequential, Norm::Rms { offset: 0.0 })
             }
             "gemma2" => (Block::Sandwich, Norm::Rms { offset: 1.0 }),
+            // Qwen 3.5's norms are centred on zero, as Gemma's.
+            "qwen3_5_moe" => (Block::Sequential, Norm::Rms { offset: 1.0 }),
             "phi" => (Block::Parallel, Norm::Layer),
             "gpt2" => (Block::Gpt2, Norm::Layer),
             other => {
@@ -314,8 +384,87 @@ impl Config {
         if windows.len() != layers {
             return invalid(format!("{} layer types for {layers} layers", windows.len()));
         }
+        let mixers: Vec<Mixer> = match field(json, &["layer_types"]).and_then(Value::as_array) {
+            Some(types) => types
+                .iter()
+                .map(|t| match t.as_str() {
+                    Some("linear_attention") => Mixer::GatedDeltaNet,
+                    _ => Mixer::Attention,
+                })
+                .collect(),
+            None => vec![Mixer::Attention; layers],
+        };
+        let linear = if mixers.contains(&Mixer::GatedDeltaNet) {
+            let linear = LinearAttention {
+                key_heads: usize_field(json, &["linear_num_key_heads"])?,
+                value_heads: usize_field(json, &["linear_num_value_heads"])?,
+                key_dim: usize_field(json, &["linear_key_head_dim"])?,
+                value_dim: usize_field(json, &["linear_value_head_dim"])?,
+                conv: usize_field(json, &["linear_conv_kernel_dim"])?,
+            };
+            for (name, value, limit) in [
+                ("linear key heads", linear.key_heads, MAX_HEADS),
+                ("linear value heads", linear.value_heads, MAX_HEADS),
+                ("linear key width", linear.key_dim, MAX_HEAD_DIM),
+                ("linear value width", linear.value_dim, MAX_HEAD_DIM),
+                ("convolution taps", linear.conv, MAX_HEAD_DIM),
+            ] {
+                if value == 0 || value > limit {
+                    return invalid(format!("{value} {name}: 1 to {limit} are accepted"));
+                }
+            }
+            if !linear.value_heads.is_multiple_of(linear.key_heads) {
+                return invalid(format!(
+                    "{} linear value heads are not a multiple of {} key heads",
+                    linear.value_heads, linear.key_heads
+                ));
+            }
+            Some(linear)
+        } else {
+            None
+        };
+        let experts = match usize_field(json, &["num_experts"]) {
+            Ok(count) if count > 0 => {
+                let experts = Experts {
+                    count,
+                    per_token: usize_field(json, &["num_experts_per_tok"])?,
+                    width: usize_field(json, &["moe_intermediate_size"])?,
+                    shared_width: usize_field(json, &["shared_expert_intermediate_size"])
+                        .ok()
+                        .filter(|&w| w > 0),
+                };
+                for (name, value, limit) in [
+                    ("experts", experts.count, MAX_EXPERTS),
+                    ("expert width", experts.width, MAX_INTERMEDIATE),
+                    (
+                        "shared expert width",
+                        experts.shared_width.unwrap_or(1),
+                        MAX_INTERMEDIATE,
+                    ),
+                ] {
+                    if value == 0 || value > limit {
+                        return invalid(format!("{value} {name}: 1 to {limit} are accepted"));
+                    }
+                }
+                if experts.per_token == 0 || experts.per_token > experts.count {
+                    return invalid(format!(
+                        "{} experts per token of {}",
+                        experts.per_token, experts.count
+                    ));
+                }
+                Some(experts)
+            }
+            _ => None,
+        };
+        if mixers.len() != layers {
+            return invalid(format!("{} layer types for {layers} layers", mixers.len()));
+        }
         let is = |name: &str| field(json, &[name]).and_then(Value::as_bool);
         Ok(Self {
+            mixers,
+            linear,
+            experts,
+            attention_gate: model_type == "qwen3_5_moe" && is("attn_output_gate").unwrap_or(true),
             block,
             norm,
             eps,
@@ -337,7 +486,7 @@ impl Config {
                 || (!matches!(model_type.as_str(), "qwen2" | "mimo")
                     && is("attention_bias").unwrap_or(false)),
             mlp_bias: is("mlp_bias").unwrap_or(false),
-            qk_norm: model_type == "qwen3",
+            qk_norm: matches!(model_type.as_str(), "qwen3" | "qwen3_5_moe"),
             rope,
             rope_layout: RopeLayout::Half,
             query_scale: f64_field(json, &["query_pre_attn_scalar"]).map(|s| 1.0 / s.sqrt()),

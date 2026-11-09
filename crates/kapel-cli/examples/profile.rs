@@ -115,6 +115,31 @@ impl<B: kapel_ops::Update> kapel_ops::Update for Timed<B> {
     }
 }
 
+impl<B: kapel_ops::Recurrent> kapel_ops::Recurrent for Timed<B> {
+    fn causal_conv(
+        &self,
+        state: &mut Tensor,
+        x: &Tensor,
+        weight: &Tensor,
+        slots: &Tensor,
+    ) -> kapel_core::Result<Tensor> {
+        self.inner.causal_conv(state, x, weight, slots)
+    }
+
+    fn delta_rule(
+        &self,
+        state: &mut Tensor,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        g: &Tensor,
+        beta: &Tensor,
+        slots: &Tensor,
+    ) -> kapel_core::Result<Tensor> {
+        self.inner.delta_rule(state, q, k, v, g, beta, slots)
+    }
+}
+
 impl<B: Transfer> Transfer for Timed<B> {
     fn upload(&self, tensor: &Tensor) -> Result<Tensor> {
         self.inner.upload(tensor)

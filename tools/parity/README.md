@@ -50,6 +50,16 @@ check that each GGUF file gives the tokens, end tokens and chat prompts of its
 original tokenizer, and that the model read from it predicts the same tokens as the
 original (Q8_0 rounds the weights: 95 % of the predictions at least).
 
+## Qwen 3.5's mixtures of experts
+
+`moe_reference.py` builds a small Qwen3.6-35B-A3B (`qwen3_5_moe`) with random weights:
+four layers, three of Gated DeltaNet and one of gated attention, eight experts of which
+each token takes three, and a shared expert. It saves it as the published checkpoint is
+laid out (the sizes under `text_config`, the weights under `model.language_model.` with
+the experts stacked), with Qwen3.6-35B-A3B's tokenizer, in `data/parity/qwen3_5_moe`. Its
+last text, 230 tokens, is longer than the chunks of 64 positions in which `transformers`
+computes the delta rule. The model's logits are checked with the others.
+
 ## MiMo's multi-token layer
 
 `multi_token_reference.py` builds a small MiMo with random weights (Qwen 2 with a

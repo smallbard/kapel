@@ -26,6 +26,15 @@
 //! indexed, free to be taken back, until its room is needed (the page served
 //! least recently goes first). Pages are written only past the end of their
 //! sequence: a shared page is full, and never written again.
+//!
+//! The layers of linear attention (Gated DeltaNet) keep no keys nor values but
+//! states, a fixed size per sequence: the last inputs of their convolution and
+//! the matrices of their delta rule ([`kapel_ops::Recurrent`]). Each sequence
+//! has its slot in these tables, the first slot left to the padding rows of
+//! recorded passes. A state holds every position at once: it cannot be shared
+//! between sequences nor brought back to an earlier length, so a cache that
+//! holds states shares no pages and refuses to go on with a sequence it has
+//! [truncated](KvCache::truncate).
 
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -57,6 +66,9 @@ struct Sequence {
     offered: usize,
     /// The hash of the tokens of its first `offered` pages ([`chain_of`]).
     chain: u64,
+    /// Whether it was brought back to an earlier length while the cache held
+    /// states, which cannot follow it.
+    stale: bool,
 }
 
 /// The hash of `tokens`, whole pages, as the index chains it: `0` for none.
@@ -126,6 +138,10 @@ pub struct KvCache {
     /// Per layer, the keys and values `[lines, kv_heads, head_dim]`, made at
     /// the first write, when their widths are known.
     layers: Vec<Option<(Tensor, Tensor)>>,
+    /// Per layer of linear attention, the states of its convolution `[slots,
+    /// taps − 1, channels]` and of its delta rule `[slots, heads, key width,
+    /// value width]` (`f32`), slot `1 + i` for sequence `i`.
+    states: Vec<Option<(Tensor, Tensor)>>,
     /// The pages of the tables: they have `pages · PAGE` lines.
     pages: usize,
     /// The free pages, not indexed; the next one given is the last.
@@ -156,6 +172,7 @@ impl Default for KvCache {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         Self {
             layers: Vec::new(),
+            states: Vec::new(),
             pages: 0,
             free: Vec::new(),
             refs: Vec::new(),
@@ -179,6 +196,11 @@ pub(crate) struct Plan {
     pub(crate) widest: usize,
     /// `[R, 2]`.
     pub(crate) rows: Vec<u32>,
+    /// `[R]`: the slot of each row's sequence in the tables of states.
+    pub(crate) slots: Vec<u32>,
+    /// The slots of the sequences the pass starts: their states are zeroed
+    /// first.
+    pub(crate) fresh: Vec<u32>,
 }
 
 impl Plan {
@@ -197,6 +219,8 @@ impl Plan {
             // The line is the first position its row sees: the row's
             // positions start at the line's place in its page.
             self.rows.extend([r as u32, line % PAGE as u32 + 1]);
+            // The padding's own slot, which no sequence has.
+            self.slots.push(0);
         }
     }
 }
@@ -214,6 +238,10 @@ pub(crate) struct Step {
     /// `[R, 2]`: the sequence of each new token in the pass, and the number
     /// of positions it sees, its own included.
     pub(crate) rows: Tensor,
+    /// `[R]`: the slot of each new token's sequence in the tables of states.
+    pub(crate) slots: Tensor,
+    /// The slots whose states the pass zeroes first, on the host.
+    pub(crate) fresh: Vec<u32>,
     /// The lines the tables must have.
     pub(crate) lines_needed: usize,
 }
@@ -262,7 +290,9 @@ impl KvCache {
     /// empty sequence.
     pub fn add_sequence_sharing(&mut self, prompt: &[u32]) -> (SequenceId, usize) {
         let id = self.add_sequence();
-        let Some(prefixes) = self.prefixes.as_mut() else {
+        // A state holds a whole sequence: nothing of it can be shared.
+        let holds_states = self.states.iter().any(Option::is_some);
+        let Some(prefixes) = self.prefixes.as_mut().filter(|_| !holds_states) else {
             return (id, 0);
         };
         let mut parent = 0;
@@ -467,6 +497,9 @@ impl KvCache {
             .as_mut()
             .expect("a sequence in progress");
         assert!(len <= sequence.len, "a sequence can only be shortened");
+        if len < sequence.len && self.states.iter().any(Option::is_some) {
+            sequence.stale = true;
+        }
         sequence.len = len;
         sequence.tokens.truncate(len);
         if sequence.offered > len / PAGE {
@@ -558,14 +591,18 @@ impl KvCache {
     pub fn table_bytes(&self) -> usize {
         self.layers
             .iter()
+            .chain(&self.states)
             .flatten()
             .map(|(k, v)| k.storage().len() + v.storage().len())
             .sum()
     }
 
-    /// Whether the first `layers` layers have their tables.
+    /// Whether the first `layers` layers have their tables, or their states.
     pub(crate) fn has_tables(&self, layers: usize) -> bool {
-        self.layers.len() >= layers && self.layers[..layers].iter().all(Option::is_some)
+        (0..layers).all(|l| {
+            self.layers.get(l).is_some_and(Option::is_some)
+                || self.states.get(l).is_some_and(Option::is_some)
+        })
     }
 
     /// What tells this cache and its present tables from any other.
@@ -621,6 +658,16 @@ impl KvCache {
                 let like = (k.narrow(0, 0, 1)?, v.narrow(0, 0, 1)?);
                 drop((k, v));
                 self.tables(backend, layer, lines, &like.0, &like.1)?;
+            }
+        }
+        for layer in 0..self.states.len() {
+            if let Some((conv, delta)) = &self.states[layer] {
+                let shapes = (
+                    conv.shape()[1..].to_vec(),
+                    conv.dtype(),
+                    delta.shape()[1..].to_vec(),
+                );
+                self.states(backend, layer, (&shapes.0, shapes.1), &shapes.2, &[])?;
             }
         }
         Ok(())
@@ -707,6 +754,14 @@ impl KvCache {
         widest: Option<usize>,
     ) -> Result<Plan, ModelError> {
         for (i, &(id, _)) in batch.iter().enumerate() {
+            if self.sequence(id).stale {
+                return Err(ModelError::Tensor(kapel_core::Error::InvalidArgument {
+                    op: "step",
+                    message: "a sequence of a model with linear attention was shortened: \
+                              its states cannot follow"
+                        .into(),
+                }));
+            }
             if batch[..i].iter().any(|&(other, _)| other == id) {
                 return Err(ModelError::Tensor(kapel_core::Error::InvalidArgument {
                     op: "step",
@@ -728,11 +783,18 @@ impl KvCache {
                 .extend(pages);
         }
         let (mut positions, mut lines, mut rows) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut slots, mut fresh) = (Vec::new(), Vec::new());
         let mut pages = vec![0u32; batch.len() * widest];
         for (s, &(id, count)) in batch.iter().enumerate() {
             let sequence = self.sequences[id.0]
                 .as_mut()
                 .expect("a sequence in progress");
+            let slot =
+                u32::try_from(id.0 + 1).map_err(|_| kapel_core::Error::Overflow { op: "step" })?;
+            if sequence.len == 0 {
+                fresh.push(slot);
+            }
+            slots.extend(std::iter::repeat_n(slot, count));
             pages[s * widest..][..sequence.pages.len()].copy_from_slice(&sequence.pages);
             for j in sequence.len..sequence.len + count {
                 let line = sequence.pages[j / PAGE] as usize * PAGE + j % PAGE;
@@ -750,6 +812,8 @@ impl KvCache {
             pages,
             widest,
             rows,
+            slots,
+            fresh,
         })
     }
 
@@ -771,8 +835,65 @@ impl KvCache {
             lines: upload(&plan.lines, &[r])?,
             pages: upload(&plan.pages, &[batch.len(), plan.widest])?,
             rows: upload(&plan.rows, &[r, 2])?,
+            slots: upload(&plan.slots, &[r])?,
+            fresh: plan.fresh,
             lines_needed: self.pages * PAGE,
         })
+    }
+
+    /// The slots the tables of states must have: one per sequence ever
+    /// started, and the padding's.
+    fn slots(&self) -> usize {
+        self.sequences.len() + 1
+    }
+
+    /// The states of `layer`, made or grown on `backend` for every sequence:
+    /// a convolution's `[slots, conv...]` of type `conv.1`, a delta rule's
+    /// `[slots, delta...]` in `f32`; the slots of `fresh` zeroed.
+    pub(crate) fn states<B: Write + Transfer>(
+        &mut self,
+        backend: &B,
+        layer: usize,
+        conv: (&[usize], DType),
+        delta: &[usize],
+        fresh: &[u32],
+    ) -> Result<&mut (Tensor, Tensor), ModelError> {
+        if self.states.len() <= layer {
+            self.states.resize_with(layer + 1, || None);
+        }
+        let needed = self.slots();
+        let shaped = |slots: usize, rest: &[usize]| {
+            let mut shape = vec![slots];
+            shape.extend_from_slice(rest);
+            shape
+        };
+        let made = self.states[layer].as_ref().map(|(c, _)| c.shape()[0]);
+        if made.is_none_or(|slots| slots < needed) {
+            self.identity.1 += 1;
+            // Room for twice the sequences, or more: few regrowths.
+            let slots = needed.max(made.unwrap_or(0) * 2).max(4);
+            let mut c = backend.zeros(&shaped(slots, conv.0), conv.1)?;
+            let mut d = backend.zeros(&shaped(slots, delta), DType::F32)?;
+            if let Some((old_c, old_d)) = self.states[layer].take() {
+                let old = old_c.shape()[0];
+                let index = backend.upload(&Tensor::from_slice(
+                    &(0..old as u32).collect::<Vec<_>>(),
+                    &[old],
+                )?)?;
+                backend.write_rows(&mut c, &index, &old_c)?;
+                backend.write_rows(&mut d, &index, &old_d)?;
+            }
+            self.states[layer] = Some((c, d));
+        }
+        let (c, d) = self.states[layer].as_mut().expect("made above");
+        if !fresh.is_empty() {
+            let index = backend.upload(&Tensor::from_slice(fresh, &[fresh.len()])?)?;
+            let zeros_c = backend.zeros(&shaped(fresh.len(), conv.0), c.dtype())?;
+            let zeros_d = backend.zeros(&shaped(fresh.len(), delta), DType::F32)?;
+            backend.write_rows(c, &index, &zeros_c)?;
+            backend.write_rows(d, &index, &zeros_d)?;
+        }
+        Ok(self.states[layer].as_mut().expect("made above"))
     }
 
     /// The lines the tables must have for the pages of the cache.

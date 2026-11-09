@@ -47,8 +47,8 @@ use std::fmt;
 
 pub use cache::{KvCache, PAGE, SequenceId};
 pub use config::{
-    Block, Config, MAX_HEAD_DIM, MAX_HEADS, MAX_HIDDEN, MAX_INTERMEDIATE, MAX_LAYERS, MAX_VOCAB,
-    Norm,
+    Block, Config, Experts, LinearAttention, MAX_EXPERTS, MAX_HEAD_DIM, MAX_HEADS, MAX_HIDDEN,
+    MAX_INTERMEDIATE, MAX_LAYERS, MAX_VOCAB, Mixer, Norm,
 };
 pub use gguf::GgufModel;
 pub use model::{Cache, Model, Observer, ROOM, Recorded, RecordedStep, Site, quantize_matrix};

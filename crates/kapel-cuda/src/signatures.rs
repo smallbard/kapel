@@ -133,6 +133,19 @@ pub(crate) const KERNELS: &[(&str, &[Param])] = &[
         &[U32, Slice, View, Slice, U32, U32, Slice],
     ),
     (
+        "causal_conv",
+        &[
+            U32, Slice, View, U32, Slice, View, Slice, U32, U32, U32, Slice, U32, Slice,
+        ],
+    ),
+    (
+        "delta_rule",
+        &[
+            U32, Slice, View, U32, Slice, View, U32, Slice, View, U32, Slice, View, U32, Slice,
+            View, Slice, U32, U32, U32, U32, Slice, U32, Slice,
+        ],
+    ),
+    (
         "paged_attention",
         &[
             Paged, Slice, Slice, Slice, Slice, Slice, Slice, Slice, Slice,

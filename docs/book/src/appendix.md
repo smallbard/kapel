@@ -4,10 +4,12 @@
 
 | Term | Meaning in Kapel |
 | --- | --- |
+| `infer` | The validation and shape computation shared by every backend for an operation |
+| `Isa` | A proof that the processor has the instructions a code path uses |
 | Acceptance rate | The share of the proposals of speculative decoding that the model accepts (`SpeculationStats::acceptance`) |
+| Activation checkpointing | Keeping only the inputs of a region of the forward pass and computing it again during the backward pass, memory traded for time (`Tape::checkpoint`) |
 | Activations in bytes | Quantizing the input of a quantized product too, by blocks of 32, so that the product is a sum of products of bytes; chosen explicitly, as it changes the result a little |
 | AWQ | Activation-aware weight quantization: input channels with large activations scaled up in the weights (and down in the operation before) so that rounding spares them, then blocks clipped (`kapel-quant`, chapter 13) |
-| Activation checkpointing | Keeping only the inputs of a region of the forward pass and computing it again during the backward pass, memory traded for time (`Tape::checkpoint`) |
 | Backend | A type implementing `Run` for every operation of the catalogue: `Reference`, `Cpu` or `Cuda` |
 | Batch | Several sequences computed in the same pass, one row per new token of each, so the weights are read once for all of them (`Model::step_batch`, `kapel_infer::Batch`) |
 | Block (quantized) | The unit a quantized type stores: a scale, sometimes a minimum, and packed codes for 32 or 256 elements |
@@ -22,32 +24,32 @@
 | Constraint | The form an answer must take: a JSON schema, any JSON object, a regular expression, a Lark grammar, a list of texts; the tokens that cannot continue it get a logit of −∞ (`kapel_infer::Constraint`); OpenAI calls it a structured output |
 | Contiguous | Stored in row-major order without gaps |
 | Continuous batching | Serving requests that come and go in the same passes: each pass computes a token of every request in progress and pieces of new prompts, a request entering as soon as there is room and leaving as soon as it ends (`kapel_infer::Engine`) |
-| CUDA graph | A pass recorded once and replayed in one launch, its kernels and buffers fixed; the `Record` trait, and `Model::record_step` |
 | Cross-entropy (fused) | The loss of each row of logits, `ln Σ eˣ − x[target]`, with its gradient `softmax − onehot` written by hand, the softmax never formed (`CrossEntropy`); over a large vocabulary, by pieces of rows without the logits whole (`linear_cross_entropy`) |
+| CUDA graph | A pass recorded once and replayed in one launch, its kernels and buffers fixed; the `Record` trait, and `Model::record_step` |
 | Decoding | Generating one token at a time after the prompt, bound by memory bandwidth |
 | Determinism | The same bits whatever the number of threads, achieved by splitting work by shape |
 | f8 | The 8-bit floats E4M3 and E5M2, used by Kapel for caches of keys and values half the size of bf16 |
 | FSDP | Fully sharded data parallelism: each weight held by one rank, fetched by the others where they use it, its gradient summed at its owner (`training.shard = "weights"`) |
 | Fusing | Stacking the projections that read the same input into one weight, one product instead of several (`Model::fused`) |
+| Gated DeltaNet | Linear attention whose state, a matrix per head, decays by a gate and is corrected by the delta rule at each token: three layers in four of Qwen 3.5 (`Mixer::GatedDeltaNet`, `Recurrent::delta_rule`) |
 | GGUF | llama.cpp's file format: a model's configuration, tokenizer and weights, quantized or not, in one file |
 | GPTQ | Quantization column by column, the error of each column carried onto those not yet rounded through the inverse Hessian (`kapel-quant`, chapter 13) |
 | GQA | Grouped-query attention: several query heads share one key and value head |
 | Grid (sweep) | Runs of one base configuration, each with its changes, run by `kapel sweep` and noted in `results.tsv` (chapter 17) |
 | Hessian (of a projection) | `H = Σ x xᵀ` over the inputs `x` of a projection: a change `δ` of a row of weights changes the outputs by `δ H δᵀ` |
-| `infer` | The validation and shape computation shared by every backend for an operation |
-| `Isa` | A proof that the processor has the instructions a code path uses |
 | IsoFLOP curve | The losses of models of several sizes trained for one budget of operations: its lowest point is the best size for that budget (`scaling::isoflops`) |
-| llguidance | The library of structured outputs that compiles constraints into a parser over the bytes of the tokens, and gives the set of tokens allowed next |
 | Leaf | A value on a tape whose gradient is wanted: a parameter (`Tape::leaf`); a constant receives none |
+| llguidance | The library of structured outputs that compiles constraints into a parser over the bytes of the tokens, and gives the set of tokens allowed next |
 | Log-likelihood | The sum of the logarithms of the probabilities of a continuation's tokens after a context; what `kapel eval` ranks answers by (`Scorer`) |
 | MFU | Model FLOP utilization: the operations a step's definition asks for, over its time and the card's peak (`kapel_train::flops`) |
 | Micro-kernel | The innermost routine of the matrix product, holding a block of C in registers |
+| Mixture of experts | An MLP replaced by many smaller ones, the experts, of which a router sends each token to a few (`Config::experts`); a shared expert sees every token |
 | Model card | The `README.md` of a model on the Hub: what it is, how it was trained, how to load it; `kapel export` writes one from a run's configuration and log (`kapel_train::export`) |
-| Muon | An optimizer of matrices: a momentum made orthogonal by Newton-Schulz's iterations, scaled to the size of an AdamW step (`kapel_train::optim::Muon`) |
 | Multi-token prediction | A layer trained with the model to predict the token after the next from the model's hidden state and the next token (MiMo, DeepSeek-V3); a proposer that costs one block (`Model::multi_token`) |
+| Muon | An optimizer of matrices: a momentum made orthogonal by Newton-Schulz's iterations, scaled to the size of an AdamW step (`kapel_train::optim::Muon`) |
 | Packing | Copying a block of an operand into the contiguous order the micro-kernel reads |
-| Padding rows | Rows added to a smaller batch so that it fits a recorded pass of more rows; each writes a scratch line of its own and is read by no one |
 | Padding (of a vocabulary) | Rows of zeros added to an output table up to a multiple of 64 for the products, the logits of the padding not read |
+| Padding rows | Rows added to a smaller batch so that it fits a recorded pass of more rows; each writes a scratch line of its own and is read by no one |
 | Paged attention | Attention of new rows over a cache by pages, each row knowing its sequence and how many positions it sees (`PagedAttention`) |
 | Parity | Agreement with the Python libraries `transformers`, `tokenizers` or llama.cpp on real models and files |
 | Perplexity | The exponential of the mean negative log-likelihood of a text: how a quantization is judged |
@@ -67,6 +69,7 @@
 | Sparse gradient | The gradient of a table of which few rows were read, kept as those rows and what to add to them (`Grad::Rows`), and the AdamW that updates only them |
 | Speculative decoding | A proposer guesses several tokens, the model checks them in one pass, accepting each by the rule that keeps its distribution exactly (`Pipeline::speculate`) |
 | Stable ABI (abi3) | CPython's interface that does not change between versions: one wheel of the Python module serves every Python from 3.9 |
+| State (of linear attention) | What a layer of linear attention keeps of a sequence instead of its keys and values: a fixed size whatever its length, carried from one token to the next, one slot per sequence in the cache |
 | Stride | The distance in the buffer between two consecutive elements of a dimension |
 | Suspension (preemption) | Taking the pages of the request admitted last when the cache runs out, to compute its tokens again later |
 | Tape | The record of a computation, run backwards to get the gradients of a loss (`kapel_train::Tape`) |

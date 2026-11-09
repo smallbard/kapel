@@ -82,6 +82,164 @@ pub fn check<B: Backend + Transfer + Write>(backend: &B, dtype: DType) -> Vec<Fa
     failures.extend(write_failures(backend, dtype));
     failures.extend(refusal_failures(backend, dtype));
     failures.extend(update_failures(backend, dtype));
+    failures.extend(recurrent_failures(backend, dtype));
+    failures
+}
+
+/// A table of `shape` and `dtype` on `backend`, the only handle on it, with
+/// the values of `values`: a state to write in place.
+fn table<B: Write + Transfer>(backend: &B, values: &Tensor, dtype: DType) -> Result<Tensor> {
+    let shape = values.shape();
+    let mut t = backend.zeros(shape, dtype)?;
+    let rows = shape[0];
+    let index = Tensor::from_slice(&(0..rows as u32).collect::<Vec<_>>(), &[rows])?;
+    backend.write_rows(&mut t, &backend.upload(&index)?, &backend.upload(values)?)?;
+    Ok(t)
+}
+
+/// The causal convolution and the delta rule, in place, compared with the
+/// reference: their outputs and the states they leave, rows of several
+/// sequences in one call, and the calls that must be refused.
+fn recurrent_failures<B: Backend + Transfer>(backend: &B, dtype: DType) -> Vec<Failure> {
+    use kapel_ops::{CAUSAL_CONV, DELTA_RULE, Recurrent};
+    let mut failures = Vec::new();
+    let mut rng = Rng::new(19);
+    let tol = tolerance(dtype);
+    // Rows of three sequences, interleaved: each reads what its previous row
+    // left.
+    let slots = Tensor::from_slice(&[2u32, 2, 0, 2, 1, 0], &[6]).expect("sizes agree");
+    let (c, taps) = (37, 4);
+    let x = random(&mut rng, &[6, c + 5], dtype, -1.0, 1.0);
+    let weight = random(&mut rng, &[c, taps], dtype, -1.0, 1.0);
+    let conv0 = random(&mut rng, &[3, taps - 1, c], DType::F32, -1.0, 1.0);
+    for state_dtype in [DType::F32, dtype] {
+        let case = format!("6 rows of 3 sequences, {c} channels, a state in {state_dtype}");
+        let outcome = (|| -> Result<Vec<String>> {
+            let x = x.narrow(1, 3, c)?;
+            let mut rs = table(&Reference, &conv0, state_dtype)?;
+            let want = Reference.causal_conv(&mut rs, &x, &weight, &slots)?;
+            let mut bs = table(backend, &conv0, state_dtype)?;
+            let got = backend.causal_conv(
+                &mut bs,
+                &backend.upload(&x)?,
+                &backend.upload(&weight)?,
+                &backend.upload(&slots)?,
+            )?;
+            let mut problems = Vec::new();
+            let got = backend.download(&got)?;
+            if got.dtype() != dtype {
+                problems.push(format!("type {}, expected {dtype}", got.dtype()));
+            }
+            compare("output", &want, &got, tol, &mut problems)?;
+            compare("state", &rs, &backend.download(&bs)?, tol, &mut problems)?;
+            Ok(problems)
+        })();
+        let problems = outcome.unwrap_or_else(|e| vec![e.to_string()]);
+        failures.extend(problems.into_iter().map(|message| Failure {
+            op: CAUSAL_CONV,
+            case: case.clone(),
+            message,
+        }));
+    }
+    let (h, hk, dk, dv) = (4, 2, 8, 6);
+    let q = random(&mut rng, &[6, hk, dk], dtype, -0.5, 0.5);
+    let k = random(&mut rng, &[6, hk, dk], dtype, -0.5, 0.5);
+    let v = random(&mut rng, &[6, h, dv], dtype, -1.0, 1.0);
+    let g = random(&mut rng, &[6, h], dtype, -1.0, 0.0);
+    let beta = random(&mut rng, &[6, h], dtype, 0.0, 1.0);
+    let delta0 = random(&mut rng, &[3, h, dk, dv], DType::F32, -0.5, 0.5);
+    let case = format!("6 rows of 3 sequences, {h} heads reading {hk}, {dk} × {dv}");
+    let outcome = (|| -> Result<Vec<String>> {
+        let mut rs = table(&Reference, &delta0, DType::F32)?;
+        let want = Reference.delta_rule(&mut rs, &q, &k, &v, &g, &beta, &slots)?;
+        let mut bs = table(backend, &delta0, DType::F32)?;
+        let up = |t: &Tensor| backend.upload(t);
+        let got = backend.delta_rule(
+            &mut bs,
+            &up(&q)?,
+            &up(&k)?,
+            &up(&v)?,
+            &up(&g)?,
+            &up(&beta)?,
+            &up(&slots)?,
+        )?;
+        let mut problems = Vec::new();
+        let got = backend.download(&got)?;
+        if got.dtype() != dtype {
+            problems.push(format!("type {}, expected {dtype}", got.dtype()));
+        }
+        compare("output", &want, &got, tol, &mut problems)?;
+        compare("state", &rs, &backend.download(&bs)?, tol, &mut problems)?;
+        Ok(problems)
+    })();
+    let problems = outcome.unwrap_or_else(|e| vec![e.to_string()]);
+    failures.extend(problems.into_iter().map(|message| Failure {
+        op: DELTA_RULE,
+        case: case.clone(),
+        message,
+    }));
+    // Calls to refuse.
+    let beyond = Tensor::from_slice(&[2u32, 3, 0, 2, 1, 0], &[6]).expect("sizes agree");
+    let refused: [(&'static str, &str, Result<Tensor>); 3] = [
+        (
+            CAUSAL_CONV,
+            "a slot beyond the table",
+            (|| {
+                let mut bs = table(backend, &conv0, DType::F32)?;
+                let x = backend.upload(&x.narrow(1, 0, c)?)?;
+                backend.causal_conv(
+                    &mut bs,
+                    &x,
+                    &backend.upload(&weight)?,
+                    &backend.upload(&beyond)?,
+                )
+            })(),
+        ),
+        (
+            DELTA_RULE,
+            "a slot beyond the table",
+            (|| {
+                let mut bs = table(backend, &delta0, DType::F32)?;
+                let up = |t: &Tensor| backend.upload(t);
+                backend.delta_rule(
+                    &mut bs,
+                    &up(&q)?,
+                    &up(&k)?,
+                    &up(&v)?,
+                    &up(&g)?,
+                    &up(&beta)?,
+                    &up(&beyond)?,
+                )
+            })(),
+        ),
+        (
+            DELTA_RULE,
+            "a state that is shared",
+            (|| {
+                let mut bs = table(backend, &delta0, DType::F32)?;
+                let _other = bs.clone();
+                let up = |t: &Tensor| backend.upload(t);
+                backend.delta_rule(
+                    &mut bs,
+                    &up(&q)?,
+                    &up(&k)?,
+                    &up(&v)?,
+                    &up(&g)?,
+                    &up(&beta)?,
+                    &up(&slots)?,
+                )
+            })(),
+        ),
+    ];
+    for (op, case, outcome) in refused {
+        if outcome.is_ok() {
+            failures.push(Failure {
+                op,
+                case: case.into(),
+                message: "accepted".into(),
+            });
+        }
+    }
     failures
 }
 

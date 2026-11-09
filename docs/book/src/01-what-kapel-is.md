@@ -36,7 +36,7 @@ Inference aimed first at one sequence at a time on a CPU. Smallem showed that a 
 - A catalogue of 23 operations with forward and backward passes, shared input checks, and three backends: reference, CPU and CUDA (chapters 4 to 7).
 - Readers for safetensors, GGUF, sharded checkpoints and Hub downloads (chapter 8); models read whole from GGUF files, or quantized at loading (chapter 10).
 - Tokenizers and chat templates that match `transformers` (chapter 9).
-- Model families Llama, Mistral, Qwen 2 and 3, MiMo, Gemma 2, Phi and GPT-2, checked logit for logit against `transformers` (chapter 10).
+- Model families Llama, Mistral, Qwen 2 and 3, MiMo, Gemma 2, Phi and GPT-2, and Qwen 3.5's mixtures of experts with Gated DeltaNet, checked logit for logit against `transformers` (chapter 10).
 - A generation engine and the `kapel run` command (chapter 11), which on a Ryzen 7 7700 generates with a quantized Llama 3.2 1B at 90 % of llama.cpp's speed (chapter 6), and generation by batches over a cache by pages, which on an RTX 3090 reaches 90 % of vLLM's throughput (chapters 7, 10 and 11).
 - A server of OpenAI's API, `kapel serve` (chapter 12): requests that come and go computed together, streamed answers, answers held to a JSON schema or a grammar, Prometheus metrics. On an RTX 3090 it serves Llama 3.2 3B at about 20 requests per second, and at 80 % of that load 99 % of the requests get their first token within 63 ms.
 - Speculative decoding (chapter 11): a smaller model, the tokens of the sequence, or the model's own multi-token layer proposes, and the model checks several tokens per pass without changing its answers. On an RTX 3090, Qwen3 8B generates 1.72 times faster with Qwen3 0.6B proposing, and MiMo-7B 1.53 times faster with its own layer.

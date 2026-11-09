@@ -146,6 +146,8 @@ The chunk length depends on the shape alone, never on the data: positions are cu
 
 Paged kernels read each query's keys apart, which is cheap for a token but grows as the square of a long prompt. A sequence with at least `PREFILL_QUERIES` = 384 consecutive queries is therefore handled by FlashAttention 2: its keys are gathered from the pages into a contiguous tensor, attention runs causally from the first query's position, and the result is placed into the output rows. A prompt of 4096 tokens of Llama 3.2 3B takes 0.76 s this way, against 1.5 s through the paged kernels.
 
+**Linear attention.** `causal_conv` takes one thread per channel, which goes through the rows of the pass in order, its column of the state its own. `delta_rule` takes one thread per value head and column `j` of its states: the delta rule never mixes columns, so each thread keeps its column `S[:, j]` (at most 256 keys) in its own memory while the rows are of the same sequence, and writes it back when the sequence changes. A prompt therefore reads and writes its states once, whatever its length; its rows go one after the other, which a chunked form, with products by tiles, would compute faster.
+
 ## 7.8 Recorded passes
 
 At one token, a model is a few hundred small kernels, and launching them costs as much as running them. `Record::record` runs a pass while the backend's stream is captured, in *relaxed* mode, and instantiates the CUDA graph it gives; `Recording::replay` then launches every kernel of the pass in one call to the driver (`graph.rs`).

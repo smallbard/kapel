@@ -34,6 +34,7 @@ mod loss;
 mod matmul;
 mod norm;
 pub(crate) mod paged;
+mod recurrent;
 mod reduce;
 mod rng;
 mod rope;
@@ -189,6 +190,31 @@ mod tests {
 
         fn copy_from_host(&self, target: &mut Tensor, values: &Tensor) -> Result<()> {
             Reference.copy_from_host(target, values)
+        }
+    }
+
+    impl kapel_ops::Recurrent for Typed {
+        fn causal_conv(
+            &self,
+            state: &mut Tensor,
+            x: &Tensor,
+            weight: &Tensor,
+            slots: &Tensor,
+        ) -> Result<Tensor> {
+            Reference.causal_conv(state, x, weight, slots)
+        }
+
+        fn delta_rule(
+            &self,
+            state: &mut Tensor,
+            q: &Tensor,
+            k: &Tensor,
+            v: &Tensor,
+            g: &Tensor,
+            beta: &Tensor,
+            slots: &Tensor,
+        ) -> Result<Tensor> {
+            Reference.delta_rule(state, q, k, v, g, beta, slots)
         }
     }
 

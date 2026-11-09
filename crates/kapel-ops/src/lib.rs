@@ -20,6 +20,7 @@ mod loss;
 mod matmul;
 mod norm;
 mod paged;
+mod recurrent;
 mod reduce;
 mod rope;
 pub mod shape;
@@ -40,6 +41,7 @@ pub use paged::{
     COPY_FROM_HOST, PagedAttention, Record, Recording, WRITE_ROWS, Write, check_copy, check_write,
     check_written,
 };
+pub use recurrent::{CAUSAL_CONV, DELTA_RULE, Recurrent, check_conv, check_delta, check_slots};
 pub use reduce::{ArgMax, Max, Mean, Sum};
 pub use rope::{Rope, RopeLayout, RopeScaling};
 pub use update::{
@@ -158,6 +160,7 @@ pub trait Transfer {
 /// generation in place.
 pub trait Backend:
     Write
+    + Recurrent
     + Record
     + Update
     + Run<Unary>
@@ -188,6 +191,7 @@ pub trait Backend:
 
 impl<B> Backend for B where
     B: Write
+        + Recurrent
         + Record
         + Update
         + Run<Unary>
